@@ -4,17 +4,36 @@ on:
     branches: [main]
   pull_request:
 jobs:
-  test:
+  python:
+    name: server + gateway (py ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        # 3.9 = /usr/bin/python3 on the macOS host that runs the gateway
+        python-version: ["3.9", "3.12"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-      - name: tests
-        run: |
-          python python/test_server.py
-          python gateway/test_gateway.py
+      - name: MCP server
+        run: python python/test_server.py
+      - name: agent gateway
+        run: python gateway/test_gateway.py
+
+  lua:
+    name: bridge + Lua/shell syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install lupa
+      - name: bridge.lua against a fake ReaScript API
+        run: python python/test_bridge_lua.py
+      - name: bridge copies in sync
+        run: cmp lua/bridge.lua reaper_mcp/bridge.lua
+      - name: every .lua compiles (Lua 5.4), every .sh parses
+        run: python scripts/check_syntax.py

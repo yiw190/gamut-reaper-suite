@@ -110,7 +110,11 @@ Running the agent somewhere else and need to reach REAPER over the internet? See
 python3 python/test_server.py                        # MCP server + fake bridge
 uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
+uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses
 ```
+
+CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12, plus a
+check that `lua/bridge.lua` and `reaper_mcp/bridge.lua` are identical.
 
 Neither needs REAPER. The second one skips if lupa is not installed.
 

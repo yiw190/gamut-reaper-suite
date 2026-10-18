@@ -57,7 +57,7 @@ fi
 "$BIN/cloudflared" --version
 
 if [ ! -d "$REPO/.git" ]; then
-  git clone https://github.com/yiw190/reaper-mcp.git "$REPO"
+  git clone https://github.com/yiw190/gamut-reaper-suite.git "$REPO"
 else
   git -C "$REPO" pull --ff-only || true
 fi

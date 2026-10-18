@@ -209,8 +209,8 @@ return { ret = out }
 def restart(host: str, bearer: str) -> int:
     """Bounce the HTTP front so it loads the new server.py."""
     code = f"""
-local cmd = "nohup sh -c 'sleep 2; launchctl kickstart -k gui/$(id -u)/{LAUNCH_LABEL}' >/dev/null 2>&1 &"
-reaper.ExecProcess(cmd, 5000)
+-- os.execute, not ExecProcess: a job backgrounded under ExecProcess never ran the kickstart
+os.execute("nohup sh -c 'sleep 2; launchctl kickstart -k gui/$(id -u)/{LAUNCH_LABEL}' >/dev/null 2>&1 &")
 return {{ ret = {{ scheduled = true }} }}
 """
     print(rpc(host, bearer, code)["ret"])

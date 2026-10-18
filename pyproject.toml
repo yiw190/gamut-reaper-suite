@@ -10,8 +10,8 @@ keywords = ["reaper", "mcp", "daw", "reascript"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/yiw190/reaper-mcp"
-Repository = "https://github.com/yiw190/reaper-mcp"
+Homepage = "https://github.com/yiw190/gamut-reaper-suite"
+Repository = "https://github.com/yiw190/gamut-reaper-suite"
 
 [project.scripts]
 reaper-mcp = "reaper_mcp.cli:main"

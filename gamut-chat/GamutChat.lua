@@ -1187,8 +1187,12 @@ local function config_chips()
     local id = sval(o.id) or tostring(i)
     local items = opt_items(o)
     local cur = S.cfg_sel[id] or sval(o.currentValue) or ''
-    local label
-    for _, it in ipairs(items) do if it.value == cur then label = it.name end end
+    local label, groups = nil, {}
+    for _, it in ipairs(items) do if it.group and it.group ~= '' then groups[it.group] = true end end
+    local multi = next(groups) ~= nil and next(groups, next(groups)) ~= nil
+    for _, it in ipairs(items) do
+      if it.value == cur then label = (multi and it.group and it.group ~= '') and (it.group .. ' · ' .. (it.name or cur)) or it.name end
+    end
     if cur == '' or not label then label = (o.category == 'model' and 'Auto') or (sval(o.name) or id):lower() end
     if i > 1 then ImGui.SameLine(ctx, 0, 2) end
     if chip(id, label) then ImGui.OpenPopup(ctx, 'cfgpop_' .. id) end

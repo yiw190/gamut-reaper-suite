@@ -1,6 +1,8 @@
 -- Gamut Chat: Cursor-style chat panel inside REAPER, talking to a Gamut agent through the
 -- local Gamut desktop API (127.0.0.1:47891). Needs ReaImGui >= 0.10.
-local HOST = 'http://127.0.0.1:47891'
+-- agent gateway (gateway/agent_gateway.py: Gamut + ACP agents, model selectors) first, Gamut's own API as fallback
+local HOSTS = { 'http://127.0.0.1:47892', 'http://127.0.0.1:47891' }
+local HOST = HOSTS[1]
 local EXT = 'GamutChat'
 
 if not reaper.ImGui_GetBuiltinPath then
@@ -142,7 +144,26 @@ local S = {
   input = '', attach = true, focus = true, scroll = true,
   sessions = {}, sess_at = 0,
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
+  cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil,
 }
+local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
+local function via_gateway() return HOST == HOSTS[1] end
+-- per-agent selector picks (model / effort / mode), stored as "id\tvalue" lines
+local function cfg_load()
+  S.cfg_sel = {}
+  for id, v in (reaper.GetExtState(EXT, 'cfg_' .. S.agent) .. '\n'):gmatch('([^\t\n]+)\t([^\n]*)\n') do S.cfg_sel[id] = v end
+end
+local function cfg_save()
+  local L = {}
+  for id, v in pairs(S.cfg_sel) do L[#L + 1] = id .. '\t' .. v end
+  reaper.SetExtState(EXT, 'cfg_' .. S.agent, table.concat(L, '\n'), true)
+end
+local function cfg_json()
+  if not via_gateway() then return '' end
+  local L = {}
+  for id, v in pairs(S.cfg_sel) do L[#L + 1] = jstr(id) .. ':' .. jstr(v) end
+  return ',"config":{' .. table.concat(L, ',') .. '}'
+end
 local function load_agent_session()
   S.sid = reaper.GetExtState(EXT, 'session_' .. S.agent)
   S.title = reaper.GetExtState(EXT, 'title_' .. S.agent)
@@ -244,13 +265,24 @@ local function on_event(d)
   elseif t == 'session_awaiting_input' then
     if not S.waiting then open_in_gamut() end -- questions/approvals are answered in Gamut, so jump there once
     S.waiting = true
+  elseif t == 'permission_request' then
+    for _, p in ipairs(S.perms) do if p.id == d.requestId then return end end
+    S.perms[#S.perms + 1] = { id = d.requestId, title = d.title or 'Run tool', options = d.options or {} }
+    scroll()
+  elseif t == 'permission_resolved' then
+    for i = #S.perms, 1, -1 do if S.perms[i].id == d.requestId then table.remove(S.perms, i) end end
+  elseif t == 'config_options' then
+    if type(d.configOptions) == 'table' then S.cfg_opts = d.configOptions end
+  elseif t == 'notice' then
+    S.live[#S.live + 1] = { kind = 'tool', text = tostring(d.text or '') }
   elseif t == 'session_input_provided' then
     S.waiting = false
   elseif t == 'session_idle' then
-    S.active, S.waiting = false, false
+    S.active, S.waiting, S.perms = false, false, {}
     refresh_messages()
   elseif t == 'session_error' then
-    S.active = false
+    S.active, S.perms = false, {}
+    if d.apiErrorCode == 'auth_required' then S.auth = S.auth or { methods = {} } end
     local p = d.errorPresentation
     S.err = (type(p) == 'table' and (p.message or p.title)) or d.apiErrorCode or 'error'
     refresh_messages()
@@ -523,7 +555,7 @@ local function send()
   scroll()
   if S.sid == '' then
     local agent = S.agent
-    http('POST', '/sessions', '{"message":' .. jstr(payload) .. '}', function(code, body)
+    http('POST', '/sessions', '{"message":' .. jstr(payload) .. cfg_json() .. '}', function(code, body)
       local r = decode(body)
       if agent ~= S.agent then return end
       if code >= 200 and code < 300 and type(r) == 'table' and type(r.id) == 'string' then
@@ -531,13 +563,16 @@ local function send()
         S.title = text:sub(1, 60)
         save_agent_session()
         stream_start()
+      elseif code == 401 then
+        S.active, S.auth = false, S.auth or { methods = {} }
+        S.err = (S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login first'
       else
         S.active = false
         S.err = ('create session failed (%d)'):format(code)
       end
     end)
   else
-    http('POST', '/sessions/' .. S.sid .. '/messages', '{"content":' .. jstr(payload) .. '}', function(code)
+    http('POST', '/sessions/' .. S.sid .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
       if code < 200 or code >= 300 then
         S.active = false
         S.err = ('send failed (%d)'):format(code)
@@ -553,6 +588,7 @@ end
 local function reset_view()
   stream_stop()
   S.msgs, S.live, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, false, nil, false, {}, 0
+  S.perms = {}
 end
 
 local function new_chat()
@@ -592,22 +628,87 @@ local function load_sessions()
   end)
 end
 
-local function load_agents()
+local load_config
+local function load_agents(try)
+  try = try or 1
   S.agents_at = reaper.time_precise()
-  http_url('GET', HOST .. '/api/agents', nil, function(code, body)
-    if code ~= 200 then S.agents_err = 'Gamut not reachable (' .. code .. ')'; return end
+  local host = HOSTS[try]
+  http_url('GET', host .. '/api/agents', nil, function(code, body)
+    if code ~= 200 then
+      if try < #HOSTS then return load_agents(try + 1) end
+      S.agents_err = 'Agent gateway and Gamut not reachable (' .. code .. ')'
+      S.boot = false
+      return
+    end
     local list = decode(body)
     if type(list) ~= 'table' then return end
     if list.agents then list = list.agents end
+    local changed = host ~= HOST
+    HOST = host
     local out = {}
     for _, a in ipairs(list) do
       if type(a.slug) == 'string' then
         out[#out + 1] = { slug = a.slug, name = type(a.name) == 'string' and a.name or a.slug,
-          desc = type(a.description) == 'string' and a.description or '' }
+          desc = type(a.description) == 'string' and a.description or '', acp = a.backend == 'acp' }
       end
     end
     S.agents, S.agents_err = out, nil
+    if (changed or not S.cfg_loaded) and S.agent ~= '' then load_config() end
+    if S.boot then
+      S.boot = false -- the saved session is reopened once we know which host answers
+      if S.sid ~= '' then stream_start(); refresh_messages() end
+    end
   end)
+end
+
+local function load_status()
+  if not via_gateway() or not is_acp() then return end
+  S.auth_at = reaper.time_precise()
+  local agent = S.agent
+  http('GET', '/status', nil, function(code, body)
+    local r = decode(body)
+    if agent ~= S.agent or code ~= 200 or type(r) ~= 'table' then return end
+    local err = type(r.error) == 'string' and r.error or nil
+    if r.state == 'auth_required' then
+      local waiting = S.auth and S.auth.waiting and err == nil
+      S.auth = { methods = type(r.authMethods) == 'table' and r.authMethods or {}, err = err, waiting = waiting }
+    elseif r.state == 'authenticating' then
+      S.auth = S.auth or { methods = {} }
+      S.auth.waiting = true
+    elseif S.auth and r.state == 'ready' then
+      S.auth, S.err = nil, nil
+      load_config()
+    end
+  end)
+end
+
+function load_config()
+  S.cfg_loaded = true
+  S.cfg_opts = {}
+  if not via_gateway() or S.agent == '' then return end
+  local agent = S.agent
+  http('GET', '/config', nil, function(code, body)
+    if agent ~= S.agent then return end
+    local r = decode(body)
+    if code == 200 and type(r) == 'table' and type(r.configOptions) == 'table' then
+      S.cfg_opts = r.configOptions
+    elseif code == 401 then
+      S.auth = S.auth or { methods = {} }
+      load_status()
+    end
+  end)
+end
+
+local function answer_perm(p, option_id)
+  for i = #S.perms, 1, -1 do if S.perms[i] == p then table.remove(S.perms, i) end end
+  local opt = option_id and jstr(option_id) or 'null'
+  http('POST', '/sessions/' .. S.sid .. '/permission', '{"requestId":' .. jstr(p.id) .. ',"optionId":' .. opt .. '}')
+end
+
+local function start_login(method_id)
+  S.auth = S.auth or { methods = {} }
+  S.auth.waiting, S.auth.err = true, nil
+  http('POST', '/auth', '{"methodId":' .. jstr(method_id) .. '}', function() load_status() end)
 end
 
 local function switch_session(id, name)
@@ -627,6 +728,9 @@ local function choose_agent(slug, name)
   reaper.SetExtState(EXT, 'agent', slug, true)
   reaper.SetExtState(EXT, 'agent_name', name, true)
   load_agent_session()
+  cfg_load()
+  S.auth = nil
+  load_config()
   if S.sid ~= '' then stream_start(); refresh_messages() end
   S.focus = true
 end
@@ -1028,15 +1132,62 @@ end
 ---------------------------------------------------------------- UI
 local function agent_combo(width)
   ImGui.SetNextItemWidth(ctx, width)
-  local preview = S.agent == '' and 'Choose your Music Agent in Gamut…' or (S.agent_name ~= '' and S.agent_name or S.agent)
+  local preview = S.agent == '' and 'Choose an agent…' or (S.agent_name ~= '' and S.agent_name or S.agent)
   if ImGui.BeginCombo(ctx, '##agent', preview, ImGui.ComboFlags_HeightLarge) then
     if reaper.time_precise() - S.agents_at > 2 then load_agents() end
     for _, a in ipairs(S.agents) do
-      if ImGui.Selectable(ctx, a.name .. '##' .. a.slug, a.slug == S.agent) then choose_agent(a.slug, a.name) end
+      if ImGui.Selectable(ctx, a.name .. (a.acp and '   (ACP)' or '') .. '##' .. a.slug, a.slug == S.agent) then
+        choose_agent(a.slug, a.name)
+      end
       if a.desc ~= '' and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, a.desc) end
     end
     if #S.agents == 0 then ImGui.TextDisabled(ctx, S.agents_err or 'loading…') end
     ImGui.EndCombo(ctx)
+  end
+end
+
+local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
+local SHOWN = { model = true, thought_level = true, model_config = true, mode = true }
+local function opt_items(o) -- ACP options may be grouped: {group, name, options = {...}}
+  local out = {}
+  for _, x in ipairs(type(o.options) == 'table' and o.options or {}) do
+    if type(x.options) == 'table' then
+      for _, y in ipairs(x.options) do out[#out + 1] = { value = sval(y.value) or '', name = sval(y.name), group = sval(x.name) } end
+    else
+      out[#out + 1] = { value = sval(x.value) or '', name = sval(x.name), group = sval(x.group) }
+    end
+  end
+  return out
+end
+
+-- model / effort / mode pickers; values are sent with the next message (gateway applies them per backend)
+local function config_row()
+  local shown = {}
+  for _, o in ipairs(S.cfg_opts) do
+    if type(o) == 'table' and o.type == 'select' and SHOWN[o.category] and #shown < 3 then shown[#shown + 1] = o end
+  end
+  if #shown == 0 then return end
+  local w = (ImGui.GetContentRegionAvail(ctx) - 8 * (#shown - 1)) / #shown
+  for i, o in ipairs(shown) do
+    if i > 1 then ImGui.SameLine(ctx) end
+    local id = sval(o.id) or tostring(i)
+    local items = opt_items(o)
+    local cur = S.cfg_sel[id] or sval(o.currentValue) or ''
+    local preview = sval(o.name) or id
+    for _, it in ipairs(items) do if it.value == cur then preview = it.name or cur end end
+    ImGui.SetNextItemWidth(ctx, w)
+    if ImGui.BeginCombo(ctx, '##cfg_' .. id, preview, ImGui.ComboFlags_HeightLarge) then
+      local group
+      for _, it in ipairs(items) do
+        if it.group and it.group ~= '' and it.group ~= group then group = it.group; ImGui.SeparatorText(ctx, group) end
+        if ImGui.Selectable(ctx, (it.name or it.value) .. '##' .. it.value, it.value == cur) then
+          S.cfg_sel[id] = it.value
+          cfg_save()
+        end
+      end
+      ImGui.EndCombo(ctx)
+    end
+    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, sval(o.name) or id) end
   end
 end
 
@@ -1067,6 +1218,7 @@ local function header()
   end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, '+', bw) then new_chat() end
+  config_row()
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
@@ -1183,6 +1335,7 @@ end
 
 local function frame()
   local t0 = reaper.time_precise()
+  if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
   check_theme()
   poll_http()
   poll_stream()
@@ -1207,7 +1360,7 @@ local function frame()
     if S.agent == '' then
       ImGui.Dummy(ctx, 0, 40)
       ImGui.PushTextWrapPos(ctx, 0)
-      ImGui.TextDisabled(ctx, 'Choose your Music Agent in Gamut to start. The list comes from the Gamut app on this Mac.')
+      ImGui.TextDisabled(ctx, 'Choose an agent to start: Gamut agents from the Gamut app on this Mac, plus ACP agents (Codex, …) from the agent gateway.')
       ImGui.PopTextWrapPos(ctx)
     else
       local composer_h = 122
@@ -1227,6 +1380,29 @@ local function frame()
         end
         for _, b in ipairs(S.live) do
           if b.kind == 'text' then md(b, b.text) else ImGui.TextDisabled(ctx, '→ ' .. b.text) end
+        end
+        for _, p in ipairs(S.perms) do
+          ImGui.PushTextWrapPos(ctx, 0)
+          ImGui.TextColored(ctx, C.accent, 'Allow: ' .. p.title .. '?')
+          ImGui.PopTextWrapPos(ctx)
+          for i, o in ipairs(p.options) do
+            if i > 1 then ImGui.SameLine(ctx) end
+            if ImGui.SmallButton(ctx, (sval(o.name) or sval(o.optionId) or '?') .. '##' .. p.id .. i) then answer_perm(p, sval(o.optionId)) end
+          end
+          if #p.options == 0 and ImGui.SmallButton(ctx, 'Dismiss##' .. p.id) then answer_perm(p, nil) end
+        end
+        if S.auth then
+          ImGui.TextColored(ctx, C.accent, (S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login')
+          if S.auth.waiting then
+            ImGui.TextDisabled(ctx, 'Finish the login in the browser window…')
+          else
+            for i, m in ipairs(S.auth.methods) do
+              if i > 1 then ImGui.SameLine(ctx) end
+              if ImGui.SmallButton(ctx, (sval(m.name) or sval(m.id) or '?') .. '##auth' .. i) then start_login(sval(m.id)) end
+              if sval(m.description) and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, m.description) end
+            end
+          end
+          if S.auth.err then ImGui.TextColored(ctx, C.danger, S.auth.err) end
         end
         if S.waiting then
           ImGui.TextColored(ctx, C.accent, 'Answer in Gamut')
@@ -1296,6 +1472,7 @@ reaper.atexit(function()
   stream_stop()
   if reaper.set_action_options then reaper.set_action_options(8) end
 end)
-if S.agent == '' then load_agents() end
-if S.sid ~= '' then stream_start(); refresh_messages() end
+if S.agent ~= '' then cfg_load() end
+S.boot = true
+load_agents()
 reaper.defer(frame)

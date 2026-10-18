@@ -15,4 +15,6 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: tests
-        run: python python/test_server.py
+        run: |
+          python python/test_server.py
+          python gateway/test_gateway.py

@@ -3,14 +3,16 @@
 <img src="icons/reaper-mcp.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
 [REAPER](https://reaper.fm) tooling for AI agents, built around [Gamut](https://github.com/SkillfulAgents/SuperAgent):
-an MCP server that drives REAPER, a chat panel docked inside REAPER, and the macOS host setup that keeps both running.
+an MCP server that drives REAPER, a chat panel docked inside REAPER, and a local gateway so the panel can talk to
+Gamut, Codex or any other ACP agent.
 
 | Path | What |
 | --- | --- |
 | `reaper_mcp/`, `python/`, `lua/bridge.lua` | MCP server (`reaper-mcp`) + the Lua bridge that runs inside REAPER |
-| `gamut-chat/` | Gamut Chat — Cursor-style chat panel in REAPER (ReaImGui), talks to the local Gamut desktop app |
+| `gamut-chat/` | Gamut Chat — Cursor-style chat panel in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
 | `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
-| `scripts/` | macOS host bootstrap (LaunchAgents + Cloudflare Tunnel) and hot-swap deploy of the bridge |
+| `gateway/` | Agent gateway: one local API for the panel in front of Gamut and ACP agents (Codex, …) |
+| `scripts/` | Remote-host bootstrap (Cloudflare Tunnel) and hot-swap deploy of the bridge — see `docs/remote-host.md` |
 
 [![ci](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml)
 
@@ -77,12 +79,25 @@ while a composition is open and shows the pending pinyin under the input.
 Copy `reaper/__startup.lua` to `<REAPER resource path>/Scripts/__startup.lua` (or merge it into yours). It starts the
 MCP bridge and opens the chat panel on every launch, registering either script if REAPER doesn't know it yet.
 
-## Remote host (macOS + Cloudflare Tunnel)
+## Agent gateway: Codex, Claude Code, … in the same panel
 
-`scripts/macos-host-bootstrap.sh` installs cloudflared, clones this repo to `~/reaper-mcp`, and writes LaunchAgents for
-the HTTP MCP front (`python/http_server.py`, bearer auth) and the tunnel; secrets come from `~/.config/reaper-mcp/env`
-and never touch the repo. `scripts/deploy_bridge.py stage | swap | restart | verify` pushes a new bridge into a
-running REAPER without restarting it.
+`gateway/agent_gateway.py` is a small local server (`127.0.0.1:47892`, stdlib Python) that the panel talks to first.
+It proxies Gamut agents unchanged and adds [ACP](https://agentclientprotocol.com) agents — Codex via
+`@agentclientprotocol/codex-acp`, and anything else that speaks ACP — under the same API. Each ACP session gets this
+repo's MCP server, so every backend can drive REAPER. The panel shows model / effort / mode pickers for both kinds
+(Gamut's model catalog, ACP config options), permission buttons when an ACP agent asks before a tool call, and a
+login button when the agent needs one. If the gateway isn't running the panel falls back to Gamut directly.
+
+```bash
+sh gateway/install_macos.sh          # LaunchAgent + Node (~/.local/node) + codex-acp; WITH_CODEX=0 to skip
+python3 gateway/test_gateway.py      # fake Gamut + fake ACP agent, no network
+```
+
+Agents are listed in `~/.config/agent-gateway/config.json` (`acp: [{slug, name, command, env, cwd}]`,
+`mcpServers: [...]`). Transcripts of ACP sessions are kept in `~/.config/agent-gateway/sessions/`.
+
+Running the agent somewhere else and need to reach REAPER over the internet? See
+[docs/remote-host.md](docs/remote-host.md).
 
 ## Tools
 
@@ -93,6 +108,7 @@ running REAPER without restarting it.
 ```
 python3 python/test_server.py                        # MCP server + fake bridge
 uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
+python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
 ```
 
 Neither needs REAPER. The second one skips if lupa is not installed.

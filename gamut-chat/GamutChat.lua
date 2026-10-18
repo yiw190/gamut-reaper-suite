@@ -280,6 +280,22 @@ local function on_event(d)
     S.live[#S.live + 1] = { kind = 'tool', text = tostring(d.text or '') }
   elseif t == 'session_input_provided' then
     S.greq_at = 0
+  elseif t == 'user_request_created' then
+    -- Gamut ships the whole request (question / secret / review) in the event
+    local q = type(d.request) == 'table' and d.request
+    local scope = q and type(q.scope) == 'table' and q.scope or {}
+    if q and sval(q.id) and sval(q.kind) and q.autoApproved ~= true
+        and (sval(scope.sessionId) == nil or scope.sessionId == S.sid) then
+      q.payload = type(q.payload) == 'table' and q.payload or {}
+      for i = #S.greqs, 1, -1 do if S.greqs[i].id == q.id then table.remove(S.greqs, i) end end
+      S.greqs[#S.greqs + 1] = q
+      S.waiting = true
+      scroll()
+    end
+  elseif t == 'user_request_resolved' then
+    for i = #S.greqs, 1, -1 do if S.greqs[i].id == d.requestId then table.remove(S.greqs, i) end end
+    S.gans[tostring(d.requestId)] = nil
+    if #S.greqs == 0 then S.waiting = false end
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
     refresh_messages()
@@ -768,7 +784,7 @@ local function load_sessions()
   end)
 end
 
-local load_config
+local load_config, load_requests
 local function load_agents(try)
   try = try or 1
   S.agents_at = reaper.time_precise()
@@ -796,7 +812,7 @@ local function load_agents(try)
     if (changed or not S.cfg_loaded) and S.agent ~= '' then load_config() end
     if S.boot then
       S.boot = false -- the saved session is reopened once we know which host answers
-      if S.sid ~= '' then stream_start(); refresh_messages() end
+      if S.sid ~= '' then stream_start(); refresh_messages(); load_requests() end
     end
   end)
 end
@@ -853,7 +869,7 @@ local function answer_perm(p, option_id)
 end
 
 -- Gamut's pending user-input requests (questions, secrets, approvals) for the open session
-local function load_requests()
+function load_requests()
   S.greq_at = reaper.time_precise()
   if S.agent == '' or is_acp() or S.sid == '' then S.greqs = {}; return end
   local agent, sid = S.agent, S.sid
@@ -870,11 +886,14 @@ local function load_requests()
         end
       end
     end
-    for _, q in ipairs(out) do -- keep in-progress UI state across refreshes
-      for _, old in ipairs(S.greqs) do if old.id == q.id then q.err, q.sending = old.err, old.sending end end
+    -- merge: events are the source of truth (user_request_resolved removes cards); this only fills in
+    -- requests created before the stream connected
+    for _, q in ipairs(out) do
+      local known = false
+      for _, old in ipairs(S.greqs) do if old.id == q.id then known = true end end
+      if not known then S.greqs[#S.greqs + 1] = q end
     end
-    S.greqs = out
-    if #out == 0 then S.waiting = false end
+    if #S.greqs > 0 then S.waiting = true end
   end)
 end
 
@@ -906,6 +925,7 @@ local function switch_session(id, name)
   save_agent_session()
   stream_start()
   refresh_messages()
+  load_requests()
   S.focus = true
 end
 
@@ -920,7 +940,7 @@ local function choose_agent(slug, name)
   S.auth = nil
   load_config()
   if is_acp() then load_acp_status(S.agent, true) end
-  if S.sid ~= '' then stream_start(); refresh_messages() end
+  if S.sid ~= '' then stream_start(); refresh_messages(); load_requests() end
   S.focus = true
 end
 
@@ -1978,7 +1998,7 @@ end
 local function frame()
   local t0 = reaper.time_precise()
   if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
-  if (S.waiting or #S.greqs > 0) and t0 - S.greq_at > 3 then load_requests() end
+  if S.waiting and #S.greqs == 0 and t0 - S.greq_at > 3 then load_requests() end
   check_theme()
   poll_http()
   poll_stream()

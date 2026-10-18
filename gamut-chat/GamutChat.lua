@@ -141,10 +141,12 @@ local S = {
   sid = '', title = '',
   msgs = {}, live = {},
   active = false, waiting = false, err = nil,
-  input = '', attach = true, focus = true, scroll = true,
+  input = '', focus = true, scroll = true,
+  ctx_level = tonumber(reaper.GetExtState(EXT, 'ctx_level')) or 1, -- 0 off, 1 simple, 2 all details
   sessions = {}, sess_at = 0,
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
   cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil, acp_status = {},
+  greqs = {}, greq_at = 0, gans = {}, card_h = {},
 }
 local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
 local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
@@ -264,8 +266,8 @@ local function on_event(d)
   elseif t == 'tool_use_ready' then
     S.live[#S.live + 1] = { kind = 'tool', text = tool_label(d.toolName) }
   elseif t == 'session_awaiting_input' then
-    if not S.waiting then open_in_gamut() end -- questions/approvals are answered in Gamut, so jump there once
     S.waiting = true
+    S.greq_at = 0 -- frame() fetches the pending requests and draws them as cards
   elseif t == 'permission_request' then
     for _, p in ipairs(S.perms) do if p.id == d.requestId then return end end
     S.perms[#S.perms + 1] = { id = d.requestId, title = d.title or 'Run tool', options = d.options or {} }
@@ -277,7 +279,7 @@ local function on_event(d)
   elseif t == 'notice' then
     S.live[#S.live + 1] = { kind = 'tool', text = tostring(d.text or '') }
   elseif t == 'session_input_provided' then
-    S.waiting = false
+    S.greq_at = 0
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
     refresh_messages()
@@ -331,7 +333,24 @@ local NOTE = { 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B' }
 local function note_name(p) return NOTE[p % 12 + 1] .. (p // 12 - 1) end
 local function trnum(tr) return math.floor(reaper.GetMediaTrackInfo_Value(tr, 'IP_TRACKNUMBER')) end
 
-local function midi_ctx(proj, full)
+local function db(v) return v > 0 and ('%.1f dB'):format(20 * math.log(v, 10)) or '-inf dB' end
+local function pan_str(p) return math.abs(p) < 0.005 and 'C' or ('%d%%%s'):format(math.floor(math.abs(p) * 100 + 0.5), p < 0 and 'L' or 'R') end
+local function qn_frac(qn) -- 0.25 qn -> 1/16
+  if not qn or qn <= 0 then return '?' end
+  local d = 4 / qn
+  if math.abs(d - math.floor(d + 0.5)) < 1e-6 then return '1/' .. math.floor(d + 0.5) end
+  return ('%.4g qn'):format(qn)
+end
+local function cc_kind(chanmsg, m2, m3)
+  if chanmsg == 0xB0 then return ('CC%d = %d'):format(m2, m3)
+  elseif chanmsg == 0xE0 then return ('pitch bend = %d'):format(((m3 << 7) | m2) - 8192)
+  elseif chanmsg == 0xC0 then return ('program %d'):format(m2)
+  elseif chanmsg == 0xD0 then return ('channel pressure = %d'):format(m2)
+  elseif chanmsg == 0xA0 then return ('poly aftertouch %s = %d'):format(note_name(m2), m3) end
+  return ('0x%X %d %d'):format(chanmsg, m2, m3)
+end
+
+local function midi_ctx(proj, full, all)
   local ed = reaper.MIDIEditor_GetActive()
   if not ed then return nil end
   local take = reaper.MIDIEditor_GetTake(ed)
@@ -343,7 +362,7 @@ local function midi_ctx(proj, full)
   local idx = reaper.MIDI_EnumSelNotes(take, -1)
   while idx ~= -1 do
     sel = sel + 1
-    if full and #list < 32 then
+    if full and #list < (all and 128 or 32) then
       local _, _, _, sp, ep, ch, pitch, vel = reaper.MIDI_GetNote(take, idx)
       local t0 = reaper.MIDI_GetProjTimeFromPPQPos(take, sp)
       local t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
@@ -359,7 +378,98 @@ local function midi_ctx(proj, full)
     local _, tk = reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false)
     r.take = tk
   end
+  if all then
+    local _, _, nccs = reaper.MIDI_CountEvts(take)
+    r.cc_total, r.cc_sel, r.cc_list = nccs, 0, {}
+    local ci = reaper.MIDI_EnumSelCC(take, -1)
+    while ci ~= -1 do
+      r.cc_sel = r.cc_sel + 1
+      if #r.cc_list < 64 then
+        local _, _, _, ppq, chanmsg, chan, m2, m3 = reaper.MIDI_GetCC(take, ci)
+        r.cc_list[#r.cc_list + 1] = ('  cc %d: %s @ %s, ch %d'):format(ci, cc_kind(chanmsg, m2, m3),
+          pos(reaper.MIDI_GetProjTimeFromPPQPos(take, ppq)), chan + 1)
+      end
+      ci = reaper.MIDI_EnumSelCC(take, ci)
+    end
+    local grid, swing, notelen = reaper.MIDI_GetGrid(take)
+    local snap = reaper.MIDIEditor_GetSetting_int(ed, 'snap_enabled')
+    r.grid = ('grid %s%s, snap %s, note length %s'):format(qn_frac(grid),
+      (swing and swing ~= 0) and (', swing %d%%'):format(math.floor(swing * 100 + 0.5)) or '',
+      snap == 1 and 'on' or 'off', (notelen and notelen > 0) and qn_frac(notelen) or 'grid')
+  end
   return r
+end
+
+local function envelope_ctx(proj)
+  local env = reaper.GetSelectedEnvelope(proj)
+  if not env then return nil end
+  local _, ename = reaper.GetEnvelopeName(env)
+  local tr = reaper.Envelope_GetParentTrack(env)
+  local owner = '?'
+  if tr then
+    local _, tn = reaper.GetTrackName(tr)
+    owner = tr == reaper.GetMasterTrack(proj) and 'MASTER' or ('#%d %s'):format(trnum(tr), tn)
+  end
+  local n = reaper.CountEnvelopePoints(env)
+  local sel, list = 0, {}
+  for i = 0, n - 1 do
+    local _, t, v, shape, _, selected = reaper.GetEnvelopePoint(env, i)
+    if selected then
+      sel = sel + 1
+      if #list < 64 then
+        list[#list + 1] = ('  point %d: %s @ %s, shape %d'):format(i, reaper.Envelope_FormatValue(env, v), pos(t), shape)
+      end
+    end
+  end
+  return { head = ('selected envelope: %s on %s — %d of %d points selected%s'):format(ename, owner, sel, n,
+    sel > #list and (' (first ' .. #list .. ' listed)') or '') .. (sel > 0 and ':' or ''), list = list }
+end
+
+local function track_detail(t)
+  local _, tn = reaper.GetTrackName(t)
+  local fx = {}
+  for f = 0, reaper.TrackFX_GetCount(t) - 1 do
+    local _, fn = reaper.TrackFX_GetFXName(t, f)
+    fn = fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')
+    fx[#fx + 1] = fn .. (reaper.TrackFX_GetEnabled(t, f) and '' or ' (bypassed)')
+  end
+  local flags = {}
+  if reaper.GetMediaTrackInfo_Value(t, 'B_MUTE') == 1 then flags[#flags + 1] = 'muted' end
+  if reaper.GetMediaTrackInfo_Value(t, 'I_SOLO') > 0 then flags[#flags + 1] = 'solo' end
+  if reaper.GetMediaTrackInfo_Value(t, 'I_RECARM') == 1 then flags[#flags + 1] = 'armed' end
+  local ni = reaper.CountTrackMediaItems(t)
+  return ('  #%d %s: %s, pan %s, %d %s%s; FX: %s'):format(trnum(t), tn, db(reaper.GetMediaTrackInfo_Value(t, 'D_VOL')),
+    pan_str(reaper.GetMediaTrackInfo_Value(t, 'D_PAN')), ni, ni == 1 and 'item' or 'items',
+    #flags > 0 and (', ' .. table.concat(flags, ', ')) or '', #fx > 0 and table.concat(fx, ', ') or 'none')
+end
+
+local function item_detail(m)
+  local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
+  local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
+  local len = reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
+  local take = reaper.GetActiveTake(m)
+  local src, tk, extra = 'empty', '', {}
+  if take then
+    tk = select(2, reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false))
+    if reaper.TakeIsMIDI(take) then
+      local _, nn = reaper.MIDI_CountEvts(take)
+      src = ('MIDI, %d notes'):format(nn)
+    else
+      local s_ = reaper.GetMediaItemTake_Source(take)
+      local f = s_ and reaper.GetMediaSourceFileName(s_) or ''
+      src = f ~= '' and f:match('[^/]+$') or 'audio'
+    end
+    local rate = reaper.GetMediaItemTakeInfo_Value(take, 'D_PLAYRATE')
+    local pitch = reaper.GetMediaItemTakeInfo_Value(take, 'D_PITCH')
+    if math.abs(rate - 1) > 1e-6 then extra[#extra + 1] = ('rate %.3g'):format(rate) end
+    if math.abs(pitch) > 1e-6 then extra[#extra + 1] = ('pitch %+.2f st'):format(pitch) end
+    extra[#extra + 1] = 'take gain ' .. db(reaper.GetMediaItemTakeInfo_Value(take, 'D_VOL'))
+  end
+  extra[#extra + 1] = 'item gain ' .. db(reaper.GetMediaItemInfo_Value(m, 'D_VOL'))
+  local fi, fo = reaper.GetMediaItemInfo_Value(m, 'D_FADEINLEN'), reaper.GetMediaItemInfo_Value(m, 'D_FADEOUTLEN')
+  if fi > 0 or fo > 0 then extra[#extra + 1] = ('fades %.3gs/%.3gs'):format(fi, fo) end
+  if reaper.GetMediaItemInfo_Value(m, 'B_MUTE') == 1 then extra[#extra + 1] = 'muted' end
+  return ('  %s @ %s–%s, take "%s" (%s), %s'):format(tn, pos(p0), pos(p0 + len), tk, src, table.concat(extra, ', '))
 end
 
 local function marker_ctx(proj, cur)
@@ -435,7 +545,8 @@ local function fx_ctx(proj, full)
   return r
 end
 
-local function context(full)
+-- full=false: cheap chip summary; full=true: the context block; all=true: + CC/envelope points, grids, track and item detail
+local function context(full, all)
   local proj = reaper.EnumProjects(-1)
   local name = reaper.GetProjectName(proj):gsub('%.[Rr][Pp][Pp]$', '')
   if name == '' then name = '(unsaved)' end
@@ -450,6 +561,11 @@ local function context(full)
     ('cursor: %s (%s)'):format(pos(cur), state),
   }
   local chip = { name, ('%g BPM'):format(bpm), pos(cur) }
+
+  if all then
+    local _, div = reaper.GetSetProjectGrid(proj, false)
+    L[#L + 1] = ('arrange grid: %s, snap %s'):format(qn_frac((div or 0) * 4), reaper.GetToggleCommandState(1157) == 1 and 'on' or 'off')
+  end
 
   local mk = marker_ctx(proj, cur)
   if mk.region then L[#L + 1] = 'region at cursor: ' .. mk.region; chip[#chip + 1] = mk.region_name end
@@ -469,11 +585,18 @@ local function context(full)
     for _, x in ipairs(tr) do names[#names + 1] = x[1] end
     L[#L + 1] = 'selected tracks: ' .. table.concat(names, ', ')
     chip[#chip + 1] = #tr == 1 and tr[1][2] or (#tr .. ' tracks')
+    if all then
+      for i = 0, math.min(#tr, 8) - 1 do L[#L + 1] = track_detail(reaper.GetSelectedTrack(proj, i)) end
+    end
   end
 
   local n = reaper.CountSelectedMediaItems(proj)
   if n > 0 then
-    if full then
+    if all then
+      L[#L + 1] = ('selected items (%d):'):format(n)
+      for i = 0, math.min(n, 32) - 1 do L[#L + 1] = item_detail(reaper.GetSelectedMediaItem(proj, i)) end
+      if n > 32 then L[#L + 1] = ('  … +%d more'):format(n - 32) end
+    elseif full then
       local it = {}
       for i = 0, math.min(n, 8) - 1 do
         local m = reaper.GetSelectedMediaItem(proj, i)
@@ -491,7 +614,7 @@ local function context(full)
   local rz = razor_ctx(proj)
   if #rz > 0 then L[#L + 1] = 'razor edits: ' .. table.concat(rz, '; '); chip[#chip + 1] = 'razor' end
 
-  local md = midi_ctx(proj, full)
+  local md = midi_ctx(proj, full, all)
   if md then
     if md.sel > 0 then
       chip[#chip + 1] = md.sel .. (md.sel == 1 and ' note' or ' notes')
@@ -502,6 +625,22 @@ local function context(full)
       end
     elseif full then
       L[#L + 1] = ('MIDI editor open: %s, item @ %s, take "%s", %d notes, none selected'):format(md.track, md.item, md.take, md.total)
+    end
+    if all then
+      L[#L + 1] = 'MIDI editor ' .. md.grid
+      if md.cc_sel > 0 then
+        L[#L + 1] = ('MIDI CC: %d of %d events selected%s:'):format(md.cc_sel, md.cc_total,
+          md.cc_sel > #md.cc_list and (' (first ' .. #md.cc_list .. ' listed)') or '')
+        for _, x in ipairs(md.cc_list) do L[#L + 1] = x end
+      end
+    end
+  end
+
+  if all then
+    local ev = envelope_ctx(proj)
+    if ev then
+      L[#L + 1] = ev.head
+      for _, x in ipairs(ev.list) do L[#L + 1] = x end
     end
   end
 
@@ -547,8 +686,8 @@ local function send()
   local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
   if text == '' then return end
   local payload = text
-  if S.attach then
-    local ctx_text = context(true)
+  if S.ctx_level > 0 then
+    local ctx_text = context(true, S.ctx_level == 2)
     payload = CTX_OPEN .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
   end
   S.msgs[#S.msgs + 1] = { role = 'user', text = payload }
@@ -589,7 +728,7 @@ end
 local function reset_view()
   stream_stop()
   S.msgs, S.live, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, false, nil, false, {}, 0
-  S.perms = {}
+  S.perms, S.greqs, S.waiting = {}, {}, false
 end
 
 local function new_chat()
@@ -713,6 +852,47 @@ local function answer_perm(p, option_id)
   http('POST', '/sessions/' .. S.sid .. '/permission', '{"requestId":' .. jstr(p.id) .. ',"optionId":' .. opt .. '}')
 end
 
+-- Gamut's pending user-input requests (questions, secrets, approvals) for the open session
+local function load_requests()
+  S.greq_at = reaper.time_precise()
+  if S.agent == '' or is_acp() or S.sid == '' then S.greqs = {}; return end
+  local agent, sid = S.agent, S.sid
+  http('GET', '/pending-requests?sessionId=' .. sid, nil, function(code, body)
+    if agent ~= S.agent or sid ~= S.sid or code ~= 200 then return end
+    local r = decode(body)
+    local list = type(r) == 'table' and r.requests
+    local out = {}
+    if type(list) == 'table' then
+      for _, q in ipairs(list) do
+        if type(q) == 'table' and sval(q.id) and sval(q.kind) and q.autoApproved ~= true then
+          q.payload = type(q.payload) == 'table' and q.payload or {}
+          out[#out + 1] = q
+        end
+      end
+    end
+    for _, q in ipairs(out) do -- keep in-progress UI state across refreshes
+      for _, old in ipairs(S.greqs) do if old.id == q.id then q.err, q.sending = old.err, old.sending end end
+    end
+    S.greqs = out
+    if #out == 0 then S.waiting = false end
+  end)
+end
+
+local function answer_request(req, path, body)
+  req.sending, req.err = true, nil
+  http('POST', path, body, function(code, resp)
+    req.sending = false
+    if code >= 200 and code < 300 then
+      for i = #S.greqs, 1, -1 do if S.greqs[i] == req then table.remove(S.greqs, i) end end
+      S.gans[req.id] = nil
+      load_requests()
+    else
+      local r = decode(resp)
+      req.err = (type(r) == 'table' and sval(r.error)) or ('failed (' .. code .. ')')
+    end
+  end)
+end
+
 local function start_login(method_id)
   S.auth = S.auth or { methods = {} }
   S.auth.waiting, S.auth.err = true, nil
@@ -814,6 +994,7 @@ local function build_palette()
   C.danger = dark and 0xF47067FF or 0xCF222EFF
   C.ok = dark and 0x3FB950FF or 0x1A7F37FF
   C.warn = dark and 0xD29922FF or 0x9A6700FF
+  C.dark_pill = dark and 0x0D1117FF or 0x24292FFF
   C.body = alpha(C.text, 0xE6)
   COLORS = {
     { ImGui.Col_WindowBg, C.bg }, { ImGui.Col_ChildBg, 0x00000000 }, { ImGui.Col_PopupBg, C.panel },
@@ -1428,23 +1609,51 @@ local function model_chip()
   end
 end
 
+-- three levels, click cycles: ◇ off -> ◆ simple -> ◆ all details (dark filled pill)
 local function context_chip()
-  local on = S.attach
-  if chip('ctx', '◆ REAPER', on and C.accent or C.muted, false) then S.attach = not S.attach end
+  local lv = S.ctx_level
+  local clicked
+  if lv == 2 then
+    local bg = C.dark_pill
+    ImGui.PushStyleColor(ctx, ImGui.Col_Button, bg)
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, alpha(bg, 0xE0))
+    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, alpha(bg, 0xC0))
+    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFFFFFFF)
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 8, 3)
+    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 10)
+    clicked = ImGui.Button(ctx, '◆ REAPER all details##chip_ctx')
+    ImGui.PopStyleVar(ctx, 2)
+    ImGui.PopStyleColor(ctx, 4)
+  else
+    clicked = chip('ctx', lv == 1 and '◆ REAPER' or '◇ REAPER', lv == 1 and C.accent or C.muted, false)
+  end
+  if clicked then
+    S.ctx_level = (lv + 1) % 3
+    reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
+  end
   if ImGui.IsItemHovered(ctx) then
-    ImGui.SetTooltip(ctx, on and ('Sent with every message: ' .. chip_text() .. '\nClick to turn off')
-      or 'REAPER context is off. Click to attach it')
+    local tips = {
+      [0] = 'REAPER context is off.\nClick: attach the summary',
+      [1] = 'Sent with every message: ' .. chip_text() .. '\nClick: all details',
+      [2] = 'All details: + CC and envelope points, grids, track mix and FX chains, item sources and gains, up to 128 notes.\nClick: turn off',
+    }
+    ImGui.SetTooltip(ctx, tips[lv])
   end
 end
 
--- cards above the input: things that need you (tool permission, login, a question waiting in Gamut)
-local CARD_H = 66
+-- cards above the input: things that need you (ACP tool permission, ACP login, Gamut questions/secrets/approvals)
 local function card_list()
   local L = {}
-  for _, p in ipairs(S.perms) do L[#L + 1] = { kind = 'perm', p = p } end
-  if S.auth and is_acp() then L[#L + 1] = { kind = 'auth' } end
-  if S.waiting then L[#L + 1] = { kind = 'wait' } end
+  for _, p in ipairs(S.perms) do L[#L + 1] = { kind = 'perm', key = 'p' .. p.id, p = p } end
+  if S.auth and is_acp() then L[#L + 1] = { kind = 'auth', key = 'auth' } end
+  for _, q in ipairs(S.greqs) do L[#L + 1] = { kind = 'greq', key = 'g' .. q.id, q = q } end
+  if S.waiting and #S.greqs == 0 then L[#L + 1] = { kind = 'wait', key = 'wait' } end
   return L
+end
+local function cards_height(L)
+  local h = 0
+  for _, c in ipairs(L) do h = h + (S.card_h[c.key] or 66) + 6 end
+  return h
 end
 local function primary(label)
   ImGui.PushStyleColor(ctx, ImGui.Col_Button, C.accent)
@@ -1455,17 +1664,166 @@ local function primary(label)
   ImGui.PopStyleColor(ctx, 4)
   return clicked
 end
+local function wrapped(text, col)
+  ImGui.PushTextWrapPos(ctx, 0)
+  if col then ImGui.TextColored(ctx, col, text) else ImGui.Text(ctx, text) end
+  ImGui.PopTextWrapPos(ctx)
+end
+
+local GAMUT_ASKS = {
+  connected_account = function(p) return 'Connect your ' .. (sval(p.toolkit) or 'account') .. ' account' end,
+  file = function(p) return 'Upload a file: ' .. (sval(p.description) or '') end,
+  remote_mcp = function(p) return 'Connect an MCP server: ' .. (sval(p.name) or sval(p.url) or '') end,
+  browser_input = function(p) return 'Do a step in the browser: ' .. (sval(p.message) or '') end,
+  computer_use = function(p) return 'Control ' .. (sval(p.appName) or 'an app') .. ' on this Mac' end,
+  account_reauth_required = function(p) return 'Reconnect ' .. (sval(p.toolkit) or 'an account') end,
+  mcp_reauth_required = function(p) return 'Reconnect ' .. (sval(p.mcpName) or 'an MCP server') end,
+}
+
+local function question_card(q, who)
+  local p, id = q.payload, q.id
+  local st = S.gans[id] or { sel = {}, other = {} }
+  S.gans[id] = st
+  local qs = type(p.questions) == 'table' and p.questions or {}
+  local ready = #qs > 0
+  for qi, qq in ipairs(qs) do
+    if type(qq) ~= 'table' then qq = {} end
+    if qi > 1 then ImGui.Spacing(ctx) end
+    if sval(qq.header) then ImGui.TextDisabled(ctx, qq.header) end
+    wrapped(sval(qq.question) or '')
+    st.sel[qi] = st.sel[qi] or {}
+    for oi, o in ipairs(type(qq.options) == 'table' and qq.options or {}) do
+      local label = sval(type(o) == 'table' and o.label) or ('Option ' .. oi)
+      local on = st.sel[qi][label] == true
+      if on then ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.accent) end
+      if ImGui.Selectable(ctx, (on and '●  ' or '○  ') .. label .. '##q' .. id .. '_' .. qi .. '_' .. oi, on) then
+        if qq.multiSelect == true then st.sel[qi][label] = (not on) or nil else st.sel[qi] = { [label] = true } end
+      end
+      if on then ImGui.PopStyleColor(ctx) end
+      local d = type(o) == 'table' and sval(o.description)
+      if d and d ~= '' then
+        ImGui.Indent(ctx, 20)
+        wrapped(d, C.muted)
+        ImGui.Unindent(ctx, 20)
+      end
+    end
+    ImGui.SetNextItemWidth(ctx, -1)
+    local _, v = ImGui.InputTextWithHint(ctx, '##other' .. id .. qi, 'Other…', st.other[qi] or '')
+    st.other[qi] = v
+    if next(st.sel[qi]) == nil and (st.other[qi] or '') == '' then ready = false end
+  end
+  local function answers()
+    local L = {}
+    for qi, qq in ipairs(qs) do
+      local picked = {}
+      for _, o in ipairs(type(qq.options) == 'table' and qq.options or {}) do
+        local label = sval(type(o) == 'table' and o.label)
+        if label and st.sel[qi][label] then picked[#picked + 1] = label end
+      end
+      if (st.other[qi] or '') ~= '' then picked[#picked + 1] = st.other[qi] end
+      L[#L + 1] = jstr(sval(qq.question) or ('Question ' .. qi)) .. ':' .. jstr(table.concat(picked, ', '))
+    end
+    return '{' .. table.concat(L, ',') .. '}'
+  end
+  local path = '/sessions/' .. S.sid .. '/answer-question'
+  if q.sending then ImGui.TextDisabled(ctx, 'Sending…')
+  else
+    if ready then
+      if primary('Send answer##' .. id) then answer_request(q, path, '{"toolUseId":' .. jstr(id) .. ',"answers":' .. answers() .. '}') end
+    else
+      ImGui.BeginDisabled(ctx)
+      primary('Send answer##' .. id)
+      ImGui.EndDisabled(ctx)
+    end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Skip##' .. id) then answer_request(q, path, '{"toolUseId":' .. jstr(id) .. ',"decline":true}') end
+  end
+end
+
+local function greq_card(q, who)
+  local p, id, kind = q.payload, q.id, q.kind
+  local sid = S.sid
+  local tid = '"toolUseId":' .. jstr(id)
+  if kind == 'question' then
+    question_card(q, who)
+  elseif kind == 'secret' then
+    wrapped(sval(p.reason) or (who .. ' needs a secret'))
+    ImGui.TextDisabled(ctx, sval(p.secretName) or '')
+    local st = S.gans[id] or { value = '' }
+    S.gans[id] = st
+    ImGui.SetNextItemWidth(ctx, -1)
+    local _, v = ImGui.InputTextWithHint(ctx, '##secret' .. id, 'Paste the value', st.value, ImGui.InputTextFlags_Password)
+    st.value = v
+    if not q.sending then
+      if st.value ~= '' and primary('Save##' .. id) then
+        answer_request(q, '/sessions/' .. sid .. '/provide-secret',
+          '{' .. tid .. ',"secretName":' .. jstr(sval(p.secretName) or '') .. ',"value":' .. jstr(st.value) .. '}')
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Decline##' .. id) then answer_request(q, '/sessions/' .. sid .. '/provide-secret', '{' .. tid .. ',"decline":true}') end
+    end
+  elseif kind == 'script_run' then
+    wrapped(sval(p.explanation) or (who .. ' wants to run a script'))
+    if sval(p.script) and ImGui.TreeNode(ctx, 'Script (' .. (sval(p.scriptType) or 'shell') .. ')##' .. id) then
+      ImGui.PushFont(ctx, F.mono, FONT_SIZE - 1)
+      wrapped(p.script, C.muted)
+      ImGui.PopFont(ctx)
+      ImGui.TreePop(ctx)
+    end
+    if not q.sending then
+      if primary('Run##' .. id) then
+        answer_request(q, '/sessions/' .. sid .. '/run-script',
+          '{' .. tid .. ',"script":' .. jstr(sval(p.script) or '') .. ',"scriptType":' .. jstr(sval(p.scriptType) or '') .. '}')
+      end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/sessions/' .. sid .. '/run-script', '{' .. tid .. ',"decline":true}') end
+    end
+  elseif kind == 'capability_review' then
+    wrapped(who .. ' wants to use ' .. (sval(p.toolName) or sval(p.capability) or 'a capability'))
+    if not q.sending then
+      local cap = ',"capability":' .. jstr(sval(p.capability) or '')
+      local path = '/sessions/' .. sid .. '/capability-review'
+      if primary('Allow once##' .. id) then answer_request(q, path, '{' .. tid .. cap .. ',"scope":"once"}') end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Allow for this chat##' .. id) then answer_request(q, path, '{' .. tid .. cap .. ',"scope":"session"}') end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, path, '{' .. tid .. cap .. ',"decline":true}') end
+    end
+  elseif kind == 'proxy_review' or kind == 'x_agent_review' then
+    local what
+    local xa = type(p.xAgent) == 'table' and p.xAgent
+    if xa then
+      what = (sval(xa.operation) or 'contact') .. ' ' .. (sval(xa.targetAgentName) or sval(xa.targetAgentSlug) or 'another agent')
+    else
+      what = (sval(p.toolkit) or 'an account') .. ': ' .. (sval(p.endpointDescription) or ((sval(p.method) or '') .. ' ' .. (sval(p.targetPath) or '')))
+    end
+    wrapped(who .. ' wants to ' .. (xa and what or ('call ' .. what)))
+    if xa and sval(xa.preview) then wrapped(xa.preview, C.muted) end
+    if not q.sending then
+      if primary('Allow##' .. id) then answer_request(q, '/proxy-review/' .. id, '{"decision":"allow"}') end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/proxy-review/' .. id, '{"decision":"deny"}') end
+    end
+  else
+    local f = GAMUT_ASKS[kind]
+    wrapped(f and f(p) or (who .. ' needs something from you (' .. kind .. ')'))
+    if sval(p.reason) then wrapped(p.reason, C.muted) end
+    if primary('Open in Gamut##' .. id) then open_in_gamut() end
+  end
+  if q.err then wrapped(q.err, C.danger) end
+end
+
 local CHILD_BORDERS = ImGui.ChildFlags_Borders or ImGui.ChildFlags_Border or 1
-local function card(c, i)
+local function card(c)
+  local who = S.agent_name ~= '' and S.agent_name or S.agent
   ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, C.panel)
   ImGui.PushStyleColor(ctx, ImGui.Col_Border, C.border)
-  if ImGui.BeginChild(ctx, 'card' .. i, 0, CARD_H, CHILD_BORDERS, ImGui.WindowFlags_NoScrollbar) then
-    local who = S.agent_name ~= '' and S.agent_name or S.agent
+  ImGui.SetNextWindowSizeConstraints(ctx, 0, 0, 100000, 340)
+  local open = ImGui.BeginChild(ctx, 'card_' .. c.key, 0, 0, CHILD_BORDERS | ImGui.ChildFlags_AutoResizeY)
+  if open then
     local w = ImGui.GetContentRegionAvail(ctx)
     if c.kind == 'perm' then
-      local line = who .. ' wants to: ' .. c.p.title
-      ImGui.Text(ctx, truncate(line, w))
-      if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, line) end
+      wrapped(who .. ' wants to: ' .. c.p.title)
       local primed = false
       for k, o in ipairs(c.p.options) do
         if k > 1 then ImGui.SameLine(ctx) end
@@ -1478,10 +1836,10 @@ local function card(c, i)
       if #c.p.options == 0 and ImGui.Button(ctx, 'Dismiss##' .. c.p.id) then answer_perm(c.p, nil) end
     elseif c.kind == 'auth' then
       if S.auth.waiting then
-        ImGui.Text(ctx, truncate('Finish the ' .. who .. ' login in your browser', w))
+        wrapped('Finish the ' .. who .. ' login in your browser')
         ImGui.TextDisabled(ctx, 'This card closes by itself once you are in.')
       else
-        ImGui.Text(ctx, truncate(who .. ' is not connected yet', w))
+        wrapped(who .. ' is not connected yet')
         for k, m in ipairs(S.auth.methods) do
           if k > 1 then ImGui.SameLine(ctx) end
           local label = (k == 1 and 'Connect with ' or '') .. (sval(m.name) or sval(m.id) or '?') .. '##auth' .. k
@@ -1491,16 +1849,17 @@ local function card(c, i)
         end
         if #S.auth.methods == 0 then ImGui.TextDisabled(ctx, 'Checking…') end
       end
-      if S.auth.err then
-        ImGui.SameLine(ctx)
-        ImGui.TextColored(ctx, C.danger, truncate(S.auth.err, ImGui.GetContentRegionAvail(ctx)))
-      end
+      if S.auth.err then wrapped(S.auth.err, C.danger) end
+    elseif c.kind == 'greq' then
+      greq_card(c.q, who)
     else
       ImGui.Text(ctx, truncate(who .. ' is asking you something', w))
       if primary('Answer in Gamut') then open_in_gamut() end
     end
     ImGui.EndChild(ctx)
   end
+  local _, h = ImGui.GetItemRectSize(ctx)
+  S.card_h[c.key] = h
   ImGui.PopStyleColor(ctx, 2)
 end
 
@@ -1619,6 +1978,7 @@ end
 local function frame()
   local t0 = reaper.time_precise()
   if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
+  if (S.waiting or #S.greqs > 0) and t0 - S.greq_at > 3 then load_requests() end
   check_theme()
   poll_http()
   poll_stream()
@@ -1647,7 +2007,7 @@ local function frame()
       ImGui.PopTextWrapPos(ctx)
     else
       local cards = card_list()
-      local composer_h = 98 + #cards * (CARD_H + 6)
+      local composer_h = 98 + cards_height(cards)
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
         for _, m in ipairs(S.msgs) do
@@ -1673,7 +2033,7 @@ local function frame()
         ImGui.EndChild(ctx)
       end
 
-      for i, c in ipairs(cards) do card(c, i) end
+      for _, c in ipairs(cards) do card(c) end
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
       local ime = ime_scan()

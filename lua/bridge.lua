@@ -356,29 +356,79 @@ function DSL.ping()
   return { ret = { pong = true, version = VERSION, reaper = reaper.GetAppVersion() } }
 end
 
-function DSL.get_project_summary()
+function DSL.get_project_summary(detail)
   local n = reaper.CountTracks(0)
   local tracks = {}
   for i = 0, n - 1 do
     local t = reaper.GetTrack(0, i)
     local _, name = reaper.GetTrackName(t)
-    tracks[#tracks + 1] = {
+    local rec = {
       index = i, name = name, volume_db = vol_db(t),
       mute = reaper.GetMediaTrackInfo_Value(t, "B_MUTE") == 1,
       solo = reaper.GetMediaTrackInfo_Value(t, "I_SOLO") ~= 0,
       item_count = reaper.CountTrackMediaItems(t),
       fx_count = reaper.TrackFX_GetCount(t),
     }
+    if detail then
+      local has_midi, has_audio, midi_notes = false, false, 0
+      for j = 0, rec.item_count - 1 do
+        local take = reaper.GetActiveTake(reaper.GetTrackMediaItem(t, j))
+        if take and reaper.TakeIsMIDI(take) then
+          has_midi = true
+          local _, nc = reaper.MIDI_CountEvts(take)
+          midi_notes = midi_notes + (nc or 0)
+        elseif take then
+          has_audio = true
+        end
+      end
+      rec.has_midi = has_midi
+      rec.has_audio = has_audio
+      if has_midi then rec.midi_note_count = midi_notes end
+      local fd = reaper.GetMediaTrackInfo_Value(t, "I_FOLDERDEPTH")
+      if fd ~= 0 then rec.folder_depth = fd end
+    end
+    tracks[#tracks + 1] = rec
   end
   local _, proj = reaper.EnumProjects(-1, "")
-  return { ret = {
+  local ret = {
     project = proj ~= "" and proj or "(unsaved)",
     tempo_bpm = reaper.Master_GetTempo(),
     play_state = reaper.GetPlayState(),
     cursor_seconds = reaper.GetCursorPosition(),
     track_count = n,
     tracks = tracks,
-  } }
+  }
+  if detail then
+    local num, denom = 4, 4
+    if reaper.TimeMap_GetTimeSigAtTime then
+      local a, b = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+      if type(a) == "number" and a > 0 then num = a end
+      if type(b) == "number" and b > 0 then denom = b end
+    end
+    local length_sec = 0
+    if reaper.GetProjectLength then length_sec = reaper.GetProjectLength(0) or 0 end
+    ret.time_sig = { numerator = num, denominator = denom }
+    ret.length_beats = time_to_beats(length_sec)
+    ret.cursor_beats = time_to_beats(ret.cursor_seconds)
+    local markers = {}
+    local nm = 0
+    if reaper.CountProjectMarkers then nm = reaper.CountProjectMarkers(0) or 0 end
+    for i = 0, nm - 1 do
+      local retval, isrgn, pos, rgnend, name, idx = reaper.EnumProjectMarkers(i)
+      if retval and retval ~= 0 then
+        local m = {
+          index = idx,
+          name = name or "",
+          position_beats = time_to_beats(pos),
+          is_region = isrgn and true or false,
+        }
+        if isrgn then m.end_beats = time_to_beats(rgnend) end
+        markers[#markers + 1] = m
+      end
+    end
+    ret.markers = markers
+  end
+  return { ret = ret }
 end
 
 function DSL.list_tracks()

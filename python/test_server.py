@@ -124,9 +124,17 @@ def fake_bridge(bridge_dir, stop):
                 except OSError:
                     pass
             if func == "get_project_summary":
+                detail = bool((payload.get("args") or [False])[0])
                 ret = {"project": "(unsaved)", "tempo_bpm": 120.0,
                        "track_count": 1,
                        "tracks": [{"index": 0, "name": "Drums"}]}
+                if detail:
+                    ret["time_sig"] = {"numerator": 4, "denominator": 4}
+                    ret["length_beats"] = 32.0
+                    ret["cursor_beats"] = 0.0
+                    ret["markers"] = []
+                    ret["tracks"][0]["has_midi"] = True
+                    ret["tracks"][0]["has_audio"] = False
             elif func == "add_track":
                 ret = {"index": payload["args"][1] or 0,
                        "name": payload["args"][0] or ""}
@@ -197,6 +205,8 @@ def main():
         r = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
         check("initialize", r["result"]["serverInfo"]["name"] == "reaper-mcp")
         check("instructions present", "beats" in r["result"].get("instructions", ""))
+        check("instructions ask for detail on new projects",
+              "detail=true" in r["result"].get("instructions", ""))
         rpc(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
@@ -208,10 +218,25 @@ def main():
         check("no 100-tool dump", "setup_sidechain_compression" not in names)
         print("       tools:", sorted(names), "count=", len(names))
 
+        status_schema = next(t["inputSchema"] for t in r["result"]["tools"]
+                             if t["name"] == "status")
+        check("status schema has detail",
+              "detail" in status_schema.get("properties", {}))
+
         r = rpc(proc, {"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                        "params": {"name": "status", "arguments": {}}})
         body = json.loads(r["result"]["content"][0]["text"])
         check("status via fake bridge", body["tracks"][0]["name"] == "Drums")
+        check("light status has no time_sig", "time_sig" not in body)
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 31, "method": "tools/call",
+                       "params": {"name": "status", "arguments": {"detail": True}}})
+        body = json.loads(r["result"]["content"][0]["text"])
+        check("detailed status has time_sig",
+              body.get("time_sig") == {"numerator": 4, "denominator": 4})
+        check("detailed status has markers", "markers" in body)
+        check("detailed status does not guess chords", "chords" not in body
+              and "chord" not in body)
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                        "params": {"name": "track",

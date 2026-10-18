@@ -33,7 +33,9 @@ RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
 
 INSTRUCTIONS = (
     "Drive REAPER. Time is beats (quarter notes), track/item indices are 0-based. "
-    "Call status first. Prefer batch for multi-step edits. "
+    "Call status first. On a new or unknown project, call status with detail=true "
+    "before editing (arrangement facts only; do not infer chords). "
+    "Prefer batch for multi-step edits. "
     "Do not ExecProcess long commands in run_lua; it blocks the bridge. "
     "Use run_lua or reaper_call only for APIs not covered by the grouped tools."
 )
@@ -254,9 +256,11 @@ CC = {
 
 tool(
     "status",
-    "Check the Lua bridge and return project tempo, play state, and tracks. Call first.",
-    obj({}),
-    lambda b, a: b.call("get_project_summary"),
+    "Check the Lua bridge and return project tempo, play state, and tracks. Call first. "
+    "detail=true adds arrangement facts (time signature, length in beats, markers, "
+    "MIDI vs audio per track) without guessing chords.",
+    obj({"detail": {"type": "boolean"}}),
+    lambda b, a: b.call("get_project_summary", [bool(a.get("detail"))]),
 )
 
 tool(

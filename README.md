@@ -1,22 +1,30 @@
-# reaper-mcp
+# gamut-reaper-suite
 
 <img src="icons/reaper-mcp.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
-MCP server for [REAPER](https://reaper.fm).
+[REAPER](https://reaper.fm) tooling for AI agents, built around [Gamut](https://github.com/SkillfulAgents/SuperAgent):
+an MCP server that drives REAPER, a chat panel docked inside REAPER, and the macOS host setup that keeps both running.
 
-[![ci](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/reaper-mcp/actions/workflows/ci.yml)
+| Path | What |
+| --- | --- |
+| `reaper_mcp/`, `python/`, `lua/bridge.lua` | MCP server (`reaper-mcp`) + the Lua bridge that runs inside REAPER |
+| `gamut-chat/` | Gamut Chat — Cursor-style chat panel in REAPER (ReaImGui), talks to the local Gamut desktop app |
+| `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
+| `scripts/` | macOS host bootstrap (LaunchAgents + Cloudflare Tunnel) and hot-swap deploy of the bridge |
+
+[![ci](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml)
 
 ```
 MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge.lua (inside REAPER)
 ```
 
-Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
+Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. Call `status` first; on a new project pass `detail=true` for arrangement facts (time signature, length in beats, markers, MIDI vs audio) — not chords. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
 
 ## Setup
 
 ```bash
-git clone https://github.com/yiw190/reaper-mcp.git
-cd reaper-mcp
+git clone https://github.com/yiw190/gamut-reaper-suite.git
+cd gamut-reaper-suite
 python3 python/install_bridge.py
 ```
 
@@ -44,6 +52,37 @@ REAPER_MCP_DEBUG=1     Lua request log
 ```
 
 Mailbox is `%APPDATA%/reaper-mcp/ipc` (ASCII path both sides derive). Time is **beats**. Indices are 0-based.
+
+## Gamut Chat panel (macOS)
+
+Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and the Gamut desktop app running on the same Mac — the
+panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamut's own UI uses.
+
+1. Copy `gamut-chat/GamutChat.lua` to `<REAPER resource path>/Scripts/GamutChat/`, then **Actions → Load ReaScript** and run it.
+2. Optional: run `gamut-chat/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
+   binds **Cmd+L** to toggle it, and relaunches REAPER.
+
+What it does: pick an agent and a session, streamed replies with a markdown renderer, every message carries a
+`[REAPER context]` block (project, tempo, cursor, region, selection, MIDI editor notes, focused FX). Enter sends,
+Shift+Enter is a newline. When the agent asks a question or needs an approval, the panel jumps to that session in
+Gamut (`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
+ReaImGui passes keys to both the IME and ImGui, so the panel undoes ImGui's half of Backspace / arrows / Esc / Enter
+while a composition is open and shows the pending pinyin under the input.
+
+> Gamut's local API has no auth in desktop mode and listens on all interfaces. Block port 47891 in the macOS
+> firewall if the Mac is on a network you don't trust.
+
+## Start with REAPER
+
+Copy `reaper/__startup.lua` to `<REAPER resource path>/Scripts/__startup.lua` (or merge it into yours). It starts the
+MCP bridge and opens the chat panel on every launch, registering either script if REAPER doesn't know it yet.
+
+## Remote host (macOS + Cloudflare Tunnel)
+
+`scripts/macos-host-bootstrap.sh` installs cloudflared, clones this repo to `~/reaper-mcp`, and writes LaunchAgents for
+the HTTP MCP front (`python/http_server.py`, bearer auth) and the tunnel; secrets come from `~/.config/reaper-mcp/env`
+and never touch the repo. `scripts/deploy_bridge.py stage | swap | restart | verify` pushes a new bridge into a
+running REAPER without restarting it.
 
 ## Tools
 

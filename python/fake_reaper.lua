@@ -98,6 +98,24 @@ reaper.GetCursorPosition = function() return 0.0 end
 reaper.EnumProjects = function() return 0, "" end
 reaper.TimeMap2_QNToTime = function(_, qn) return qn * 0.5 end
 reaper.TimeMap2_timeToQN = function(_, t) return t / 0.5 end
+reaper.TimeMap_GetTimeSigAtTime = function() return 4, 4, 120.0 end
+reaper.GetProjectLength = function()
+  local max = 0
+  for _, t in ipairs(tracks) do
+    for _, it in ipairs(t.items) do
+      local e = (it.position or 0) + (it.length or 0)
+      if e > max then max = e end
+    end
+  end
+  return max
+end
+markers = markers or {}
+reaper.CountProjectMarkers = function() return #markers end
+reaper.EnumProjectMarkers = function(i)
+  local m = markers[i + 1]
+  if not m then return false, false, 0, 0, "", 0 end
+  return true, m.isrgn or false, m.pos or 0, m.rgnend or 0, m.name or "", m.idx or i
+end
 
 -- undo
 reaper.Undo_BeginBlock = function() hit("Undo_BeginBlock") end

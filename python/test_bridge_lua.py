@@ -215,6 +215,28 @@ def main() -> None:
 
     r = rpc("get_project_summary")
     check("status has no ipc", r.get("ok") and "ipc" not in r["ret"], r)
+    check("light status has no time_sig", "time_sig" not in r["ret"], r)
+
+    seeded_track(0)
+    lua.execute('markers = {{isrgn = false, pos = 0.0, name = "Intro", idx = 1}}')
+    r = rpc("get_project_summary", [True])
+    det = r.get("ret") or {}
+    tr0 = (det.get("tracks") or [{}])[0]
+    check("detailed status ok", r.get("ok"), r)
+    check("detailed time_sig 4/4",
+          (det.get("time_sig") or {}).get("numerator") == 4
+          and (det.get("time_sig") or {}).get("denominator") == 4, det)
+    check("detailed length_beats from project length",
+          abs(float(det.get("length_beats") or 0) - 4.0) < 1e-6, det)
+    check("detailed cursor_beats", "cursor_beats" in det, det)
+    check("detailed markers",
+          det.get("markers") and det["markers"][0].get("name") == "Intro", det)
+    check("detailed track is midi", tr0.get("has_midi") is True
+          and tr0.get("has_audio") is False, tr0)
+    check("detailed midi_note_count", tr0.get("midi_note_count") == 1, tr0)
+    check("detailed status does not guess chords",
+          "chords" not in det and "chord" not in det, det)
+    lua.execute("markers = {}")
 
     r = rpc("batch", [[{"func": "ping"}]])
     inner = r["ret"][0]

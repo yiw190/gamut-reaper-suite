@@ -1,6 +1,6 @@
 #!/bin/sh
 # Install the agent gateway as a LaunchAgent (127.0.0.1:47892).
-# WITH_CODEX=1 (default) also installs Node (user-level, ~/.local/node) and @agentclientprotocol/codex-acp.
+# WITH_CODEX=1 (default) also installs Node (user-level, ~/.local/node) and the Codex + Claude Code ACP adapters.
 # Re-run to upgrade; an existing ~/.config/agent-gateway/config.json is kept.
 set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,8 +23,9 @@ if [ "${WITH_CODEX:-1}" = 1 ]; then
     mv "$TMP/node-$V-darwin-$ARCH" "$NODE_DIR"
     rm -rf "$TMP"
   fi
-  echo "installing @agentclientprotocol/codex-acp"
-  PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/npm" install -g --no-fund --no-audit @agentclientprotocol/codex-acp
+  echo "installing ACP adapters: codex-acp, claude-agent-acp"
+  PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/npm" install -g --no-fund --no-audit \
+    @agentclientprotocol/codex-acp @agentclientprotocol/claude-agent-acp
   PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/codex-acp" --version || true
 fi
 
@@ -38,6 +39,14 @@ if [ ! -f "$CFG/config.json" ]; then
       "description": "OpenAI Codex CLI over ACP",
       "command": ["$NODE_DIR/bin/codex-acp"],
       "env": {"PATH": "$NODE_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+      "cwd": "~/Documents/REAPER Media"
+    },
+    {
+      "slug": "claude",
+      "name": "Claude Code",
+      "description": "Claude Code (Claude Agent SDK) over ACP; uses the local claude login",
+      "command": ["$NODE_DIR/bin/claude-agent-acp"],
+      "env": {"PATH": "$NODE_DIR/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
       "cwd": "~/Documents/REAPER Media"
     }
   ],

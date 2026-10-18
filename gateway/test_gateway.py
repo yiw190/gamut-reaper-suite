@@ -161,6 +161,13 @@ def main():
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut SSE proxied", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 
+        g.get("/api/agents/acp-fake/status?probe=1")
+        for _ in range(100):
+            st = g.get("/api/agents/acp-fake/status")
+            if st["connected"]:
+                break
+            time.sleep(0.05)
+        check("probe connects", st["connected"] and st["state"] == "ready")
         acfg = g.get("/api/agents/acp-fake/config")["configOptions"]
         check("acp model selector", acfg[0]["category"] == "model" and acfg[0]["currentValue"] == "fast")
         code, s = g.post("/api/agents/acp-fake/sessions", {"message": "use tool please", "config": {"model": "smart"}})
@@ -206,6 +213,13 @@ def main():
     tmp2 = tempfile.mkdtemp()
     g = GW(tmp2, gport, {"FAKE_ACP_AUTH": "1"})
     try:
+        g.get("/api/agents/acp-fake/status?probe=1")
+        for _ in range(100):
+            st = g.get("/api/agents/acp-fake/status")
+            if st["state"] == "auth_required":
+                break
+            time.sleep(0.05)
+        check("probe finds auth required", st["state"] == "auth_required" and not st["connected"])
         code, body = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         st = g.get("/api/agents/acp-fake/status")
         check("auth required surfaced", code == 401 and body["error"] == "auth_required"
@@ -216,7 +230,7 @@ def main():
                 break
             time.sleep(0.05)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
-        check("login then session", code == 201)
+        check("login then session", code == 201 and g.get("/api/agents/acp-fake/status")["connected"])
     finally:
         g.stop()
     print("all passed")

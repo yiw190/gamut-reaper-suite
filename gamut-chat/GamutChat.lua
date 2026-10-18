@@ -144,8 +144,9 @@ local S = {
   input = '', attach = true, focus = true, scroll = true,
   sessions = {}, sess_at = 0,
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
-  cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil,
+  cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil, acp_status = {},
 }
+local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
 local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
 local function via_gateway() return HOST == HOSTS[1] end
 -- per-agent selector picks (model / effort / mode), stored as "id\tvalue" lines
@@ -661,33 +662,40 @@ local function load_agents(try)
   end)
 end
 
-local function load_status()
-  if not via_gateway() or not is_acp() then return end
-  S.auth_at = reaper.time_precise()
-  local agent = S.agent
-  http('GET', '/status', nil, function(code, body)
+-- ACP agent status for the picker dots and the login card; probe=true starts the agent to find out
+local function load_acp_status(slug, probe)
+  if not via_gateway() or slug:sub(1, 4) ~= 'acp-' then return end
+  if slug == S.agent then S.auth_at = reaper.time_precise() end
+  http_url('GET', HOST .. '/api/agents/' .. slug .. '/status' .. (probe and '?probe=1' or ''), nil, function(code, body)
     local r = decode(body)
-    if agent ~= S.agent or code ~= 200 or type(r) ~= 'table' then return end
-    local err = type(r.error) == 'string' and r.error or nil
-    if r.state == 'auth_required' then
+    if code ~= 200 or type(r) ~= 'table' then return end
+    local err = sval(r.error)
+    local st = { state = sval(r.state) or '', connected = r.connected == true, err = err,
+      methods = type(r.authMethods) == 'table' and r.authMethods or {} }
+    S.acp_status[slug] = st
+    if slug ~= S.agent then return end
+    if st.connected then
+      if S.auth then S.auth, S.err = nil, nil end
+      if #S.cfg_opts == 0 and not S.cfg_pending then load_config() end
+    elseif st.state == 'auth_required' then
       local waiting = S.auth and S.auth.waiting and err == nil
-      S.auth = { methods = type(r.authMethods) == 'table' and r.authMethods or {}, err = err, waiting = waiting }
-    elseif r.state == 'authenticating' then
-      S.auth = S.auth or { methods = {} }
+      S.auth = { methods = st.methods, err = err, waiting = waiting }
+    elseif st.state == 'authenticating' then
+      S.auth = S.auth or { methods = st.methods }
       S.auth.waiting = true
-    elseif S.auth and r.state == 'ready' then
-      S.auth, S.err = nil, nil
-      load_config()
     end
   end)
 end
+local function load_status() if is_acp() then load_acp_status(S.agent, false) end end
 
 function load_config()
   S.cfg_loaded = true
   S.cfg_opts = {}
   if not via_gateway() or S.agent == '' then return end
   local agent = S.agent
+  S.cfg_pending = true
   http('GET', '/config', nil, function(code, body)
+    if agent == S.agent then S.cfg_pending = false end
     if agent ~= S.agent then return end
     local r = decode(body)
     if code == 200 and type(r) == 'table' and type(r.configOptions) == 'table' then
@@ -731,6 +739,7 @@ local function choose_agent(slug, name)
   cfg_load()
   S.auth = nil
   load_config()
+  if is_acp() then load_acp_status(S.agent, true) end
   if S.sid ~= '' then stream_start(); refresh_messages() end
   S.focus = true
 end
@@ -803,6 +812,8 @@ local function build_palette()
   C.rule = dark and 0x5A5A5AFF or 0xD0D7DEFF
   C.hover = dark and 0x4A4A4AFF or 0xEAEEF2FF
   C.danger = dark and 0xF47067FF or 0xCF222EFF
+  C.ok = dark and 0x3FB950FF or 0x1A7F37FF
+  C.warn = dark and 0xD29922FF or 0x9A6700FF
   C.body = alpha(C.text, 0xE6)
   COLORS = {
     { ImGui.Col_WindowBg, C.bg }, { ImGui.Col_ChildBg, 0x00000000 }, { ImGui.Col_PopupBg, C.panel },
@@ -1130,24 +1141,194 @@ local function tools_line(tools)
 end
 
 ---------------------------------------------------------------- UI
-local function agent_combo(width)
-  ImGui.SetNextItemWidth(ctx, width)
-  local preview = S.agent == '' and 'Choose an agent…' or (S.agent_name ~= '' and S.agent_name or S.agent)
-  if ImGui.BeginCombo(ctx, '##agent', preview, ImGui.ComboFlags_HeightLarge) then
-    if reaper.time_precise() - S.agents_at > 2 then load_agents() end
-    for _, a in ipairs(S.agents) do
-      if ImGui.Selectable(ctx, a.name .. (a.acp and '   (ACP)' or '') .. '##' .. a.slug, a.slug == S.agent) then
-        choose_agent(a.slug, a.name)
-      end
-      if a.desc ~= '' and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, a.desc) end
+local function truncate(str, w)
+  if ImGui.CalcTextSize(ctx, str) <= w then return str end
+  local n = utf8.len(str) or #str
+  while n > 1 do
+    n = n - 1
+    local cut = str:sub(1, (utf8.offset(str, n + 1) or (#str + 1)) - 1) .. '…'
+    if ImGui.CalcTextSize(ctx, cut) <= w then return cut end
+  end
+  return '…'
+end
+
+local function flat_push(col)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C.hover)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C.hover)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, col or C.muted)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 6, 3)
+end
+local function flat_pop()
+  ImGui.PopStyleVar(ctx)
+  ImGui.PopStyleColor(ctx, 4)
+end
+local function chevron(x2, y1, y2, col)
+  local cx, cy = x2 - 11, (y1 + y2) / 2 + 1
+  ImGui.DrawList_AddTriangleFilled(ImGui.GetWindowDrawList(ctx), cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5, col)
+end
+local function dot(col, x, y) ImGui.DrawList_AddCircleFilled(ImGui.GetWindowDrawList(ctx), x, y, 3.5, col) end
+
+-- frameless muted button; chevron=false for toggles
+local function chip(id, label, col, with_chevron)
+  flat_push(col)
+  local clicked = ImGui.Button(ctx, label .. (with_chevron == false and '' or '     ') .. '##chip_' .. id)
+  flat_pop()
+  if with_chevron ~= false then
+    local _, y1 = ImGui.GetItemRectMin(ctx)
+    local x2, y2 = ImGui.GetItemRectMax(ctx)
+    chevron(x2, y1, y2, col or C.muted)
+  end
+  return clicked
+end
+
+local function icon_button(id, kind, col, tip)
+  local sz = ImGui.GetFrameHeight(ctx)
+  local clicked = ImGui.InvisibleButton(ctx, '##icon_' .. id, sz, sz)
+  local x1, y1 = ImGui.GetItemRectMin(ctx)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + sz, y1 + sz, C.hover, 6)
+    if tip then ImGui.SetTooltip(ctx, tip) end
+  end
+  local cx, cy = x1 + sz / 2, y1 + sz / 2
+  col = col or C.muted
+  if kind == 'clock' then
+    ImGui.DrawList_AddCircle(dl, cx, cy, 6.5, col, 0, 1.5)
+    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx, cy - 3.5, col, 1.5)
+    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx + 3, cy + 2, col, 1.5)
+  elseif kind == 'plus' then
+    ImGui.DrawList_AddLine(dl, cx - 5.5, cy, cx + 5.5, cy, col, 1.6)
+    ImGui.DrawList_AddLine(dl, cx, cy - 5.5, cx, cy + 5.5, col, 1.6)
+  else
+    ImGui.DrawList_AddRectFilled(dl, cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, col, 2)
+  end
+  return clicked
+end
+
+local function agent_dot(a)
+  if not a.acp then return C.ok end
+  local st = S.acp_status[a.slug]
+  if not st then return C.muted end
+  if st.connected then return C.ok end
+  if st.state == 'starting' or st.state == 'authenticating' then return C.warn end
+  return C.muted
+end
+
+local NO_CLOSE = ImGui.SelectableFlags_NoAutoClosePopups or ImGui.SelectableFlags_DontClosePopups or 0
+
+-- one picker for every backend: Gamut agents and local ACP agents, each with a status dot and Connect
+local function agent_picker()
+  local cur
+  for _, a in ipairs(S.agents) do if a.slug == S.agent then cur = a end end
+  local name = S.agent == '' and 'Choose an agent' or (S.agent_name ~= '' and S.agent_name or S.agent)
+  flat_push(C.text)
+  local clicked = ImGui.Button(ctx, '    ' .. name .. '     ##agentpick')
+  flat_pop()
+  local x1, y1 = ImGui.GetItemRectMin(ctx)
+  local x2, y2 = ImGui.GetItemRectMax(ctx)
+  dot(cur and agent_dot(cur) or C.muted, x1 + 11, (y1 + y2) / 2)
+  chevron(x2, y1, y2, C.muted)
+  if clicked then
+    ImGui.OpenPopup(ctx, 'agentpop')
+    load_agents()
+    for _, a in ipairs(S.agents) do if a.acp then load_acp_status(a.slug, true) end end
+    S.agentpop_at = reaper.time_precise()
+  end
+  ImGui.SetNextWindowSizeConstraints(ctx, 250, 0, 420, 480)
+  if ImGui.BeginPopup(ctx, 'agentpop') then
+    if reaper.time_precise() - (S.agentpop_at or 0) > 2 then
+      S.agentpop_at = reaper.time_precise()
+      for _, a in ipairs(S.agents) do if a.acp then load_acp_status(a.slug, false) end end
     end
+    local function section(title, acp)
+      local first = true
+      for _, a in ipairs(S.agents) do
+        if (a.acp == true) == acp then
+          if first then ImGui.TextDisabled(ctx, title); first = false end
+          local st = a.acp and S.acp_status[a.slug]
+          local need = st and not st.connected and st.state == 'auth_required'
+          local busy = st and not st.connected and (st.state == 'starting' or st.state == 'authenticating')
+          local tag = need and 'Connect' or (busy and 'checking…' or nil)
+          local tw_ = tag and (ImGui.CalcTextSize(ctx, tag) + 18) or 0
+          if ImGui.Selectable(ctx, '    ' .. a.name .. '##' .. a.slug, a.slug == S.agent, 0,
+              ImGui.GetContentRegionAvail(ctx) - tw_, 0) then
+            choose_agent(a.slug, a.name)
+          end
+          if a.desc ~= '' and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, a.desc) end
+          local sx1, sy1 = ImGui.GetItemRectMin(ctx)
+          local _, sy2 = ImGui.GetItemRectMax(ctx)
+          dot(agent_dot(a), sx1 + 8, (sy1 + sy2) / 2)
+          if need then
+            ImGui.SameLine(ctx)
+            if ImGui.SmallButton(ctx, 'Connect##c' .. a.slug) then
+              choose_agent(a.slug, a.name)
+              S.auth = { methods = st.methods }
+              ImGui.CloseCurrentPopup(ctx)
+            end
+          elseif busy then
+            ImGui.SameLine(ctx)
+            ImGui.TextDisabled(ctx, tag)
+          end
+        end
+      end
+      if not first then ImGui.Spacing(ctx) end
+    end
+    section('Gamut', false)
+    section('On this Mac', true)
     if #S.agents == 0 then ImGui.TextDisabled(ctx, S.agents_err or 'loading…') end
-    ImGui.EndCombo(ctx)
+    ImGui.EndPopup(ctx)
   end
 end
 
-local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
-local SHOWN = { model = true, thought_level = true, model_config = true, mode = true }
+local function history_popup()
+  ImGui.SetNextWindowSizeConstraints(ctx, 260, 0, 460, 480)
+  if ImGui.BeginPopup(ctx, 'histpop') then
+    if reaper.time_precise() - S.sess_at > 2 then load_sessions() end
+    ImGui.TextDisabled(ctx, 'Recent chats')
+    local dl = ImGui.GetWindowDrawList(ctx)
+    for _, x in ipairs(S.sessions) do
+      local aw = ImGui.CalcTextSize(ctx, x.age)
+      local label = truncate((x.active and '● ' or '') .. x.name, ImGui.GetContentRegionAvail(ctx) - aw - 16)
+      if ImGui.Selectable(ctx, label .. '##' .. x.id, x.id == S.sid) then switch_session(x.id, x.name) end
+      local _, sy1 = ImGui.GetItemRectMin(ctx)
+      local sx2 = ImGui.GetItemRectMax(ctx)
+      ImGui.DrawList_AddText(dl, sx2 - aw - 4, sy1, C.muted, x.age)
+    end
+    if #S.sessions == 0 then ImGui.TextDisabled(ctx, 'No chats yet') end
+    ImGui.EndPopup(ctx)
+  end
+end
+
+local function header()
+  agent_picker()
+  if S.agent == '' then return end
+  local sz = ImGui.GetFrameHeight(ctx)
+  local n = S.active and 3 or 2
+  local right = n * sz + (n - 1) * 2
+  ImGui.SameLine(ctx)
+  local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
+  local room = ImGui.GetContentRegionAvail(ctx) - right - 8
+  if room > 40 then
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.TextDisabled(ctx, truncate(title, room))
+    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, title) end
+    ImGui.SameLine(ctx)
+  end
+  ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + math.max(0, ImGui.GetContentRegionAvail(ctx) - right))
+  if S.active then
+    if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
+    ImGui.SameLine(ctx, 0, 2)
+  end
+  if icon_button('hist', 'clock', nil, 'Recent chats') then
+    load_sessions()
+    ImGui.OpenPopup(ctx, 'histpop')
+  end
+  ImGui.SameLine(ctx, 0, 2)
+  if icon_button('new', 'plus', nil, 'New chat') then new_chat() end
+  history_popup()
+end
+
 local function opt_items(o) -- ACP options may be grouped: {group, name, options = {...}}
   local out = {}
   for _, x in ipairs(type(o.options) == 'table' and o.options or {}) do
@@ -1160,93 +1341,167 @@ local function opt_items(o) -- ACP options may be grouped: {group, name, options
   return out
 end
 
--- Cursor-style pickers under the composer: frameless muted chips with a chevron, popup list on click.
--- Values are sent with the next message; the gateway maps them to Gamut's model/effort or ACP config options.
-local function chip(id, label)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0)
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C.hover)
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C.hover)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.muted)
-  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 6, 2)
-  local clicked = ImGui.Button(ctx, label .. '     ##chip_' .. id)
-  ImGui.PopStyleVar(ctx)
-  ImGui.PopStyleColor(ctx, 4)
-  local x1, y1 = ImGui.GetItemRectMin(ctx)
-  local x2, y2 = ImGui.GetItemRectMax(ctx)
-  local cx, cy = x2 - 11, (y1 + y2) / 2 + 1
-  ImGui.DrawList_AddTriangleFilled(ImGui.GetWindowDrawList(ctx), cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5, C.muted)
-  return clicked
-end
-
-local function config_chips()
-  local shown = {}
+-- one chip for model + effort (+ mode); the popup has a section for each
+local function model_chip()
+  local model, effort, mode
   for _, o in ipairs(S.cfg_opts) do
-    if type(o) == 'table' and o.type == 'select' and SHOWN[o.category] and #shown < 3 then shown[#shown + 1] = o end
-  end
-  for i, o in ipairs(shown) do
-    local id = sval(o.id) or tostring(i)
-    local items = opt_items(o)
-    local cur = S.cfg_sel[id] or sval(o.currentValue) or ''
-    local label, groups = nil, {}
-    for _, it in ipairs(items) do if it.group and it.group ~= '' then groups[it.group] = true end end
-    local multi = next(groups) ~= nil and next(groups, next(groups)) ~= nil
-    for _, it in ipairs(items) do
-      if it.value == cur then label = (multi and it.group and it.group ~= '') and (it.group .. ' · ' .. (it.name or cur)) or it.name end
+    if type(o) == 'table' and o.type == 'select' then
+      if o.category == 'model' and not model then model = o
+      elseif (o.category == 'thought_level' or o.category == 'model_config') and not effort then effort = o
+      elseif o.category == 'mode' and not mode then mode = o end
     end
-    if cur == '' or not label then label = (o.category == 'model' and 'Auto') or (sval(o.name) or id):lower() end
-    if i > 1 then ImGui.SameLine(ctx, 0, 2) end
-    if chip(id, label) then ImGui.OpenPopup(ctx, 'cfgpop_' .. id) end
-    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, sval(o.name) or id) end
-    ImGui.SetNextWindowSizeConstraints(ctx, 180, 0, 360, 420)
-    if ImGui.BeginPopup(ctx, 'cfgpop_' .. id) then
+  end
+  if not (model or effort or mode) then return end
+  local function cur_of(o) local id = sval(o.id) or o.category; return id, S.cfg_sel[id] or sval(o.currentValue) or '' end
+  local function groups_of(items)
+    local g, n = {}, 0
+    for _, it in ipairs(items) do if it.group and it.group ~= '' and not g[it.group] then g[it.group] = true; n = n + 1 end end
+    return n
+  end
+  local parts = {}
+  if model then
+    local _, v = cur_of(model)
+    local items = opt_items(model)
+    local multi = groups_of(items) > 1
+    local label = 'Auto'
+    for _, it in ipairs(items) do
+      if it.value == v and v ~= '' then label = (multi and it.group and it.group ~= '') and (it.group .. ' · ' .. (it.name or v)) or (it.name or v) end
+    end
+    parts[#parts + 1] = label
+  end
+  if effort then
+    local _, v = cur_of(effort)
+    for _, it in ipairs(opt_items(effort)) do if it.value == v and v ~= '' then parts[#parts + 1] = it.name or v end end
+  end
+  if #parts == 0 and mode then
+    local _, v = cur_of(mode)
+    for _, it in ipairs(opt_items(mode)) do if it.value == v then parts[#parts + 1] = it.name or v end end
+  end
+  if chip('model', table.concat(parts, ' · '), C.muted) then ImGui.OpenPopup(ctx, 'modelpop') end
+  if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, 'Model and effort for the next message') end
+  ImGui.SetNextWindowSizeConstraints(ctx, 240, 0, 380, 520)
+  if ImGui.BeginPopup(ctx, 'modelpop') then
+    local function pick(id, value)
+      S.cfg_sel[id] = value
+      cfg_save()
+    end
+    local function vertical(o, title)
+      local id, cur = cur_of(o)
+      local items = opt_items(o)
+      local multi = groups_of(items) > 1
+      ImGui.TextDisabled(ctx, title)
       local group
       for _, it in ipairs(items) do
-        if it.group and it.group ~= '' and it.group ~= group then
+        if multi and it.group and it.group ~= group then
           group = it.group
-          if _ > 1 then ImGui.Spacing(ctx) end
-          ImGui.TextDisabled(ctx, group)
+          ImGui.TextColored(ctx, C.muted, '  ' .. group)
         end
         local on = it.value == cur
         if on then ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.accent) end
-        if ImGui.Selectable(ctx, (it.name or it.value) .. '##' .. it.value, on) then
-          S.cfg_sel[id] = it.value
-          cfg_save()
+        if ImGui.Selectable(ctx, '    ' .. (it.name or it.value) .. '##' .. id .. it.value, on, NO_CLOSE) then pick(id, it.value) end
+        if on then ImGui.PopStyleColor(ctx) end
+      end
+    end
+    local sections = 0
+    if model then vertical(model, 'Model'); sections = sections + 1 end
+    if effort then
+      if sections > 0 then ImGui.Separator(ctx) end
+      local id, cur = cur_of(effort)
+      ImGui.TextDisabled(ctx, 'Effort')
+      for k, it in ipairs(opt_items(effort)) do
+        if k > 1 then ImGui.SameLine(ctx, 0, 4) end
+        local on = it.value == cur
+        local label = it.name or it.value
+        if on then ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.accent) end
+        if ImGui.Selectable(ctx, label .. '##eff' .. it.value, on, NO_CLOSE, ImGui.CalcTextSize(ctx, label) + 12, 0) then
+          pick(id, it.value)
         end
         if on then ImGui.PopStyleColor(ctx) end
       end
-      ImGui.EndPopup(ctx)
+      sections = sections + 1
     end
+    if mode then
+      if sections > 0 then ImGui.Separator(ctx) end
+      vertical(mode, 'Mode')
+    end
+    ImGui.EndPopup(ctx)
   end
-  return #shown
 end
 
-local function header()
-  local bw = 30
-  local avail = ImGui.GetContentRegionAvail(ctx)
-  agent_combo(avail)
-  if S.agent == '' then return end
-  local right = (S.active and (bw * 2 + 8) or bw)
-  ImGui.SetNextItemWidth(ctx, ImGui.GetContentRegionAvail(ctx) - right - 8)
-  local preview = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or S.sid:sub(1, 8))
-  if ImGui.BeginCombo(ctx, '##history', preview, ImGui.ComboFlags_HeightLarge) then
-    if reaper.time_precise() - S.sess_at > 2 then load_sessions() end
-    if ImGui.Selectable(ctx, '+  New chat', S.sid == '') then new_chat() end
-    ImGui.Separator(ctx)
-    for _, x in ipairs(S.sessions) do
-      local label = (x.active and '● ' or '   ') .. x.name .. '   ' .. x.age .. '##' .. x.id
-      if ImGui.Selectable(ctx, label, x.id == S.sid) then switch_session(x.id, x.name) end
+local function context_chip()
+  local on = S.attach
+  if chip('ctx', '◆ REAPER', on and C.accent or C.muted, false) then S.attach = not S.attach end
+  if ImGui.IsItemHovered(ctx) then
+    ImGui.SetTooltip(ctx, on and ('Sent with every message: ' .. chip_text() .. '\nClick to turn off')
+      or 'REAPER context is off. Click to attach it')
+  end
+end
+
+-- cards above the input: things that need you (tool permission, login, a question waiting in Gamut)
+local CARD_H = 66
+local function card_list()
+  local L = {}
+  for _, p in ipairs(S.perms) do L[#L + 1] = { kind = 'perm', p = p } end
+  if S.auth and is_acp() then L[#L + 1] = { kind = 'auth' } end
+  if S.waiting then L[#L + 1] = { kind = 'wait' } end
+  return L
+end
+local function primary(label)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, C.accent)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, alpha(C.accent, 0xDD))
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, alpha(C.accent, 0xBB))
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFFFFFFF)
+  local clicked = ImGui.Button(ctx, label)
+  ImGui.PopStyleColor(ctx, 4)
+  return clicked
+end
+local CHILD_BORDERS = ImGui.ChildFlags_Borders or ImGui.ChildFlags_Border or 1
+local function card(c, i)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, C.panel)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Border, C.border)
+  if ImGui.BeginChild(ctx, 'card' .. i, 0, CARD_H, CHILD_BORDERS, ImGui.WindowFlags_NoScrollbar) then
+    local who = S.agent_name ~= '' and S.agent_name or S.agent
+    local w = ImGui.GetContentRegionAvail(ctx)
+    if c.kind == 'perm' then
+      local line = who .. ' wants to: ' .. c.p.title
+      ImGui.Text(ctx, truncate(line, w))
+      if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, line) end
+      local primed = false
+      for k, o in ipairs(c.p.options) do
+        if k > 1 then ImGui.SameLine(ctx) end
+        local label = (sval(o.name) or sval(o.optionId) or '?') .. '##' .. c.p.id .. k
+        local allow = (sval(o.kind) or ''):match('^allow')
+        local clicked
+        if allow and not primed then primed = true; clicked = primary(label) else clicked = ImGui.Button(ctx, label) end
+        if clicked then answer_perm(c.p, sval(o.optionId)) end
+      end
+      if #c.p.options == 0 and ImGui.Button(ctx, 'Dismiss##' .. c.p.id) then answer_perm(c.p, nil) end
+    elseif c.kind == 'auth' then
+      if S.auth.waiting then
+        ImGui.Text(ctx, truncate('Finish the ' .. who .. ' login in your browser', w))
+        ImGui.TextDisabled(ctx, 'This card closes by itself once you are in.')
+      else
+        ImGui.Text(ctx, truncate(who .. ' is not connected yet', w))
+        for k, m in ipairs(S.auth.methods) do
+          if k > 1 then ImGui.SameLine(ctx) end
+          local label = (k == 1 and 'Connect with ' or '') .. (sval(m.name) or sval(m.id) or '?') .. '##auth' .. k
+          local clicked = (k == 1) and primary(label) or ImGui.Button(ctx, label)
+          if clicked then start_login(sval(m.id)) end
+          if sval(m.description) and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, m.description) end
+        end
+        if #S.auth.methods == 0 then ImGui.TextDisabled(ctx, 'Checking…') end
+      end
+      if S.auth.err then
+        ImGui.SameLine(ctx)
+        ImGui.TextColored(ctx, C.danger, truncate(S.auth.err, ImGui.GetContentRegionAvail(ctx)))
+      end
+    else
+      ImGui.Text(ctx, truncate(who .. ' is asking you something', w))
+      if primary('Answer in Gamut') then open_in_gamut() end
     end
-    if #S.sessions == 0 then ImGui.TextDisabled(ctx, 'loading…') end
-    ImGui.EndCombo(ctx)
+    ImGui.EndChild(ctx)
   end
-  if S.active then
-    ImGui.SameLine(ctx)
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.danger)
-    if ImGui.Button(ctx, '■', bw) then stop() end
-    ImGui.PopStyleColor(ctx)
-  end
-  ImGui.SameLine(ctx)
-  if ImGui.Button(ctx, '+', bw) then new_chat() end
+  ImGui.PopStyleColor(ctx, 2)
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
@@ -1388,10 +1643,11 @@ local function frame()
     if S.agent == '' then
       ImGui.Dummy(ctx, 0, 40)
       ImGui.PushTextWrapPos(ctx, 0)
-      ImGui.TextDisabled(ctx, 'Choose an agent to start: Gamut agents from the Gamut app on this Mac, plus ACP agents (Codex, …) from the agent gateway.')
+      ImGui.TextDisabled(ctx, 'Pick an agent at the top left to start.')
       ImGui.PopTextWrapPos(ctx)
     else
-      local composer_h = 122
+      local cards = card_list()
+      local composer_h = 98 + #cards * (CARD_H + 6)
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
         for _, m in ipairs(S.msgs) do
@@ -1409,34 +1665,7 @@ local function frame()
         for _, b in ipairs(S.live) do
           if b.kind == 'text' then md(b, b.text) else ImGui.TextDisabled(ctx, '→ ' .. b.text) end
         end
-        for _, p in ipairs(S.perms) do
-          ImGui.PushTextWrapPos(ctx, 0)
-          ImGui.TextColored(ctx, C.accent, 'Allow: ' .. p.title .. '?')
-          ImGui.PopTextWrapPos(ctx)
-          for i, o in ipairs(p.options) do
-            if i > 1 then ImGui.SameLine(ctx) end
-            if ImGui.SmallButton(ctx, (sval(o.name) or sval(o.optionId) or '?') .. '##' .. p.id .. i) then answer_perm(p, sval(o.optionId)) end
-          end
-          if #p.options == 0 and ImGui.SmallButton(ctx, 'Dismiss##' .. p.id) then answer_perm(p, nil) end
-        end
-        if S.auth then
-          ImGui.TextColored(ctx, C.accent, (S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login')
-          if S.auth.waiting then
-            ImGui.TextDisabled(ctx, 'Finish the login in the browser window…')
-          else
-            for i, m in ipairs(S.auth.methods) do
-              if i > 1 then ImGui.SameLine(ctx) end
-              if ImGui.SmallButton(ctx, (sval(m.name) or sval(m.id) or '?') .. '##auth' .. i) then start_login(sval(m.id)) end
-              if sval(m.description) and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, m.description) end
-            end
-          end
-          if S.auth.err then ImGui.TextColored(ctx, C.danger, S.auth.err) end
-        end
-        if S.waiting then
-          ImGui.TextColored(ctx, C.accent, 'Answer in Gamut')
-          ImGui.SameLine(ctx)
-          if ImGui.SmallButton(ctx, 'Open Gamut') then open_in_gamut() end
-        elseif S.active then
+        if S.active and not S.waiting then
           local s = spin[(math.floor(reaper.time_precise() * 6) % #spin) + 1]
           ImGui.TextColored(ctx, C.accent, 'Working ' .. s)
         end
@@ -1444,12 +1673,7 @@ local function frame()
         ImGui.EndChild(ctx)
       end
 
-      local rv
-      rv, S.attach = ImGui.Checkbox(ctx, '##attach', S.attach)
-      ImGui.SameLine(ctx)
-      ImGui.PushTextWrapPos(ctx, 0)
-      if S.attach then ImGui.TextDisabled(ctx, '◆ ' .. chip_text()) else ImGui.TextDisabled(ctx, 'context off') end
-      ImGui.PopTextWrapPos(ctx)
+      for i, c in ipairs(cards) do card(c, i) end
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
       local ime = ime_scan()
@@ -1474,10 +1698,12 @@ local function frame()
       ImGui.DrawList_AddRect(ImGui.GetWindowDrawList(ctx), x1, y1, x2, y2,
         focused and C.accent or C.border, 6, 0, focused and 2 or 1)
       if entered then send() end
-      local n = config_chips()
+      context_chip()
+      ImGui.SameLine(ctx, 0, 2)
+      model_chip()
       local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or 'Enter to send'
       local hw = ImGui.CalcTextSize(ctx, hint)
-      if n > 0 then ImGui.SameLine(ctx) end
+      ImGui.SameLine(ctx)
       local gap = ImGui.GetContentRegionAvail(ctx) - hw
       if gap > 0 then ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + gap) end
       ImGui.AlignTextToFramePadding(ctx)

@@ -83,13 +83,14 @@ MCP bridge and opens the chat panel on every launch, registering either script i
 
 `gateway/agent_gateway.py` is a small local server (`127.0.0.1:47892`, stdlib Python) that the panel talks to first.
 It proxies Gamut agents unchanged and adds [ACP](https://agentclientprotocol.com) agents — Codex via
-`@agentclientprotocol/codex-acp`, and anything else that speaks ACP — under the same API. Each ACP session gets this
+`@agentclientprotocol/codex-acp`, Claude Code via `@agentclientprotocol/claude-agent-acp`, and anything else that
+speaks ACP — under the same API. Subscriptions work: Codex logs in with ChatGPT, Claude Code reuses the local `claude` login. Each ACP session gets this
 repo's MCP server, so every backend can drive REAPER. The panel shows model / effort / mode pickers for both kinds
 (Gamut's model catalog, ACP config options), permission buttons when an ACP agent asks before a tool call, and a
 login button when the agent needs one. If the gateway isn't running the panel falls back to Gamut directly.
 
 ```bash
-sh gateway/install_macos.sh          # LaunchAgent + Node (~/.local/node) + codex-acp; WITH_CODEX=0 to skip
+sh gateway/install_macos.sh          # LaunchAgent + Node (~/.local/node) + Codex/Claude ACP adapters; WITH_CODEX=0 to skip
 python3 gateway/test_gateway.py      # fake Gamut + fake ACP agent, no network
 ```
 

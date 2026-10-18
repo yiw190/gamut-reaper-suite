@@ -185,6 +185,8 @@ class AcpAgent:
         self.pending = {}
         self.state = "stopped"
         self.error = None
+        self.connected = False
+        self.probing = False
         self.auth_methods = []
         self.caps = {}
         self.sessions = {}
@@ -346,9 +348,9 @@ class AcpAgent:
             res = self.request("session/new", {"cwd": cwd, "mcpServers": self.mcp_servers}, timeout=180)
         except AcpError as e:
             if e.code == AUTH_REQUIRED:
-                self.state = "auth_required"
+                self.state, self.connected = "auth_required", False
             raise
-        self.state = "ready"
+        self.state, self.connected = "ready", True
         cfg = normalize_config(res)
         if cfg:
             self.config_cache = cfg
@@ -484,12 +486,25 @@ class AcpAgent:
         s.emit("permission_resolved", requestId=request_id)
         return True
 
+    def probe(self):
+        """Start the agent and open a warm session so the picker knows whether it is logged in."""
+        if self.probing or self.connected:
+            return
+        self.probing = True
+        try:
+            self.get_config()
+        except Exception as e:  # surfaced through state/error
+            if self.state not in ("auth_required",):
+                self.error = str(e)
+        finally:
+            self.probing = False
+
     def authenticate(self, method_id):
         self.ensure()
         self.state = "authenticating"
         try:
             self.request("authenticate", {"methodId": method_id}, timeout=900)
-            self.state, self.error = "ready", None
+            self.state, self.error, self.connected = "ready", None, True
         except AcpError as e:
             self.state, self.error = "auth_required", e.message
 
@@ -591,7 +606,7 @@ class Handler(BaseHTTPRequestHandler):
         self.route("DELETE")
 
     def route(self, method):
-        path = self.path.split("?", 1)[0]
+        path = self.path.split("?", 1)[0]  # acp_route reads the query (?probe=1) from self.path
         parts = [p for p in path.split("/") if p]
         try:
             if path == "/health":
@@ -628,7 +643,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def acp_route(self, method, a, rest):
         if method == "GET" and rest == ["status"]:
-            return self.reply(200, {"state": a.state, "error": a.error, "authMethods": a.auth_methods})
+            if "probe=1" in self.path and not a.connected and a.state in ("stopped", "ready", "error"):
+                threading.Thread(target=a.probe, daemon=True).start()
+            return self.reply(200, {"state": "starting" if a.probing else a.state, "connected": a.connected,
+                                    "error": a.error, "authMethods": a.auth_methods})
         if method == "POST" and rest == ["auth"]:
             mid = self.body().get("methodId")
             threading.Thread(target=a.authenticate, args=(mid,), daemon=True).start()

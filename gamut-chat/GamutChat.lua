@@ -1160,35 +1160,60 @@ local function opt_items(o) -- ACP options may be grouped: {group, name, options
   return out
 end
 
--- model / effort / mode pickers; values are sent with the next message (gateway applies them per backend)
-local function config_row()
+-- Cursor-style pickers under the composer: frameless muted chips with a chevron, popup list on click.
+-- Values are sent with the next message; the gateway maps them to Gamut's model/effort or ACP config options.
+local function chip(id, label)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C.hover)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C.hover)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.muted)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 6, 2)
+  local clicked = ImGui.Button(ctx, label .. '     ##chip_' .. id)
+  ImGui.PopStyleVar(ctx)
+  ImGui.PopStyleColor(ctx, 4)
+  local x1, y1 = ImGui.GetItemRectMin(ctx)
+  local x2, y2 = ImGui.GetItemRectMax(ctx)
+  local cx, cy = x2 - 11, (y1 + y2) / 2 + 1
+  ImGui.DrawList_AddTriangleFilled(ImGui.GetWindowDrawList(ctx), cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5, C.muted)
+  return clicked
+end
+
+local function config_chips()
   local shown = {}
   for _, o in ipairs(S.cfg_opts) do
     if type(o) == 'table' and o.type == 'select' and SHOWN[o.category] and #shown < 3 then shown[#shown + 1] = o end
   end
-  if #shown == 0 then return end
-  local w = (ImGui.GetContentRegionAvail(ctx) - 8 * (#shown - 1)) / #shown
   for i, o in ipairs(shown) do
-    if i > 1 then ImGui.SameLine(ctx) end
     local id = sval(o.id) or tostring(i)
     local items = opt_items(o)
     local cur = S.cfg_sel[id] or sval(o.currentValue) or ''
-    local preview = sval(o.name) or id
-    for _, it in ipairs(items) do if it.value == cur then preview = it.name or cur end end
-    ImGui.SetNextItemWidth(ctx, w)
-    if ImGui.BeginCombo(ctx, '##cfg_' .. id, preview, ImGui.ComboFlags_HeightLarge) then
+    local label
+    for _, it in ipairs(items) do if it.value == cur then label = it.name end end
+    if cur == '' or not label then label = (o.category == 'model' and 'Auto') or (sval(o.name) or id):lower() end
+    if i > 1 then ImGui.SameLine(ctx, 0, 2) end
+    if chip(id, label) then ImGui.OpenPopup(ctx, 'cfgpop_' .. id) end
+    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, sval(o.name) or id) end
+    ImGui.SetNextWindowSizeConstraints(ctx, 180, 0, 360, 420)
+    if ImGui.BeginPopup(ctx, 'cfgpop_' .. id) then
       local group
       for _, it in ipairs(items) do
-        if it.group and it.group ~= '' and it.group ~= group then group = it.group; ImGui.SeparatorText(ctx, group) end
-        if ImGui.Selectable(ctx, (it.name or it.value) .. '##' .. it.value, it.value == cur) then
+        if it.group and it.group ~= '' and it.group ~= group then
+          group = it.group
+          if _ > 1 then ImGui.Spacing(ctx) end
+          ImGui.TextDisabled(ctx, group)
+        end
+        local on = it.value == cur
+        if on then ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.accent) end
+        if ImGui.Selectable(ctx, (it.name or it.value) .. '##' .. it.value, on) then
           S.cfg_sel[id] = it.value
           cfg_save()
         end
+        if on then ImGui.PopStyleColor(ctx) end
       end
-      ImGui.EndCombo(ctx)
+      ImGui.EndPopup(ctx)
     end
-    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, sval(o.name) or id) end
   end
+  return #shown
 end
 
 local function header()
@@ -1218,7 +1243,6 @@ local function header()
   end
   ImGui.SameLine(ctx)
   if ImGui.Button(ctx, '+', bw) then new_chat() end
-  config_row()
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
@@ -1446,10 +1470,16 @@ local function frame()
       ImGui.DrawList_AddRect(ImGui.GetWindowDrawList(ctx), x1, y1, x2, y2,
         focused and C.accent or C.border, 6, 0, focused and 2 or 1)
       if entered then send() end
-      if S.ime and #S.ime > 0 then
-        ImGui.TextColored(ctx, C.accent, 'pinyin: ' .. S.ime)
-      else
-        ImGui.TextDisabled(ctx, 'Enter send · Shift+Enter newline · Cmd+L toggle · right-click message to copy')
+      local n = config_chips()
+      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or 'Enter to send'
+      local hw = ImGui.CalcTextSize(ctx, hint)
+      if n > 0 then ImGui.SameLine(ctx) end
+      local gap = ImGui.GetContentRegionAvail(ctx) - hw
+      if gap > 0 then ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + gap) end
+      ImGui.AlignTextToFramePadding(ctx)
+      if S.ime and #S.ime > 0 then ImGui.TextColored(ctx, C.accent, hint) else ImGui.TextDisabled(ctx, hint) end
+      if ImGui.IsItemHovered(ctx) then
+        ImGui.SetTooltip(ctx, 'Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
       end
     end
     ImGui.End(ctx)

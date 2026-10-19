@@ -998,6 +998,63 @@ local F = {
   mono = font_file('/System/Library/Fonts/Menlo.ttc', 0) or ImGui.CreateFont('monospace'),
 }
 for _, f in pairs(F) do ImGui.Attach(ctx, f) end
+
+-- Latin text follows the REAPER theme's UI font. The .ReaperTheme stores fonts as LOGFONT hex (face name from byte
+-- 28); the face used most is the theme's UI font. It usually has no CJK glyphs and ReaImGui has no glyph fallback,
+-- so Chinese (and symbols like ◆ →) stay on Hiragino: see font_for() and the per-token pick in layout_inline.
+local FONT_DIRS = { (os.getenv('HOME') or '') .. '/Library/Fonts', '/Library/Fonts', '/System/Library/Fonts',
+  '/System/Library/Fonts/Supplemental' }
+local function theme_face(theme)
+  if not theme or theme == '' then return nil end
+  local txt = theme:lower():match('%.reaperthemezip$')
+    and sh('/usr/bin/unzip -p ' .. q(theme) .. ' "*.ReaperTheme" 2>/dev/null') or sh('/bin/cat ' .. q(theme))
+  local count, best, bn = {}, nil, 0
+  for hex in txt:gmatch('\n[%w_]*font[%w_]*=(%x+)') do
+    local name = {}
+    for i = 57, #hex - 1, 2 do
+      local b = tonumber(hex:sub(i, i + 1), 16)
+      if not b or b == 0 then break end
+      name[#name + 1] = string.char(b)
+    end
+    local face = table.concat(name)
+    if face ~= '' then
+      count[face] = (count[face] or 0) + 1
+      if count[face] > bn then best, bn = face, count[face] end
+    end
+  end
+  return best
+end
+local function face_files(face)
+  local key = face:gsub('%s', ''):lower()
+  local reg, bold
+  for _, d in ipairs(FONT_DIRS) do
+    for name in sh('/bin/ls ' .. q(d) .. ' 2>/dev/null'):gmatch('[^\n]+') do
+      local n = name:lower():gsub('%s', '')
+      if n:sub(1, #key) == key and n:match('%.[ot]tf$') then
+        local rest = n:sub(#key + 1)
+        if not reg and (rest:match('^%-?regular%.') or rest:match('^%.')) then reg = d .. '/' .. name end
+        if not bold and rest:match('^%-?bold%.') then bold = d .. '/' .. name end
+      end
+    end
+  end
+  return reg, bold
+end
+local function load_theme_fonts()
+  for _, f in ipairs({ F.ui, F.ui_bold }) do
+    if f and f ~= F.reg and f ~= F.bold then ImGui.Detach(ctx, f) end
+  end
+  local face = theme_face(reaper.GetLastColorThemeFile())
+  local reg, bold
+  if face then reg, bold = face_files(face) end
+  F.ui = reg and font_file(reg, 0) or F.reg
+  F.ui_bold = bold and font_file(bold, 0) or F.bold
+  if F.ui ~= F.reg then ImGui.Attach(ctx, F.ui) end
+  if F.ui_bold ~= F.bold then ImGui.Attach(ctx, F.ui_bold) end
+  S.theme_font = face and (face .. (reg and '' or ' (not installed)')) or 'none'
+  reaper.SetExtState(EXT, 'theme_font', S.theme_font .. ' | ' .. tostring(reg) .. ' | ' .. tostring(bold), false)
+end
+-- plain Latin (ASCII + Latin-1, e.g. "·") in the theme font; anything from U+2000 up (CJK, ◆, →) in Hiragino
+local function font_for(str) return str:find('[\226-\244]') and F.reg or F.ui end
 -- key + char of one keystroke must land in the same frame for the IME guard below
 ImGui.SetConfigVar(ctx, ImGui.ConfigVar_InputTrickleEventQueue, 0)
 
@@ -1080,9 +1137,15 @@ local function check_theme()
   if now - theme_at < 1 then return end
   theme_at = now
   local f = reaper.GetLastColorThemeFile()
-  if f ~= theme_file then theme_file = f; build_palette() end
+  if f ~= theme_file then
+    theme_file = f
+    build_palette()
+    load_theme_fonts()
+    pal_ver = pal_ver + 1 -- relayout messages with the new font
+  end
 end
 build_palette()
+load_theme_fonts()
 
 local VARS = {
   { ImGui.StyleVar_FrameRounding, 6 }, { ImGui.StyleVar_ChildRounding, 6 }, { ImGui.StyleVar_PopupRounding, 6 },
@@ -1173,7 +1236,10 @@ local function layout_inline(ops, runs, x0, y, maxw, size, base_col, mono)
       if tok == '\n' then
         x, y, has, nl = x0, y + lh, false, true
       else
-        local f = (font == F.mono and tok:byte(1) >= 0x80) and F.reg or font
+        local f
+        if font == F.mono then f = tok:byte(1) >= 0x80 and F.reg or F.mono
+        elseif tok:byte(1) >= 0xE2 then f = font
+        else f = font == F.bold and F.ui_bold or F.ui end
         local w = tw(f, size, tok)
         if x + w > x0 + maxw and has then
           x, y, has = x0, y + lh, false
@@ -1529,7 +1595,9 @@ local function dot(col, x, y) ImGui.DrawList_AddCircleFilled(ImGui.GetWindowDraw
 -- frameless muted button; chevron=false for toggles
 local function chip(id, label, col, with_chevron)
   flat_push(col)
+  ImGui.PushFont(ctx, font_for(label), FONT_SIZE)
   local clicked = ImGui.Button(ctx, label .. (with_chevron == false and '' or '     ') .. '##chip_' .. id)
+  ImGui.PopFont(ctx)
   flat_pop()
   if with_chevron ~= false then
     local _, y1 = ImGui.GetItemRectMin(ctx)
@@ -1580,7 +1648,9 @@ local function agent_picker()
   for _, a in ipairs(S.agents) do if a.slug == S.agent then cur = a end end
   local name = S.agent == '' and 'Choose an agent' or (S.agent_name ~= '' and S.agent_name or S.agent)
   flat_push(C.text)
+  ImGui.PushFont(ctx, font_for(name), FONT_SIZE)
   local clicked = ImGui.Button(ctx, '    ' .. name .. '     ##agentpick')
+  ImGui.PopFont(ctx)
   flat_pop()
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local x2, y2 = ImGui.GetItemRectMax(ctx)
@@ -1794,11 +1864,13 @@ local function context_chip()
     push_btn(bg, alpha(bg, 0xE0), alpha(bg, 0xC0), 0xFFFFFFFF)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 8, 3)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 10)
-    clicked = ImGui.Button(ctx, '◆ Detail context##chip_ctx')
+    ImGui.PushFont(ctx, F.ui, FONT_SIZE)
+    clicked = ImGui.Button(ctx, 'Detail context##chip_ctx')
+    ImGui.PopFont(ctx)
     ImGui.PopStyleVar(ctx, 2)
     ImGui.PopStyleColor(ctx, 4)
   else
-    clicked = chip('ctx', lv == 1 and '◆ Context' or '◇ No context', lv == 1 and C.accent or C.muted, false)
+    clicked = chip('ctx', lv == 1 and 'Context' or 'No context', lv == 1 and C.accent or C.muted, false)
   end
   if clicked then
     S.ctx_level = (lv + 1) % 3
@@ -2214,12 +2286,14 @@ local function frame()
       ImGui.SameLine(ctx, 0, 2)
       model_chip()
       local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or 'Enter to send'
+      ImGui.PushFont(ctx, font_for(hint), FONT_SIZE) -- measure and draw in the same font
       local hw = ImGui.CalcTextSize(ctx, hint)
       ImGui.SameLine(ctx)
       local gap = ImGui.GetContentRegionAvail(ctx) - hw
       if gap > 0 then ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + gap) end
       ImGui.AlignTextToFramePadding(ctx)
       if S.ime and #S.ime > 0 then ImGui.TextColored(ctx, C.accent, hint) else ImGui.TextDisabled(ctx, hint) end
+      ImGui.PopFont(ctx)
       if ImGui.IsItemHovered(ctx) then
         ImGui.SetTooltip(ctx, 'Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
       end

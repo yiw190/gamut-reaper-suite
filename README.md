@@ -97,8 +97,8 @@ python3 gateway/test_gateway.py      # fake Gamut + fake ACP agent, no network
 Agents are listed in `~/.config/agent-gateway/config.json` (`acp: [{slug, name, command, env, cwd}]`,
 `mcpServers: [...]`). Transcripts of ACP sessions are kept in `~/.config/agent-gateway/sessions/`.
 
-Running the agent somewhere else and need to reach REAPER over the internet? See
-[docs/remote-host.md](docs/remote-host.md).
+Gamut desktop on the same Mac: register the MCP as `http://localhost:8787/mcp` (no tunnel). Agent running somewhere
+else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/remote-host.md).
 
 ## Tools
 

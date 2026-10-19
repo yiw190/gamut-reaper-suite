@@ -1127,6 +1127,15 @@ clear ? (
 ]])
 ImGui.Attach(ctx, ime_cb)
 local FONT_SIZE = 14
+-- tooltips wrap: the panel is docked at the screen edge, where a one-line tooltip runs off the screen
+local function show_tip(text)
+  if ImGui.BeginTooltip(ctx) then
+    ImGui.PushTextWrapPos(ctx, FONT_SIZE * 22)
+    ImGui.Text(ctx, text)
+    ImGui.PopTextWrapPos(ctx)
+    ImGui.EndTooltip(ctx)
+  end
+end
 
 -- palette follows the active REAPER theme
 local function native(name, fallback)
@@ -1679,7 +1688,7 @@ local function icon_button(id, kind, col, tip)
   local dl = ImGui.GetWindowDrawList(ctx)
   if ImGui.IsItemHovered(ctx) then
     ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + sz, y1 + sz, C.hover, 6)
-    if tip then ImGui.SetTooltip(ctx, tip) end
+    if tip then show_tip(tip) end
   end
   local cx, cy = x1 + sz / 2, y1 + sz / 2
   col = col or C.muted
@@ -1747,7 +1756,7 @@ local function agent_picker()
               ImGui.GetContentRegionAvail(ctx) - tw_, 0) then
             choose_agent(a.slug, a.name)
           end
-          if a.desc ~= '' and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, a.desc) end
+          if a.desc ~= '' and ImGui.IsItemHovered(ctx) then show_tip(a.desc) end
           local sx1, sy1 = ImGui.GetItemRectMin(ctx)
           local _, sy2 = ImGui.GetItemRectMax(ctx)
           dot(agent_dot(a), sx1 + 8, (sy1 + sy2) / 2)
@@ -1804,7 +1813,7 @@ local function header()
   if room > 40 then
     ImGui.AlignTextToFramePadding(ctx)
     ImGui.TextDisabled(ctx, truncate(title, room))
-    if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, title) end
+    if ImGui.IsItemHovered(ctx) then show_tip(title) end
     ImGui.SameLine(ctx)
   end
   ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + math.max(0, ImGui.GetContentRegionAvail(ctx) - right))
@@ -1850,19 +1859,25 @@ local function model_chip()
     for _, it in ipairs(items) do if it.group and it.group ~= '' and not g[it.group] then g[it.group] = true; n = n + 1 end end
     return n
   end
+  -- the chip shows what is in effect: an explicit pick, else what the agent runs with (currentValue)
+  local function effective(o)
+    local _, v = cur_of(o)
+    if v == '' then v = sval(o.currentValue) or '' end
+    return v
+  end
   local parts = {}
   if model then
-    local _, v = cur_of(model)
+    local v = effective(model)
     local items = opt_items(model)
     local multi = groups_of(items) > 1
-    local label = 'Auto'
+    local label
     for _, it in ipairs(items) do
       if it.value == v and v ~= '' then label = (multi and it.group and it.group ~= '') and (it.group .. ' · ' .. (it.name or v)) or (it.name or v) end
     end
-    parts[#parts + 1] = label
+    parts[#parts + 1] = label or 'Default model'
   end
   if effort then
-    local _, v = cur_of(effort)
+    local v = effective(effort)
     for _, it in ipairs(opt_items(effort)) do if it.value == v and v ~= '' then parts[#parts + 1] = it.name or v end end
   end
   if #parts == 0 and mode then
@@ -1870,7 +1885,7 @@ local function model_chip()
     for _, it in ipairs(opt_items(mode)) do if it.value == v then parts[#parts + 1] = it.name or v end end
   end
   if chip('model', table.concat(parts, ' · '), C.muted) then ImGui.OpenPopup(ctx, 'modelpop') end
-  if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, 'Model and effort for the next message') end
+  if ImGui.IsItemHovered(ctx) then show_tip('Model and effort for the next message') end
   ImGui.SetNextWindowSizeConstraints(ctx, 240, 0, 380, 520)
   if ImGui.BeginPopup(ctx, 'modelpop') then
     local function pick(id, value)
@@ -1943,11 +1958,11 @@ local function context_chip()
   end
   if ImGui.IsItemHovered(ctx) then
     local tips = {
-      [0] = 'No REAPER context is sent.\nClick: Context',
-      [1] = 'REAPER context sent with every message: ' .. chip_text() .. '\nClick: Detail context',
-      [2] = 'Detail context: + CC and envelope points, grids, track mix and FX chains, item sources and gains, up to 128 notes.\nClick: No context',
+      [0] = 'No REAPER context is sent.\n\nClick: Context',
+      [1] = 'Sent with every message:\n' .. chip_text():gsub(' · ', '\n') .. '\n\nClick: Detail context',
+      [2] = 'Detail context adds CC and envelope points, grids, track mix and FX chains, item sources and gains, and up to 128 notes.\n\nClick: No context',
     }
-    ImGui.SetTooltip(ctx, tips[lv])
+    show_tip(tips[lv])
   end
 end
 
@@ -2152,7 +2167,7 @@ local function card(c)
           local label = (k == 1 and 'Connect with ' or '') .. (sval(m.name) or sval(m.id) or '?') .. '##auth' .. k
           local clicked = (k == 1) and primary(label) or ImGui.Button(ctx, label)
           if clicked then start_login(sval(m.id)) end
-          if sval(m.description) and ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, m.description) end
+          if sval(m.description) and ImGui.IsItemHovered(ctx) then show_tip(m.description) end
         end
         if #S.auth.methods == 0 then ImGui.TextDisabled(ctx, 'Checking…') end
       end
@@ -2333,7 +2348,7 @@ local function frame()
       for n, f in ipairs(S.files) do -- attachments waiting to be sent; click to remove
         if n > 1 then ImGui.SameLine(ctx, 0, 4) end
         if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
-        if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, f.path .. '\nClick to remove') end
+        if ImGui.IsItemHovered(ctx) then show_tip(f.path .. '\nClick to remove') end
       end
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
@@ -2372,7 +2387,7 @@ local function frame()
         local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
         if ok then add_file(fn) end
       end
-      if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, 'Attach a file (or drop files on the panel)') end
+      if ImGui.IsItemHovered(ctx) then show_tip('Attach a file (or drop files on the panel)') end
       ImGui.SameLine(ctx, 0, 2)
       context_chip()
       ImGui.SameLine(ctx, 0, 2)
@@ -2389,7 +2404,7 @@ local function frame()
       if S.ime and #S.ime > 0 then ImGui.TextColored(ctx, C.accent, hint) else ImGui.TextDisabled(ctx, hint) end
       ImGui.PopFont(ctx)
       if ImGui.IsItemHovered(ctx) then
-        ImGui.SetTooltip(ctx, 'Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
+        show_tip('Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
       end
     end
     ImGui.End(ctx)

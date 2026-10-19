@@ -649,9 +649,41 @@ def gamut_json(path, timeout=10):
         return json.load(r)
 
 
-def gamut_config():
-    """Gamut's model catalog as ACP-style config options; value = '<connectionId>|<modelId>'."""
+def gamut_defaults(slug):
+    """What the agent runs with when nothing is picked: its own preferences, else Gamut's global defaults."""
+    prefs, glob = {}, {}
+    try:
+        prefs = gamut_json("/api/agents/%s/preferences" % urllib.parse.quote(slug, safe="")) or {}
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    try:
+        glob = (gamut_json("/api/settings") or {}).get("models") or {}
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    return (prefs.get("defaultLlmProviderId"), prefs.get("defaultModel") or glob.get("agentModel"),
+            prefs.get("defaultEffort") or glob.get("agentEffort"))
+
+
+def resolve_model(conns, conn_id, model):
+    """'<connectionId>|<modelId>' for a model id or family alias ("opus" = the family's newest entry)."""
+    if not model:
+        return None
+    for c in [c for c in conns if c.get("id") == conn_id] or conns:
+        cat = c.get("catalog") or []
+        for m in cat:
+            if m.get("id") == model:
+                return c["id"] + "|" + m["id"]
+        family = [m for m in cat if m.get("family") == model]
+        if family:
+            return c["id"] + "|" + family[-1]["id"]
+    return None
+
+
+def gamut_config(slug=None):
+    """Gamut's model catalog as ACP-style config options; value = '<connectionId>|<modelId>'.
+    currentValue is what the agent uses when nothing is picked, so the panel can show it."""
     conns = gamut_json("/api/llm-connections").get("connections") or []
+    conn_id, model_default, effort_default = gamut_defaults(slug) if slug else (None, None, None)
     models = []
     for c in conns:
         for m in c.get("catalog") or []:
@@ -659,11 +691,12 @@ def gamut_config():
                            "group": c.get("name", ""), "efforts": m.get("supportedEfforts") or []})
     seen = {e for m in models for e in m["efforts"]}
     efforts = [e for e in EFFORTS if e in seen]
-    out = [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": None,
+    out = [{"id": "model", "name": "Model", "category": "model", "type": "select",
+            "currentValue": resolve_model(conns, conn_id, model_default),
             "options": [{"value": "", "name": "Agent default"}] + models}]
     if efforts:
         out.append({"id": "effort", "name": "Effort", "category": "thought_level", "type": "select",
-                    "currentValue": None,
+                    "currentValue": effort_default if effort_default in efforts else None,
                     "options": [{"value": "", "name": "Default"}] + [{"value": e, "name": e} for e in efforts]})
     return out
 
@@ -771,7 +804,7 @@ class Handler(BaseHTTPRequestHandler):
                 if slug in GW.acp:
                     return self.acp_route(method, GW.acp[slug], rest)
                 if method == "GET" and rest == ["config"]:
-                    return self.reply(200, {"configOptions": gamut_config()})
+                    return self.reply(200, {"configOptions": gamut_config(slug)})
             return self.proxy(method, path)
         except AcpError as e:
             code = 401 if e.code == AUTH_REQUIRED else 502

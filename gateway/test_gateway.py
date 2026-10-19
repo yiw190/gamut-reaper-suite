@@ -39,7 +39,12 @@ class FakeGamut(BaseHTTPRequestHandler):
             return self.j([{"slug": "g1", "name": "Gamut One"}])
         if self.path == "/api/llm-connections":
             return self.j({"connections": [{"id": "c1", "name": "Conn", "catalog": [
-                {"id": "m1", "label": "Model One", "supportedEfforts": ["low", "high"]}]}]})
+                {"id": "m1", "label": "Model One", "family": "one", "supportedEfforts": ["low", "high"]},
+                {"id": "m2", "label": "Model Two", "family": "one", "supportedEfforts": ["low", "high"]}]}]})
+        if self.path == "/api/agents/g1/preferences":
+            return self.j({"defaultLlmProviderId": "c1", "defaultModel": "one", "defaultEffort": "high"})
+        if self.path == "/api/settings":
+            return self.j({"models": {"agentModel": "m1", "agentEffort": "low"}})
         if self.path.endswith("/stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -185,6 +190,8 @@ def main():
 
         cfg = g.get("/api/agents/g1/config")["configOptions"]
         check("gamut model selector", cfg[0]["options"][1]["value"] == "c1|m1" and cfg[1]["id"] == "effort")
+        check("gamut defaults resolved (family -> newest, agent prefs win)",
+              cfg[0]["currentValue"] == "c1|m2" and cfg[1]["currentValue"] == "high")
         code, _ = g.post("/api/agents/g1/sessions", {"message": "hi", "config": {"model": "c1|m1", "effort": "high"}})
         body = GAMUT_BODIES[-1][1]
         check("gamut config -> llmProviderId/model/effort",

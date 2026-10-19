@@ -727,8 +727,9 @@ local function send()
   local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
   if text == '' then return end
   -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
-  -- Enter (or key repeat) re-sent it; clear ImGui's buffer through the callback and drop exact repeats
-  ImGui.Function_SetValue(ime_cb, 'clear', 1)
+  -- Enter (or key repeat) re-sent it; the composer clears ImGui's buffer next frame (S.clear_input) and exact
+  -- repeats are dropped here
+  S.clear_input = true
   local now = reaper.time_precise()
   if text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
   S.last_sent, S.last_sent_at = text, now
@@ -1058,6 +1059,7 @@ local function build_palette()
   C.ok = dark and 0x3FB950FF or 0x1A7F37FF
   C.warn = dark and 0xD29922FF or 0x9A6700FF
   C.dark_pill = dark and 0x0D1117FF or 0x24292FFF
+  C.selection = alpha(C.accent, 0x55)
   C.body = alpha(C.text, 0xE6)
   COLORS = {
     { ImGui.Col_WindowBg, C.bg }, { ImGui.Col_ChildBg, 0x00000000 }, { ImGui.Col_PopupBg, C.panel },
@@ -1159,12 +1161,17 @@ local function layout_inline(ops, runs, x0, y, maxw, size, base_col, mono)
   local lh = math.floor(size * 1.5 + 0.5)
   local dy = math.floor((lh - size) / 2)
   local x, has = x0, false
+  local nl = true -- the first op of a block, and the first after a hard newline, starts a source line
+  local function put(op)
+    if op[1] == 't' and nl then op.nl, nl = true, false end
+    ops[#ops + 1] = op
+  end
   for _, r in ipairs(runs) do
     local font = (mono or r.code) and F.mono or (r.bold and F.bold or F.reg)
     local col = r.link and C.accent or (r.italic and C.muted) or base_col
     for _, tok in ipairs(tokens(r.text)) do
       if tok == '\n' then
-        x, y, has = x0, y + lh, false
+        x, y, has, nl = x0, y + lh, false, true
       else
         local f = (font == F.mono and tok:byte(1) >= 0x80) and F.reg or font
         local w = tw(f, size, tok)
@@ -1177,12 +1184,12 @@ local function layout_inline(ops, runs, x0, y, maxw, size, base_col, mono)
             for ch in tok:gmatch('[%z\1-\127\194-\244][\128-\191]*') do
               local cw = tw(f, size, ch)
               if x + cw > x0 + maxw and has then x, y = x0, y + lh end
-              ops[#ops + 1] = { 't', x, y + dy, f, size, col, ch }
+              put({ 't', x, y + dy, f, size, col, ch })
               x, has = x + cw, true
             end
           else
             if r.code and not mono then ops[#ops + 1] = { 'r', x, y + 1, x + w, y + lh - 1, C.codebg, 2 } end
-            ops[#ops + 1] = { 't', x, y + dy, f, size, col, tok }
+            put({ 't', x, y + dy, f, size, col, tok })
             if r.link then ops[#ops + 1] = { 'l', x, y + dy + size + 1, x + w, y + dy + size + 1, alpha(C.accent, 0x88), 1 } end
             x, has = x + w, true
           end
@@ -1307,7 +1314,7 @@ local function layout_md(text, maxw, size)
     elseif b.t == 'li' then
       local ind = 2 + b.level * 16
       local bw = math.max(tw(F.reg, size, b.bullet) + 6, 14)
-      ops[#ops + 1] = { 't', ind, y + math.floor((lh - size) / 2), F.reg, size, C.muted, b.bullet }
+      ops[#ops + 1] = { 't', ind, y + math.floor((lh - size) / 2), F.reg, size, C.muted, b.bullet, nl = true }
       y = layout_inline(ops, b.runs, ind + bw, y, maxw - ind - bw, size, C.body)
     elseif b.t == 'quote' then
       local y0 = y
@@ -1328,13 +1335,95 @@ local function layout_md(text, maxw, size)
   return ops, y
 end
 
-local function draw_ops(ops, h, w)
+-- Text selection. Messages are drawn from laid-out ops, so ImGui's own selection doesn't apply: hit-test the
+-- text ops, keep {op index, byte offset} for both ends, highlight, and copy with Cmd+C.
+local function op_line(o)
+  local lh = math.floor(o[5] * 1.5 + 0.5)
+  local top = o[3] - math.floor((lh - o[5]) / 2)
+  return top, top + lh
+end
+local function op_stops(o) -- {byte offset, x} at every character boundary, cached on the op
+  if not o.stops then
+    local st, x = { { 0, o[2] } }, o[2]
+    for pos, ch in o[7]:gmatch('()([%z\1-\127\194-\244][\128-\191]*)') do
+      x = x + tw(o[4], o[5], ch)
+      st[#st + 1] = { pos + #ch - 1, x }
+    end
+    o.stops = st
+  end
+  return o.stops
+end
+local function stop_x(o, off)
+  for _, st in ipairs(op_stops(o)) do if st[1] >= off then return st[2] end end
+  return o[2]
+end
+local function hit(ops, lx, ly)
+  local best, bd
+  for i, o in ipairs(ops) do
+    if o[1] == 't' then
+      local top, bot = op_line(o)
+      local st = op_stops(o)
+      local right = st[#st][2]
+      local dv = ly < top and top - ly or (ly > bot and ly - bot or 0)
+      local dh = lx < o[2] and o[2] - lx or (lx > right and lx - right or 0)
+      local d = dv * 10000 + dh
+      if not bd or d < bd then best, bd = i, d end
+    end
+  end
+  if not best then return nil end
+  local off, dx = 0, math.huge
+  for _, st in ipairs(op_stops(ops[best])) do
+    if math.abs(st[2] - lx) < dx then off, dx = st[1], math.abs(st[2] - lx) end
+  end
+  return { i = best, off = off }
+end
+local function sel_range(sel)
+  local a, b = sel.a, sel.b
+  if b.i < a.i or (b.i == a.i and b.off < a.off) then a, b = b, a end
+  return a, b
+end
+local function selected_text(sel)
+  local a, b = sel_range(sel)
+  local out, prev = {}, nil
+  for i = a.i, b.i do
+    local o = sel.L.ops[i]
+    if o[1] == 't' then
+      local piece = o[7]:sub((i == a.i and a.off or 0) + 1, i == b.i and b.off or #o[7])
+      if prev then
+        if o[3] > prev[3] + 1 then
+          if o.nl then out[#out + 1] = '\n' end -- a wrapped line continues the same source line
+        elseif o[2] > op_stops(prev)[#op_stops(prev)][2] + 2 and not (out[#out] or ''):match(' $') then
+          out[#out + 1] = ' '
+        end
+      end
+      out[#out + 1] = piece
+      prev = o
+    end
+  end
+  return table.concat(out)
+end
+
+local function draw_ops(L, w)
+  local ops, h = L.ops, L.h
   local x0, y0 = ImGui.GetCursorScreenPos(ctx)
   local _, wy = ImGui.GetWindowPos(ctx)
   local _, wh = ImGui.GetWindowSize(ctx)
   if y0 + h >= wy and y0 <= wy + wh then
     local dl = ImGui.GetWindowDrawList(ctx)
     local top, bot = wy - y0 - 40, wy + wh - y0
+    local sel = S.sel and S.sel.L == L and S.sel
+    local sa, sb
+    if sel then sa, sb = sel_range(sel) end
+    for i, o in ipairs(ops) do
+      if sel and o[1] == 't' and i >= sa.i and i <= sb.i and o[3] > top and o[3] < bot then
+        local x1 = i == sa.i and stop_x(o, sa.off) or o[2]
+        local x2 = i == sb.i and stop_x(o, sb.off) or op_stops(o)[#op_stops(o)][2]
+        if x2 > x1 then
+          local lt, lb = op_line(o)
+          ImGui.DrawList_AddRectFilled(dl, x0 + x1, y0 + lt, x0 + x2, y0 + lb, C.selection)
+        end
+      end
+    end
     for _, o in ipairs(ops) do
       local k = o[1]
       if k == 't' then
@@ -1346,6 +1435,24 @@ local function draw_ops(ops, h, w)
     end
   end
   ImGui.Dummy(ctx, w, math.max(1, h))
+  local hovered = ImGui.IsItemHovered(ctx)
+  if hovered then ImGui.SetMouseCursor(ctx, ImGui.MouseCursor_TextInput) end
+  local mx, my = ImGui.GetMousePos(ctx)
+  if hovered and ImGui.IsMouseClicked(ctx, 0) then
+    S.sel_clicked = true
+    local p = hit(ops, mx - x0, my - y0)
+    if p and ImGui.IsMouseDoubleClicked(ctx, 0) then -- whole word (one op)
+      S.sel = { L = L, a = { i = p.i, off = 0 }, b = { i = p.i, off = #ops[p.i][7] } }
+    else
+      S.sel = p and { L = L, a = p, b = p, drag = true } or nil
+    end
+  elseif S.sel and S.sel.L == L and S.sel.drag then
+    if ImGui.IsMouseDown(ctx, 0) then
+      S.sel.b = hit(ops, mx - x0, my - y0) or S.sel.b
+    else
+      S.sel.drag = false
+    end
+  end
 end
 
 local function md(holder, text)
@@ -1356,7 +1463,7 @@ local function md(holder, text)
     L = { w = w, text = text, pal = pal_ver, ops = ops, h = h }
     holder._md = L
   end
-  draw_ops(L.ops, L.h, w)
+  draw_ops(L, w)
   if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
 end
 
@@ -1371,7 +1478,7 @@ local function bubble(holder, text)
     L = { w = w, text = text, pal = pal_ver, ops = ops, h = y + pad }
     holder._bubble = L
   end
-  draw_ops(L.ops, L.h, w)
+  draw_ops(L, w)
   if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
 end
 
@@ -1687,11 +1794,11 @@ local function context_chip()
     push_btn(bg, alpha(bg, 0xE0), alpha(bg, 0xC0), 0xFFFFFFFF)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 8, 3)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 10)
-    clicked = ImGui.Button(ctx, '◆ REAPER all details##chip_ctx')
+    clicked = ImGui.Button(ctx, '◆ Detail context##chip_ctx')
     ImGui.PopStyleVar(ctx, 2)
     ImGui.PopStyleColor(ctx, 4)
   else
-    clicked = chip('ctx', lv == 1 and '◆ REAPER' or '◇ REAPER', lv == 1 and C.accent or C.muted, false)
+    clicked = chip('ctx', lv == 1 and '◆ Context' or '◇ No context', lv == 1 and C.accent or C.muted, false)
   end
   if clicked then
     S.ctx_level = (lv + 1) % 3
@@ -1699,9 +1806,9 @@ local function context_chip()
   end
   if ImGui.IsItemHovered(ctx) then
     local tips = {
-      [0] = 'REAPER context is off.\nClick: attach the summary',
-      [1] = 'Sent with every message: ' .. chip_text() .. '\nClick: all details',
-      [2] = 'All details: + CC and envelope points, grids, track mix and FX chains, item sources and gains, up to 128 notes.\nClick: turn off',
+      [0] = 'No REAPER context is sent.\nClick: Context',
+      [1] = 'REAPER context sent with every message: ' .. chip_text() .. '\nClick: Detail context',
+      [2] = 'Detail context: + CC and envelope points, grids, track mix and FX chains, item sources and gains, up to 128 notes.\nClick: No context',
     }
     ImGui.SetTooltip(ctx, tips[lv])
   end
@@ -2037,7 +2144,13 @@ local function frame()
       ImGui.PopTextWrapPos(ctx)
     else
       local cards = card_list()
+      if S.sel and not S.sel_clicked and ImGui.IsMouseClicked(ctx, 0) then S.sel = nil end -- clicked elsewhere
+      if S.sel and not S.comp_active and not S.sel.drag
+          and ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_C) then
+        ImGui.SetClipboardText(ctx, selected_text(S.sel))
+      end
       local composer_h = 98 + cards_height(cards)
+      S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
         for _, m in ipairs(S.msgs) do
@@ -2078,9 +2191,17 @@ local function frame()
         if not ImGui.IsKeyDown(ctx, ImGui.Mod_Shift) then flags = flags | ImGui.InputTextFlags_CtrlEnterForNewLine end
         if ime == 'restore' then ImGui.Function_SetValue(ime_cb, 'restore', 1) end
       end
+      -- a request to clear ImGui's own buffer only makes sense while the input is active; when it isn't, the
+      -- emptied S.input is what ImGui loads on activation. Never leave the flag pending for a later frame.
+      if S.clear_input and S.comp_active then ImGui.Function_SetValue(ime_cb, 'clear', 1) end
+      S.clear_input = false
       local before = S.input
       local entered
       entered, S.input = ImGui.InputTextMultiline(ctx, '##input', S.input, -1, 62, flags, ime_cb)
+      -- callback flags are one-frame requests: an inactive input never ran the callback, so drop them here
+      ImGui.Function_SetValue(ime_cb, 'clear', 0)
+      ImGui.Function_SetValue(ime_cb, 'restore', 0)
+      ImGui.Function_SetValue(ime_cb, 'strip_nl', 0)
       local x1, y1 = ImGui.GetItemRectMin(ctx)
       local x2, y2 = ImGui.GetItemRectMax(ctx)
       local focused = ImGui.IsItemActive(ctx)

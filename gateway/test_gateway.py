@@ -92,7 +92,7 @@ class GW:
         cfg = Path(tmp) / "config.json"
         cfg.write_text(json.dumps({
             "acp": [{"slug": "fake", "name": "Fake", "command": [sys.executable, str(HERE / "fake_acp_agent.py")],
-                     "env": acp_env or {}, "cwd": tmp}],
+                     "env": acp_env or {}, "cwd": tmp, "loginArgs": ["--region", "global"]}],
             "mcpServers": [{"name": "reaper", "command": sys.executable, "args": ["-c", "pass"]}],
         }))
         env = dict(os.environ, AGENT_GATEWAY_PORT=str(self.port), GAMUT_URL="http://127.0.0.1:%d" % gamut_port,
@@ -337,7 +337,7 @@ def main():
             if st["connected"]:
                 break
             time.sleep(0.05)
-        check("terminal login runs the command and connects", os.path.exists(mark) and st["connected"]
+        check("terminal login runs the command and connects", open(mark).read() == "--region global" and st["connected"]
               and st["state"] == "ready")
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         check("session after terminal login", code == 201)

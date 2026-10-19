@@ -105,6 +105,7 @@ def terminal_auth(method, spec):
         argv, env = [expand(c) for c in spec["command"]] + list(method.get("args") or []), method.get("env") or {}
     else:
         return None
+    argv += [str(a) for a in spec.get("loginArgs") or []]  # e.g. kimi: ["--region", "global"]
     merged = dict(spec.get("env") or {})
     merged.update(env)
     return argv, merged

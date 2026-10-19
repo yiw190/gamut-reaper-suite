@@ -9,8 +9,9 @@ import os
 import sys
 import threading
 
-if sys.argv[1:] == ["login"]:
-    open(os.environ["FAKE_ACP_MARK"], "w").close()
+if sys.argv[1:2] == ["login"]:
+    with open(os.environ["FAKE_ACP_MARK"], "w") as f:
+        f.write(" ".join(sys.argv[2:]))
     sys.exit(0)
 
 lock = threading.Lock()

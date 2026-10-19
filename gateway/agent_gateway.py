@@ -8,7 +8,7 @@ Gemini CLI, ...) run as stdio subprocesses and are served under the same routes,
   GET  /api/agents                                   Gamut agents + ACP agents
   GET  /api/agents/<slug>/config                     model / effort / mode selectors (normalized config options)
   GET  /api/agents/<slug>/status[?probe=1]           ACP: {state, connected, authMethods, error}; probe starts it
-  POST /api/agents/<slug>/auth          {methodId}   ACP: start login
+  POST /api/agents/<slug>/auth          {methodId}   ACP: start login (terminal methods open Terminal.app)
   GET  /api/agents/<slug>/sessions
   POST /api/agents/<slug>/sessions      {message, config}
   GET  /api/agents/<slug>/sessions/<id>
@@ -37,6 +37,7 @@ import mimetypes
 import os
 import queue
 import re
+import shlex
 import socket
 import subprocess
 import sys
@@ -62,6 +63,8 @@ SSE_QUEUE_MAX = 2000
 MAX_UPLOAD = 50 * 1024 * 1024
 MAX_IMAGE_BLOCK = 10 * 1024 * 1024
 ATTACHED = "[Attached files:]"  # Gamut's attachment block, appended to a message as "- <path>" lines
+LOGIN_POLL = float(os.environ.get("AGENT_GATEWAY_LOGIN_POLL", "3"))
+LOGIN_TIMEOUT = 900
 
 
 def log(*a):
@@ -80,6 +83,31 @@ def load_config():
     if CONFIG.exists():
         return json.loads(CONFIG.read_text())
     return {"acp": [], "mcpServers": []}
+
+
+def open_terminal(command):
+    """Run a shell command in a visible terminal (Terminal.app; AGENT_GATEWAY_TERMINAL overrides the launcher)."""
+    custom = os.environ.get("AGENT_GATEWAY_TERMINAL")
+    if custom:
+        subprocess.Popen(shlex.split(custom) + [command], stdin=subprocess.DEVNULL)
+        return
+    esc = command.replace("\\", "\\\\").replace('"', '\\"')
+    subprocess.Popen(["osascript", "-e", 'tell application "Terminal"', "-e", "activate",
+                      "-e", 'do script "%s"' % esc, "-e", "end tell"], stdin=subprocess.DEVNULL)
+
+
+def terminal_auth(method, spec):
+    """argv + env for an ACP auth method that wants the client to run a login command in a terminal."""
+    meta = (method.get("_meta") or {}).get("terminal-auth")
+    if isinstance(meta, dict) and meta.get("command"):
+        argv, env = [meta["command"]] + list(meta.get("args") or []), meta.get("env") or {}
+    elif method.get("type") == "terminal":
+        argv, env = [expand(c) for c in spec["command"]] + list(method.get("args") or []), method.get("env") or {}
+    else:
+        return None
+    merged = dict(spec.get("env") or {})
+    merged.update(env)
+    return argv, merged
 
 
 class AcpError(Exception):
@@ -630,6 +658,10 @@ class AcpAgent:
             self.probing = False
 
     def authenticate(self, method_id):
+        method = next((m for m in self.auth_methods if m.get("id") == method_id), {})
+        term = terminal_auth(method, self.spec)
+        if term:
+            return self.terminal_login(*term)
         try:
             self.ensure()
             self.state = "authenticating"
@@ -637,6 +669,30 @@ class AcpAgent:
             self.state, self.error, self.connected = "ready", None, True
         except AcpError as e:
             self.state, self.error = "auth_required", e.message
+
+    def terminal_login(self, argv, env):
+        """Open the agent's login command in a terminal, then retry a session until the login lands."""
+        exports = "".join("export %s=%s; " % (k, shlex.quote(str(expand(v)))) for k, v in env.items())
+        self.state, self.error = "authenticating", None
+        try:
+            open_terminal(exports + " ".join(shlex.quote(a) for a in argv))
+        except OSError as e:
+            self.state, self.error = "auth_required", "cannot open a terminal: %s" % e
+            return
+        deadline = time.time() + LOGIN_TIMEOUT
+        while time.time() < deadline:
+            time.sleep(LOGIN_POLL)
+            try:
+                with self.cfg_lock:
+                    self.config_cache = None
+                self.get_config()
+                return
+            except AcpError as e:
+                if e.code != AUTH_REQUIRED:
+                    self.state, self.error = "auth_required", e.message
+                    return
+                self.state = "authenticating"
+        self.state, self.error = "auth_required", "login timed out"
 
 
 # ---------------------------------------------------------------- Gamut model selector

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal ACP agent over stdio for gateway tests: config options, streamed chunks, a tool call that asks for
-permission, cancel, an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called), stray non-object
+permission, cancel, an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called; FAKE_ACP_AUTH=terminal
+until `fake_acp_agent.py login` has written FAKE_ACP_MARK, as a terminal login does), stray non-object
 stdout lines (FAKE_ACP_NOISE=1) and a prompt containing "crash" that kills the process mid-turn."""
 
 import json
@@ -8,8 +9,13 @@ import os
 import sys
 import threading
 
+if sys.argv[1:] == ["login"]:
+    open(os.environ["FAKE_ACP_MARK"], "w").close()
+    sys.exit(0)
+
 lock = threading.Lock()
-need_auth = os.environ.get("FAKE_ACP_AUTH") == "1"
+auth_mode = os.environ.get("FAKE_ACP_AUTH")
+need_auth = auth_mode == "1"
 model = {"v": "fast"}
 pending = {}
 next_id = [1000]
@@ -90,13 +96,16 @@ for line in sys.stdin:
         continue
     m, p, rid = msg["method"], msg.get("params") or {}, msg.get("id")
     if m == "initialize":
+        method = {"id": "login", "name": "Log in", "description": "fake"}
+        if auth_mode == "terminal":
+            method.update(type="terminal", args=["login"], env={"FAKE_ACP_MARK": os.environ["FAKE_ACP_MARK"]})
         send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": False, "promptCapabilities": {"image": True}},
-              "authMethods": [{"id": "login", "name": "Log in", "description": "fake"}]}})
+              "authMethods": [method]}})
     elif m == "authenticate":
         need_auth = False
         send({"jsonrpc": "2.0", "id": rid, "result": {}})
     elif m == "session/new":
-        if need_auth:
+        if need_auth or (auth_mode == "terminal" and not os.path.exists(os.environ["FAKE_ACP_MARK"])):
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Authentication required"}})
         else:
             assert p["mcpServers"][0]["name"] == "reaper", p

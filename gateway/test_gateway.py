@@ -87,7 +87,7 @@ def multipart(filename, data):
 
 
 class GW:
-    def __init__(self, tmp, gamut_port, acp_env=None):
+    def __init__(self, tmp, gamut_port, acp_env=None, gw_env=None):
         self.port = free_port()
         cfg = Path(tmp) / "config.json"
         cfg.write_text(json.dumps({
@@ -96,7 +96,7 @@ class GW:
             "mcpServers": [{"name": "reaper", "command": sys.executable, "args": ["-c", "pass"]}],
         }))
         env = dict(os.environ, AGENT_GATEWAY_PORT=str(self.port), GAMUT_URL="http://127.0.0.1:%d" % gamut_port,
-                   AGENT_GATEWAY_CONFIG=str(cfg))
+                   AGENT_GATEWAY_CONFIG=str(cfg), **(gw_env or {}))
         self.proc = subprocess.Popen([sys.executable, str(HERE / "agent_gateway.py")], env=env,
                                      stderr=subprocess.DEVNULL)
         for _ in range(100):
@@ -320,6 +320,27 @@ def main():
             time.sleep(0.05)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         check("login then session", code == 201 and g.get("/api/agents/acp-fake/status")["connected"])
+    finally:
+        g.stop()
+
+    tmp3 = tempfile.mkdtemp()
+    mark = os.path.join(tmp3, "logged-in")
+    g = GW(tmp3, gport, {"FAKE_ACP_AUTH": "terminal", "FAKE_ACP_MARK": mark},
+           {"AGENT_GATEWAY_TERMINAL": "sh -c", "AGENT_GATEWAY_LOGIN_POLL": "0.1"})
+    try:
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
+        st = g.get("/api/agents/acp-fake/status")
+        check("terminal auth method surfaced", code == 401 and st["authMethods"][0].get("type") == "terminal")
+        g.post("/api/agents/acp-fake/auth", {"methodId": "login"})
+        for _ in range(100):
+            st = g.get("/api/agents/acp-fake/status")
+            if st["connected"]:
+                break
+            time.sleep(0.05)
+        check("terminal login runs the command and connects", os.path.exists(mark) and st["connected"]
+              and st["state"] == "ready")
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
+        check("session after terminal login", code == 201)
     finally:
         g.stop()
     print("all passed")

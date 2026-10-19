@@ -913,7 +913,7 @@ local function load_acp_status(slug, probe)
       if #S.cfg_opts == 0 and not S.cfg_pending then load_config() end
     elseif st.state == 'auth_required' then
       local waiting = S.auth and S.auth.waiting and err == nil
-      S.auth = { methods = st.methods, err = err, waiting = waiting }
+      S.auth = { methods = st.methods, err = err, waiting = waiting, terminal = S.auth and S.auth.terminal }
     elseif st.state == 'authenticating' then
       S.auth = S.auth or { methods = st.methods }
       S.auth.waiting = true
@@ -993,9 +993,9 @@ local function answer_request(req, path, body)
   end)
 end
 
-local function start_login(method_id)
+local function start_login(method_id, terminal)
   S.auth = S.auth or { methods = {} }
-  S.auth.waiting, S.auth.err = true, nil
+  S.auth.waiting, S.auth.err, S.auth.terminal = true, nil, terminal
   http('POST', '/auth', '{"methodId":' .. jstr(method_id) .. '}', function() load_status() end)
 end
 
@@ -2158,15 +2158,17 @@ local function card(c)
       if #c.p.options == 0 and ImGui.Button(ctx, 'Dismiss##' .. c.p.id) then answer_perm(c.p, nil) end
     elseif c.kind == 'auth' then
       if S.auth.waiting then
-        wrapped('Finish the ' .. who .. ' login in your browser')
+        wrapped('Finish the ' .. who .. ' login in ' .. (S.auth.terminal and 'the Terminal window' or 'your browser'))
         ImGui.TextDisabled(ctx, 'This card closes by itself once you are in.')
       else
         wrapped(who .. ' is not connected yet')
         for k, m in ipairs(S.auth.methods) do
           if k > 1 then ImGui.SameLine(ctx) end
-          local label = (k == 1 and 'Connect with ' or '') .. (sval(m.name) or sval(m.id) or '?') .. '##auth' .. k
+          local name = sval(m.name) or sval(m.id) or '?'
+          local verb = name:match('^Log') or name:match('^Sign') or name:match('^Connect')
+          local label = ((k == 1 and not verb) and 'Connect with ' or '') .. name .. '##auth' .. k
           local clicked = (k == 1) and primary(label) or ImGui.Button(ctx, label)
-          if clicked then start_login(sval(m.id)) end
+          if clicked then start_login(sval(m.id), sval(m.type) == 'terminal') end
           if sval(m.description) and ImGui.IsItemHovered(ctx) then show_tip(m.description) end
         end
         if #S.auth.methods == 0 then ImGui.TextDisabled(ctx, 'Checking…') end

@@ -1,6 +1,7 @@
 #!/bin/sh
 # Install the agent gateway as a LaunchAgent (127.0.0.1:47892).
-# WITH_CODEX=1 (default) also installs Node (user-level, ~/.local/node) and the Codex + Claude Code ACP adapters.
+# WITH_CODEX=1 (default) also installs Node (user-level, ~/.local/node), the Codex + Claude Code ACP adapters
+# and Kimi Code CLI (ACP built in; log in from the panel, which opens `kimi login` in Terminal).
 # Re-run to upgrade; an existing ~/.config/agent-gateway/config.json is kept.
 set -eu
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,9 +24,10 @@ if [ "${WITH_CODEX:-1}" = 1 ]; then
     mv "$TMP/node-$V-darwin-$ARCH" "$NODE_DIR"
     rm -rf "$TMP"
   fi
-  echo "installing ACP adapters: codex-acp, claude-agent-acp"
+  echo "installing ACP agents: codex-acp, claude-agent-acp, kimi-code"
   PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/npm" install -g --no-fund --no-audit \
-    @agentclientprotocol/codex-acp @agentclientprotocol/claude-agent-acp
+    --allow-scripts=@moonshot-ai/kimi-code,node-pty \
+    @agentclientprotocol/codex-acp @agentclientprotocol/claude-agent-acp @moonshot-ai/kimi-code
   PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/codex-acp" --version < /dev/null || true
 fi
 
@@ -47,6 +49,14 @@ if [ ! -f "$CFG/config.json" ]; then
       "description": "Claude Code (Claude Agent SDK) over ACP; uses the local claude login",
       "command": ["$NODE_DIR/bin/claude-agent-acp"],
       "env": {"PATH": "$NODE_DIR/bin:$HOME/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+      "cwd": "~/Documents/REAPER Media"
+    },
+    {
+      "slug": "kimi",
+      "name": "Kimi",
+      "description": "Kimi Code CLI over ACP; uses the Kimi Code subscription login",
+      "command": ["$NODE_DIR/bin/kimi", "acp"],
+      "env": {"PATH": "$NODE_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
       "cwd": "~/Documents/REAPER Media"
     }
   ],

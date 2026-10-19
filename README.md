@@ -119,6 +119,7 @@ else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/
 ```
 python3 python/test_server.py                        # MCP server + fake bridge
 uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
+uv run --with lupa python gamut-chat/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
 uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses
 ```

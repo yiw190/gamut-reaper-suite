@@ -2,7 +2,7 @@
 """Minimal ACP agent over stdio for gateway tests: config options, streamed chunks, a tool call that asks for
 permission, cancel, an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called; FAKE_ACP_AUTH=terminal
 until `fake_acp_agent.py login` has written FAKE_ACP_MARK, as a terminal login does), stray non-object
-stdout lines (FAKE_ACP_NOISE=1) and a prompt containing "crash" that kills the process mid-turn."""
+stdout lines (FAKE_ACP_NOISE=1) and a prompt containing "crash" that kills the process mid-turn (after the permission answer if it also says "tool")."""
 
 import json
 import os
@@ -63,7 +63,7 @@ def prompt(rid, p):
 def _prompt(rid, p, sid):
     text = p["prompt"][0]["text"]
     update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "[" + model["v"] + "] "}})
-    if "crash" in text:
+    if "crash" in text and "tool" not in text:
         os._exit(3)
     if "tool" in text:
         update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit REAPER project", "kind": "edit",
@@ -74,6 +74,8 @@ def _prompt(rid, p, sid):
         outcome = (r or {}).get("outcome", {})
         update(sid, {"sessionUpdate": "agent_message_chunk",
                      "content": {"type": "text", "text": "permission=" + str(outcome.get("optionId", outcome.get("outcome")))}})
+        if "crash" in text:  # after the permission, so a test can queue a message while the turn is open
+            os._exit(3)
     if sid in cancelled:
         cancelled.discard(sid)
         send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})

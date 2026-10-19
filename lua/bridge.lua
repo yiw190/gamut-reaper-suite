@@ -938,22 +938,23 @@ function DSL.import_media(path, opts)
     reaper.Main_OnCommand(40297, 0)
     reaper.SetTrackSelected(track_at(ti), true)
   end
-  local n_before = reaper.CountTracks(0)
-  local items_before = {}
-  for i = 0, n_before - 1 do
-    items_before[i] = reaper.CountTrackMediaItems(reaper.GetTrack(0, i))
+  -- REAPER keeps items sorted by position and a new track shifts later ones, so compare items, not counts
+  local existing = {}
+  for i = 0, reaper.CountTracks(0) - 1 do
+    local t = reaper.GetTrack(0, i)
+    for j = 0, reaper.CountTrackMediaItems(t) - 1 do existing[reaper.GetTrackMediaItem(t, j)] = true end
   end
   local ok = reaper.InsertMedia(path, as_new_track and 1 or 0)
   if ok == false then error("InsertMedia failed: " .. path) end
   local created = {}
-  local n_after = reaper.CountTracks(0)
-  for i = 0, n_after - 1 do
+  for i = 0, reaper.CountTracks(0) - 1 do
     local t = reaper.GetTrack(0, i)
-    local start_j = items_before[i] or 0
-    for j = start_j, reaper.CountTrackMediaItems(t) - 1 do
+    for j = 0, reaper.CountTrackMediaItems(t) - 1 do
       local item = reaper.GetTrackMediaItem(t, j)
-      reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", 0)
-      created[#created + 1] = { track_index = i, item_index = j }
+      if not existing[item] then
+        reaper.SetMediaItemInfo_Value(item, "B_LOOPSRC", 0)
+        created[#created + 1] = { track_index = i, item_index = j }
+      end
     end
   end
   refresh_tracks()
@@ -1035,6 +1036,8 @@ function DSL.save_project(path)
     local dir = path:match("^(.*)[/\\]")
     if dir then reaper.RecursiveCreateDirectory(dir, 0) end
     reaper.Main_SaveProjectEx(0, path, 0)
+    -- checked before adopting the path: opening a file that wasn't written would drop the unsaved project
+    if not reaper.file_exists(path) then error("could not write " .. path .. " (is the folder writable on the REAPER host?)") end
     local _, cur = reaper.EnumProjects(-1, "")
     if cur == "" then
       -- an untitled project adopts the path instead of leaving a stray copy

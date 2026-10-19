@@ -9,7 +9,7 @@ Gamut, Codex or any other ACP agent.
 | Path | What |
 | --- | --- |
 | `reaper_mcp/`, `python/`, `lua/bridge.lua` | MCP server (`reaper-mcp`) + the Lua bridge that runs inside REAPER |
-| `gamut-chat/` | Gamut Chat — Cursor-style chat panel in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
+| `gamut-chat/` | Gamut Chat — chat panel docked in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
 | `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
 | `gateway/` | Agent gateway: one local API for the panel in front of Gamut and ACP agents (Codex, …) |
 | `scripts/` | Remote-host bootstrap (Cloudflare Tunnel) and hot-swap deploy of the bridge — see `docs/remote-host.md` |

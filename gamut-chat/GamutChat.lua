@@ -1,5 +1,5 @@
--- Gamut Chat: Cursor-style chat panel inside REAPER, talking to a Gamut agent through the
--- local Gamut desktop API (127.0.0.1:47891). Needs ReaImGui >= 0.10.
+-- Gamut Chat: a chat panel docked inside REAPER, talking to Gamut and ACP agents through the
+-- local agent gateway (127.0.0.1:47892) or the Gamut desktop API (127.0.0.1:47891). Needs ReaImGui >= 0.10.
 -- agent gateway (gateway/agent_gateway.py: Gamut + ACP agents, model selectors) first, Gamut's own API as fallback
 local HOSTS = { 'http://127.0.0.1:47892', 'http://127.0.0.1:47891' }
 local HOST = HOSTS[1]
@@ -697,10 +697,17 @@ local function split_context(text)
 end
 
 ---------------------------------------------------------------- actions
+local ime_cb -- created with the ImGui context below; send() clears the input through it
 local function send()
   if S.agent == '' then return end
   local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
   if text == '' then return end
+  -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
+  -- Enter (or key repeat) re-sent it; clear ImGui's buffer through the callback and drop exact repeats
+  ImGui.Function_SetValue(ime_cb, 'clear', 1)
+  local now = reaper.time_precise()
+  if text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
+  S.last_sent, S.last_sent_at = text, now
   local payload = text
   if S.ctx_level > 0 then
     local ctx_text = context(true, S.ctx_level == 2)
@@ -965,8 +972,13 @@ ImGui.SetConfigVar(ctx, ImGui.ConfigVar_InputTrickleEventQueue, 0)
 -- ReaImGui (cocoa_inputview.mm keyDown) hands every key to the IME *and* to ImGui, so while a pinyin
 -- composition is open Backspace/arrows/Esc also edit the field and Enter also sends. We infer the composition
 -- (letter keys that produced no characters) and this callback undoes ImGui's side of those keys.
-local ime_cb = ImGui.CreateFunctionFromEEL([[
-restore ? (
+ime_cb = ImGui.CreateFunctionFromEEL([[
+clear ? (
+  InputTextCallback_DeleteChars(0, strlen(#Buf));
+  CursorPos = 0; SelectionStart = 0; SelectionEnd = 0;
+  strcpy(#prev, ""); prev_cursor = 0;
+  clear = 0; restore = 0; strip_nl = 0;
+) : restore ? (
   InputTextCallback_DeleteChars(0, strlen(#Buf));
   InputTextCallback_InsertChars(0, #prev);
   CursorPos = prev_cursor; SelectionStart = prev_cursor; SelectionEnd = prev_cursor;

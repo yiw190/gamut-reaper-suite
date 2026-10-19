@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""Syntax gate for the parts no test imports: every .lua compiles under Lua 5.4 (REAPER's version),
-every .sh parses. Needs `pip install lupa`."""
+"""Syntax gate for the parts no test imports: every .lua compiles under Lua 5.4 (REAPER's version) and calls no
+top-level local function above its declaration (that call hits a nil global at runtime), every .sh parses.
+Needs `pip install lupa`."""
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -17,9 +19,32 @@ def files(ext):
 
 rt = lua54.LuaRuntime()
 compile_lua = rt.eval("function(src, name) local f, e = load(src, '=' .. name) return f and '' or e end")
+
+
+def use_before_declare(src):
+    lines = src.splitlines()
+    decl = {}
+    for i, line in enumerate(lines):
+        m = re.match(r"^local function (\w+)", line) or re.match(r"^local (\w+)\s*=\s*function", line)
+        if m:
+            decl.setdefault(m.group(1), i)
+        m = re.match(r"^local ([\w, ]+)$", line)  # forward declaration
+        if m:
+            for n in m.group(1).split(","):
+                decl.setdefault(n.strip(), i)
+    out = []
+    for i, line in enumerate(lines):
+        code = line.split("--")[0]
+        for name, d in decl.items():
+            if i < d and re.search(r"(?<![\w.:])" + name + r"\s*\(", code):
+                out.append("%s() called on line %d, declared on line %d" % (name, i + 1, d + 1))
+    return "; ".join(out)
+
+
 bad = 0
 for p in files(".lua"):
-    err = compile_lua(p.read_text(), str(p.relative_to(ROOT)))
+    src = p.read_text()
+    err = compile_lua(src, str(p.relative_to(ROOT))) or use_before_declare(src)
     print(("  ok   " if not err else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if not err else "  " + err))
     bad += bool(err)
 for p in files(".sh"):

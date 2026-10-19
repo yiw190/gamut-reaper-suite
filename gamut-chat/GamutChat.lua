@@ -262,6 +262,8 @@ local function on_event(d)
   local t = d.type
   if t == 'connected' then
     S.active = d.isActive == true
+    -- the gateway replays an ACP turn in progress right after this event; start the live view from that replay
+    if S.active and is_acp() then S.live = {} end
   elseif t == 'stream_start' or t == 'message_start' or t == 'session_active' then
     S.active = true
   elseif t == 'stream_delta' then

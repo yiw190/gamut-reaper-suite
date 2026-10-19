@@ -791,12 +791,21 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(("event: message\ndata: " + json.dumps(d) + "\n\n").encode())
             self.wfile.flush()
 
-        with s.lock:  # subscribe and snapshot together so a permission request is neither missed nor doubled
+        with s.lock:  # subscribe and snapshot together so nothing is missed or doubled
             s.subs.add(q)
             pending = [ev for _, ev in s.perms.values()]
             active = s.active
+            # a client that subscribes after the turn started (the panel creates the session, then subscribes)
+            # gets the reply so far; "connected" with isActive tells it to rebuild its live view from this
+            turn = s.msgs[-1] if active and s.msgs and s.msgs[-1]["type"] == "assistant" else None
+            replay_text = turn["content"]["text"] if turn else ""
+            replay_tools = [tc.get("name") for tc in turn.get("toolCalls") or []] if turn else []
         try:
             write({"type": "connected", "isActive": active})
+            for name in replay_tools:
+                write({"type": "tool_use_ready", "toolName": name})
+            if replay_text:
+                write({"type": "stream_delta", "text": replay_text})
             for ev in pending:
                 write(dict(ev, type="permission_request"))
             while not q.dead:

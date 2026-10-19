@@ -188,6 +188,7 @@ def main():
         code, s = g.post("/api/agents/acp-fake/sessions", {"message": "use tool please", "config": {"model": "smart"}})
         check("acp session created", code == 201 and s["name"] == "use tool please")
         sid = s["id"]
+        time.sleep(0.5)  # subscribe late on purpose: the opening delta and tool call must be replayed
         q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid)
 
         def allow(d):

@@ -95,7 +95,12 @@ reaper.Main_GetTempo = function() return 120.0 end
 reaper.Master_GetTempo = function() return 120.0 end
 reaper.GetPlayState = function() return 0 end
 reaper.GetCursorPosition = function() return 0.0 end
-reaper.EnumProjects = function() return 0, "" end
+local project_path = ""
+reaper.EnumProjects = function() return 0, project_path end
+reaper.Main_openProject = function(name)
+  hit("Main_openProject")
+  project_path = name:gsub("^noprompt:", "")
+end
 reaper.TimeMap2_QNToTime = function(_, qn) return qn * 0.5 end
 reaper.TimeMap2_timeToQN = function(_, t) return t / 0.5 end
 reaper.TimeMap_GetTimeSigAtTime = function() return 4, 4, 120.0 end

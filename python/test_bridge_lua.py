@@ -263,9 +263,17 @@ def main() -> None:
     clear()
     r = rpc("save_project", [None])
     check("save_project unsaved needs path", r.get("ok") is False, r)
-    r = rpc("save_project", ["/tmp/song.RPP"])
-    check("save_project copy", r.get("ok") and r["ret"]["copy"] is True, r)
-    check("save_project uses SaveProjectEx", count("Main_SaveProjectEx") == 1)
+    r = rpc("save_project", ["/tmp/new dir/song.RPP"])
+    check("save_project untitled adopts the path", r.get("ok") and r["ret"]["copy"] is False
+          and count("Main_openProject") == 1, r)
+    check("save_project creates the folder", count("RecursiveCreateDirectory") == 1)
+    r = rpc("save_project", ["/tmp/song_v2.RPP"])
+    check("save_project named project writes a copy", r.get("ok") and r["ret"]["copy"] is True
+          and count("Main_openProject") == 1, r)
+    check("save_project uses SaveProjectEx", count("Main_SaveProjectEx") == 2)
+    r = rpc("save_project", [None])
+    check("save_project named project saves in place", r.get("ok") and r["ret"]["path"] == "/tmp/new dir/song.RPP"
+          and count("Main_SaveProject") == 1, r)
     check("save_project skips undo block", count("Undo_BeginBlock") == 0)
 
     # --- idle heartbeat throttle --------------------------------------

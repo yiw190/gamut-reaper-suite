@@ -101,23 +101,27 @@ class GW:
                    AGENT_GATEWAY_CONFIG=str(cfg), **(gw_env or {}))
         self.proc = subprocess.Popen([sys.executable, str(HERE / "agent_gateway.py")], env=env,
                                      stderr=subprocess.DEVNULL)
+        self.auth = {}
         for _ in range(100):
             try:
                 self.get("/health")
-                return
+                break
             except OSError:
                 time.sleep(0.05)
-        raise RuntimeError("gateway did not start")
+        else:
+            raise RuntimeError("gateway did not start")
+        self.token_file = Path(tmp) / "token"
+        self.auth = {"Authorization": "Bearer " + self.token_file.read_text().strip()}
 
     def url(self, path):
         return "http://127.0.0.1:%d%s" % (self.port, path)
 
     def get(self, path):
-        with urllib.request.urlopen(self.url(path), timeout=10) as r:
+        with urllib.request.urlopen(urllib.request.Request(self.url(path), headers=self.auth), timeout=10) as r:
             return json.load(r)
 
     def post(self, path, body, headers=None):
-        h = {"Content-Type": "application/json"}
+        h = dict(self.auth, **{"Content-Type": "application/json"})
         h.update(headers or {})
         req = urllib.request.Request(self.url(path), data=json.dumps(body).encode(), method="POST", headers=h)
         try:
@@ -128,7 +132,7 @@ class GW:
 
     def upload(self, path, filename, data):
         body, ctype = multipart(filename, data)
-        req = urllib.request.Request(self.url(path), data=body, method="POST", headers={"Content-Type": ctype})
+        req = urllib.request.Request(self.url(path), data=body, method="POST", headers=dict(self.auth, **{"Content-Type": ctype}))
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return r.status, json.load(r)
@@ -140,7 +144,7 @@ class GW:
 
         def run():
             c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=30)
-            c.request("GET", path)
+            c.request("GET", path, headers=self.auth)
             r = c.getresponse()
             while True:
                 line = r.readline()
@@ -196,11 +200,19 @@ def main():
               cfg[0]["currentValue"] == "c1|m2" and cfg[1]["currentValue"] == "high")
         code, _ = g.post("/api/agents/g1/sessions", {"message": "hi", "config": {"model": "c1|m1", "effort": "high"}})
         body = GAMUT_BODIES[-1][1]
+        g.post("/api/agents/g1/sessions", {"message": "hi", "title": "hi"})
+        check("title hint not forwarded to Gamut", GAMUT_BODIES[-1][1] == {"message": "hi"})
         check("gamut config -> llmProviderId/model/effort",
               code == 201 and body == {"message": "hi", "llmProviderId": "c1", "model": "m1", "effort": "high"})
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 
+        check("token file is private", os.stat(g.token_file).st_mode & 0o777 == 0o600)
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Authorization": ""})
+        check("missing token refused", code == 403)
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Host": "host.docker.internal:47892",
+                                                                             "Authorization": "Bearer wrong"})
+        check("container host with a wrong token refused", code == 403)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Origin": "https://evil.example"})
         check("browser Origin refused", code == 403)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Host": "evil.example"})
@@ -215,8 +227,11 @@ def main():
         check("probe connects", st["connected"] and st["state"] == "ready")
         acfg = g.get("/api/agents/acp-fake/config")["configOptions"]
         check("acp model selector", acfg[0]["category"] == "model" and acfg[0]["currentValue"] == "fast")
-        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "use tool please", "config": {"model": "smart"}})
-        check("acp session created", code == 201 and s["name"] == "use tool please")
+        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "[REAPER context]\n#1 Drums\n[/REAPER context]\n\n"
+                                                           "use tool please", "title": "use tool please",
+                                                           "config": {"model": "smart"}})
+        check("acp session titled from the panel's title, not the context block",
+              code == 201 and s["name"] == "use tool please")
         sid = s["id"]
         time.sleep(0.5)  # subscribe late on purpose: the opening delta and tool call must be replayed
         q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid)
@@ -247,7 +262,7 @@ def main():
         check("gamut upload proxied as multipart", code == 200 and r["path"] == "/workspace/uploads/shot.png")
         body, ctype = multipart("x.txt", b"hi")
         req = urllib.request.Request(g.url("/api/agents/acp-fake/sessions"), data=body, method="POST",
-                                     headers={"Content-Type": ctype})
+                                     headers=dict(g.auth, **{"Content-Type": ctype}))
         try:
             urllib.request.urlopen(req, timeout=10)
             code = 200
@@ -257,6 +272,9 @@ def main():
         code, img = g.upload("/api/agents/acp-fake/upload-file", "shot.png", b"\x89PNG\r\n\x1a\n" + b"0" * 64)
         code2, doc = g.upload("/api/agents/acp-fake/sessions/%s/upload-file" % sid, "notes.txt", b"hello")
         check("acp uploads saved", code == 200 and code2 == 200 and os.path.isfile(img["path"])
+              and open(doc["path"], "rb").read() == b"hello")
+        _, doc2 = g.upload("/api/agents/acp-fake/upload-file", "notes.txt", b"other take")
+        check("same-name uploads in the same second don't overwrite", doc2["path"] != doc["path"]
               and open(doc["path"], "rb").read() == b"hello")
         for _ in range(100):  # let the previous turn finish so this message isn't queued behind it
             if not g.get("/api/agents/acp-fake/sessions/%s" % sid)["isActive"]:
@@ -298,6 +316,23 @@ def main():
         g.post("/api/agents/acp-fake/sessions/%s/messages" % s["id"], {"content": "again"})
         seen = until(q, "session_idle")
         check("agent restarts on next message", "notice" in [d["type"] for d in seen])
+
+        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "tool then crash"})
+        sid3 = s["id"]
+        q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid3)
+
+        def queue_then_allow(d):
+            if d["type"] == "permission_request":
+                g.post("/api/agents/acp-fake/sessions/%s/messages" % sid3, {"content": "queued follow-up"})
+                g.post("/api/agents/acp-fake/sessions/%s/permission" % sid3, {"requestId": d["requestId"],
+                                                                            "optionId": "allow"})
+        seen = until(q, "session_error", queue_then_allow)
+        msgs = g.get("/api/agents/acp-fake/sessions/%s/messages" % sid3)
+        check("queued message kept in the transcript when the turn fails",
+              "1 queued message not sent" in seen[-1]["errorPresentation"]["message"]
+              and msgs[-1]["type"] == "user" and msgs[-1]["content"]["text"] == "queued follow-up")
+        late = until(g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid3), "session_error")
+        check("late subscriber gets the finished turn's error", [d["type"] for d in late] == ["connected", "session_error"])
     finally:
         g.stop()
 

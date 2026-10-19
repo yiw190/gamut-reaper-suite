@@ -105,13 +105,30 @@ local function jstr(s)
 end
 
 ---------------------------------------------------------------- http (background curl)
+-- the gateway wants its token (gateway/agent_gateway.py writes it); curl reads the header from a file, not argv
+local TOKEN_FILE = (os.getenv('HOME') or '') .. '/.config/agent-gateway/token'
+local AUTH_FILE, auth_token = DIR .. 'gateway-auth', nil
+local function auth_args(url)
+  if url:sub(1, #HOSTS[1]) ~= HOSTS[1] then return '' end
+  local f = io.open(TOKEN_FILE, 'rb')
+  local token = f and (f:read('*a') or ''):gsub('%s+', '') or ''
+  if f then f:close() end
+  if token == '' then return '' end
+  if token ~= auth_token then
+    local h = io.open(AUTH_FILE, 'wb')
+    if not h then return '' end
+    h:write('Authorization: Bearer ' .. token .. '\n'); h:close()
+    auth_token = token
+  end
+  return ' -H @' .. q(AUTH_FILE)
+end
 -- the run id keeps a curl left over from a closed panel from answering this run's request of the same number
 local RUN = ('%x'):format(math.floor(reaper.time_precise() * 1000) % 0xFFFFFF)
 local reqn, pending = 0, {}
 local function http_url(method, url, body, cb)
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
-  local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"'
+  local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"' .. auth_args(url)
   if body then
     local f = io.open(b .. '.json', 'wb')
     if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(b .. '.json', 'wb') end
@@ -128,7 +145,7 @@ local function http_upload(url, path, cb)
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
   local field = 'file=@"' .. (path:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
-  sh('( /usr/bin/curl -s -m 300 -F ' .. q(field) .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
+  sh('( /usr/bin/curl -s -m 300' .. auth_args(url) .. ' -F ' .. q(field) .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
     ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
   pending[#pending + 1] = { b = b, cb = cb }
 end
@@ -154,7 +171,7 @@ local S = {
   agent = reaper.GetExtState(EXT, 'agent'), agent_name = reaper.GetExtState(EXT, 'agent_name'),
   agents = {},
   sid = '', title = '',
-  msgs = {}, live = {},
+  msgs = {}, live = {}, queued = {}, -- queued: user messages sent while a turn runs, shown after it
   active = false, waiting = false, err = nil,
   input = '', focus = true, scroll = true,
   ctx_level = tonumber(reaper.GetExtState(EXT, 'ctx_level')) or 1, -- 0 off, 1 simple, 2 all details
@@ -228,7 +245,7 @@ local function refresh_messages()
     end
     if #S.msgs == 0 then scroll() end
     S.msgs = out
-    S.live = {}
+    S.live, S.queued = {}, {}
   end)
 end
 
@@ -250,7 +267,8 @@ local function stream_start()
   st.starts = (st.starts or 0) + 1
   st.dead = st.file .. '.dead' .. st.starts -- per start, so a late write from the previous curl can't fake a death
   -- the wrapper drops the .dead file when curl exits, so liveness is a file check, not a periodic popen (forks stall the UI)
-  local out = sh('( /usr/bin/curl -s -N ' .. q(api('/sessions/' .. S.sid .. '/stream')) ..
+  local url = api('/sessions/' .. S.sid .. '/stream')
+  local out = sh('( /usr/bin/curl -s -N' .. auth_args(url) .. ' ' .. q(url) ..
     ' >> ' .. q(st.file) .. '; : > ' .. q(st.dead) .. ' ) >/dev/null 2>&1 & echo $!')
   st.pid = tonumber(out:match('%d+'))
 end
@@ -275,6 +293,17 @@ local function on_event(d)
     S.active = d.isActive == true
     -- the gateway replays an ACP turn in progress right after this event; start the live view from that replay
     if S.active and is_acp() then S.live = {} end
+    -- a turn that ended while we weren't subscribed (late first subscribe, reconnect) only shows in the transcript
+    if not S.active then refresh_messages() end
+  elseif t == 'session_active' and #S.queued > 0 and #S.live > 0 then
+    -- the gateway starts a queued message: settle the previous reply above it
+    local text, tools = {}, {}
+    for _, b in ipairs(S.live) do
+      if b.kind == 'text' then text[#text + 1] = b.text else tools[#tools + 1] = b.text end
+    end
+    S.msgs[#S.msgs + 1] = { role = 'assistant', text = table.concat(text), tools = tools }
+    S.msgs[#S.msgs + 1] = table.remove(S.queued, 1)
+    S.live, S.active = {}, true
   elseif t == 'stream_start' or t == 'message_start' or t == 'session_active' then
     S.active = true
   elseif t == 'stream_delta' then
@@ -732,14 +761,32 @@ local function utf8_prefix(str, n)
   return cut and str:sub(1, cut - 1) or str
 end
 
-local function deliver(payload, text)
-  S.msgs[#S.msgs + 1] = { role = 'user', text = payload }
-  S.live, S.err, S.input, S.focus, S.active = {}, nil, '', true, true
+-- typed/files: what the user entered, handed back if the send fails
+local function deliver(payload, text, typed, files)
+  local bubble = { role = 'user', text = payload }
+  local queued = S.active and S.sid ~= ''
+  if queued then
+    S.queued[#S.queued + 1] = bubble -- the reply in progress stays above it
+  else
+    S.msgs[#S.msgs + 1] = bubble
+    S.live = {}
+  end
+  S.err, S.input, S.focus, S.active = nil, '', true, true
   scroll()
   local gen = S.gen
+  local function failed(err)
+    S.err = err
+    if not queued then S.active = false end -- a queued send failing doesn't end the turn that is running
+    for _, list in ipairs({ S.msgs, S.queued }) do
+      for i = #list, 1, -1 do if list[i] == bubble then table.remove(list, i) end end
+    end
+    if S.input == '' then S.input = typed or '' end
+    if files and #S.files == 0 then S.files = files end
+  end
   if S.sid == '' then
     S.creating = true
-    http('POST', '/sessions', '{"message":' .. jstr(payload) .. cfg_json() .. '}', function(code, body)
+    local title = via_gateway() and (',"title":' .. jstr(utf8_prefix(text, 60))) or ''
+    http('POST', '/sessions', '{"message":' .. jstr(payload) .. title .. cfg_json() .. '}', function(code, body)
       local r = decode(body)
       if gen ~= S.gen then return end -- the user switched agent/session meanwhile
       S.creating = false
@@ -749,20 +796,17 @@ local function deliver(payload, text)
         save_agent_session()
         stream_start()
       elseif code == 401 and is_acp() then
-        S.active, S.auth = false, S.auth or { methods = {} }
-        S.err = (S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login first'
+        S.auth = S.auth or { methods = {} }
+        failed((S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login first')
       else
-        S.active = false
-        S.err = ('create session failed (%d)'):format(code)
+        failed(('create session failed (%d)'):format(code))
       end
     end)
   else
+    if not S.stream.file then stream_start() end -- the boot-time restore never ran (hosts were down then)
     http('POST', '/sessions/' .. S.sid .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
       if gen ~= S.gen then return end
-      if code < 200 or code >= 300 then
-        S.active = false
-        S.err = ('send failed (%d)'):format(code)
-      end
+      if code < 200 or code >= 300 then failed(('send failed (%d)'):format(code)) end
     end)
   end
 end
@@ -785,7 +829,7 @@ local function send()
     local ctx_text = context(true, S.ctx_level == 2)
     payload = CTX_OPEN .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
   end
-  if #S.files == 0 then return deliver(payload, text) end
+  if #S.files == 0 then return deliver(payload, text, text) end
   -- upload the attachments first, then send the message with Gamut's "[Attached files:]" block
   local files = S.files
   S.files, S.uploading, S.input, S.err = {}, #files, '', nil
@@ -808,7 +852,7 @@ local function send()
       local lines = {}
       for m = 1, #files do lines[#lines + 1] = '- ' .. paths[m] end
       deliver(payload .. (payload ~= '' and '\n\n' or '') .. '[Attached files:]\n' .. table.concat(lines, '\n'),
-        text ~= '' and text or files[1].name)
+        text ~= '' and text or files[1].name, text, files)
     end)
   end
 end
@@ -820,7 +864,7 @@ end
 local function reset_view()
   stream_stop()
   S.gen = S.gen + 1 -- late callbacks from the previous view check this and drop their result
-  S.msgs, S.live, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, false, nil, false, {}, 0
+  S.msgs, S.live, S.queued, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, {}, false, nil, false, {}, 0
   S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
   S.last_sent, S.last_sent_at = nil, nil
   S.stream.fails = 0
@@ -872,8 +916,7 @@ local function load_agents(try)
     if code ~= 200 then
       if try < #HOSTS then return load_agents(try + 1) end
       S.agents_err = 'Agent gateway and Gamut not reachable (' .. code .. ')'
-      S.boot = false
-      return
+      return -- S.boot stays set: the next successful load reopens the saved session
     end
     local list = decode(body)
     if type(list) ~= 'table' then return end
@@ -2086,7 +2129,9 @@ local function greq_card(q, who)
     end
   elseif kind == 'script_run' then
     wrapped(sval(p.explanation) or (who .. ' wants to run a script'))
-    if sval(p.script) and ImGui.TreeNode(ctx, 'Script (' .. (sval(p.scriptType) or 'shell') .. ')##' .. id) then
+    -- open by default: Run approves this script, not the agent's explanation of it
+    if sval(p.script) and ImGui.TreeNode(ctx, 'Script (' .. (sval(p.scriptType) or 'shell') .. ')##' .. id,
+        ImGui.TreeNodeFlags_DefaultOpen) then
       ImGui.PushFont(ctx, F.mono, FONT_SIZE - 1)
       wrapped(p.script, C.muted)
       ImGui.PopFont(ctx)
@@ -2307,7 +2352,7 @@ local function frame()
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
-        for _, m in ipairs(S.msgs) do
+        local function draw_msg(m)
           if m.role == 'user' then
             if m._had == nil then
               m._body, m._had = split_context(m.text)
@@ -2334,9 +2379,11 @@ local function frame()
             ImGui.Spacing(ctx)
           end
         end
+        for _, m in ipairs(S.msgs) do draw_msg(m) end
         for _, b in ipairs(S.live) do
           if b.kind == 'text' then md(b, b.text) else ImGui.TextDisabled(ctx, '→ ' .. b.text) end
         end
+        for _, m in ipairs(S.queued) do draw_msg(m) end
         if S.active and not S.waiting then
           local s = spin[(math.floor(reaper.time_precise() * 6) % #spin) + 1]
           ImGui.TextColored(ctx, C.accent, 'Working ' .. s)

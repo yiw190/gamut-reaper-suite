@@ -256,6 +256,24 @@ def main() -> None:
     new_it = g.tracks[len(g.tracks)]["items"][1]
     check("import_media clears loop source", new_it["loop"] is False, dict(new_it))
 
+    lua.execute("""
+        tracks[1].selected = false
+        tracks[2] = tracks[2] or new_track("T1")
+        tracks[2].items = { new_item(0.0, 1.0), new_item(8.0, 1.0) }
+    """)
+    r = rpc("import_media", ["/tmp/y.wav", {"start_beats": 8, "track_index": 1}])
+    items = g.tracks[2]["items"]
+    check("import_media reports the item it created, between existing ones",
+          r.get("ok") and r["ret"]["created"] == [{"track_index": 1, "item_index": 1}], r)
+    check("import_media leaves existing items alone", items[3]["loop"] is True and items[2]["loop"] is False,
+          [dict(items[i]) for i in (1, 2, 3)])
+    n_before = len(g.tracks)
+    r = rpc("import_media", ["/tmp/z.wav", {"as_new_track": True}])
+    created = r.get("ret", {}).get("created")
+    check("import_media new track mid-list: only the new item",
+          r.get("ok") and len(created) == 1 and g.tracks[created[0]["track_index"] + 1]["name"] == "imported"
+          and len(g.tracks) == n_before + 1, r)
+
     r = rpc("import_media", ["", {"track_index": 0}])
     check("import_media rejects empty path", r.get("ok") is False, r)
 
@@ -275,6 +293,8 @@ def main() -> None:
     check("save_project named project saves in place", r.get("ok") and r["ret"]["path"] == "/tmp/new dir/song.RPP"
           and count("Main_SaveProject") == 1, r)
     check("save_project skips undo block", count("Undo_BeginBlock") == 0)
+    r = rpc("save_project", ["/readonly/song.RPP"])
+    check("save_project reports a failed write", r.get("ok") is False and "could not write" in (r.get("error") or ""), r)
 
     # --- idle heartbeat throttle --------------------------------------
     clear()

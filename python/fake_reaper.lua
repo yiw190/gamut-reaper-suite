@@ -215,18 +215,26 @@ reaper.Main_OnCommand = function(id)
     for _, t in ipairs(tracks) do t.selected = false end
   end
 end
+-- like REAPER: the item goes in at the edit cursor, items stay sorted by position, a new track goes after the
+-- selected one
 reaper.InsertMedia = function(path, mode)
   hit("InsertMedia")
+  local sel
+  for i, x in ipairs(tracks) do
+    if x.selected then sel = i break end
+  end
+  local it = new_item(cursor or 0, 4)
   if mode == 1 then
     local t = new_track("imported")
-    t.items[1] = new_item(0, 4)
-    tracks[#tracks + 1] = t
+    t.items[1] = it
+    table.insert(tracks, (sel or #tracks) + 1, t)
   else
-    local t = tracks[#tracks]
-    for _, x in ipairs(tracks) do
-      if x.selected then t = x break end
+    local t = tracks[sel or #tracks]
+    local at = #t.items + 1
+    for i, x in ipairs(t.items) do
+      if x.position > it.position then at = i break end
     end
-    t.items[#t.items + 1] = new_item(0, 4)
+    table.insert(t.items, at, it)
   end
   return true
 end
@@ -234,10 +242,14 @@ reaper.Main_SaveProject = function(_, force)
   hit("Main_SaveProject")
   saved = { force = force }
 end
+local written = {}
 reaper.Main_SaveProjectEx = function(_, path, flags)
   hit("Main_SaveProjectEx")
+  if path:find("^/readonly/") then return end
   saved = { path = path, flags = flags }
+  written[path] = true
 end
+reaper.file_exists = function(path) return written[path] == true end
 
 -- sends / envelopes / fx
 reaper.GetTrackNumSends = function(t) return #t.sends end

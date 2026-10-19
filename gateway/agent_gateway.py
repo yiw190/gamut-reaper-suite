@@ -26,17 +26,21 @@ the gateway also sends each file as a prompt block (an image block when the agen
 resource_link).
 
 Stdlib only; runs on macOS' /usr/bin/python3 (3.9). Listens on 127.0.0.1 only and refuses browser requests
-(any Origin header) and foreign Host headers, so web pages can't drive local agents.
+(any Origin header) and foreign Host headers, so web pages can't drive local agents. Every route except /health
+needs "Authorization: Bearer <token>" from the 0600 token file: Docker and Lima forward the host names below to the
+Mac's loopback, so containers reach this port and the bind address alone doesn't keep them out.
 """
 
 import base64
 import email
 import email.policy
+import hmac
 import json
 import mimetypes
 import os
 import queue
 import re
+import secrets
 import shlex
 import socket
 import subprocess
@@ -54,6 +58,7 @@ from pathlib import Path
 PORT = int(os.environ.get("AGENT_GATEWAY_PORT", "47892"))
 GAMUT = os.environ.get("GAMUT_URL", "http://127.0.0.1:47891").rstrip("/")
 CONFIG = Path(os.environ.get("AGENT_GATEWAY_CONFIG", "~/.config/agent-gateway/config.json")).expanduser()
+TOKEN_FILE = Path(os.environ.get("AGENT_GATEWAY_TOKEN_FILE", str(CONFIG.parent / "token"))).expanduser()
 STATE = Path(os.environ.get("AGENT_GATEWAY_STATE", str(CONFIG.parent / "sessions"))).expanduser()
 ACP_PREFIX = "acp-"
 AUTH_REQUIRED = -32000
@@ -126,6 +131,22 @@ def login_variants(methods, spec):
     return out
 
 
+def load_token():
+    """The shared secret the panel sends; created once, readable only by this user."""
+    TOKEN_FILE.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(TOKEN_FILE), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        token = TOKEN_FILE.read_text().strip()
+        if not token:
+            raise SystemExit("%s is empty; delete it to generate a new token" % TOKEN_FILE)
+        return token
+    token = secrets.token_urlsafe(32)
+    with os.fdopen(fd, "w") as f:
+        f.write(token + "\n")
+    return token
+
+
 class AcpError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
@@ -192,6 +213,7 @@ class Session:
         self.perms = {}  # requestId -> (JSON-RPC id, event)
         self.config = []
         self.backlog = []
+        self.error = None  # the last turn's session_error, replayed to clients that subscribe after it
         self.loading = False
         self.lock = threading.RLock()
 
@@ -513,13 +535,14 @@ class AcpAgent:
                 self.warm = w
             return self.config_cache
 
-    def create(self, message, config):
+    def create(self, message, config, title=None):
         with self.cfg_lock:
             s, self.warm = self.warm, None
         if s is None:
             s = Session(self)
             self.open_session(s)
-        s.title = message.strip().splitlines()[0][:60] if message.strip() else "New chat"
+        title = (title or message).strip()
+        s.title = title.splitlines()[0][:60] if title else "New chat"
         self.sessions[s.id] = s
         self.send(s, message, config)
         return s
@@ -568,6 +591,7 @@ class AcpAgent:
 
     def send(self, s, text, config):
         with s.lock:
+            s.error = None
             if s.active:
                 s.backlog.append((text, config))
                 return
@@ -576,16 +600,16 @@ class AcpAgent:
 
     def _turn(self, s, text, config):
         while True:
+            with s.lock:  # before revive, so a failed start still keeps the message in the transcript
+                s.msgs.append({"id": str(uuid.uuid4()), "type": "user", "content": {"text": text},
+                               "createdAt": now_iso()})
+                s.updated = now_iso()
             try:
                 self.revive(s)
                 try:
                     self.apply_config(s, config)
                 except AcpError as e:  # a stale pick must not cost the message
                     s.emit("notice", text="Kept the previous settings: " + e.message)
-                with s.lock:
-                    s.msgs.append({"id": str(uuid.uuid4()), "type": "user", "content": {"text": text},
-                                   "createdAt": now_iso()})
-                    s.updated = now_iso()
                 s.emit("session_active")
                 if not s.cancelled:
                     res = self.request("session/prompt", {"sessionId": s.acp_id,
@@ -596,14 +620,20 @@ class AcpAgent:
                 code, message = (e.code, e.message) if isinstance(e, AcpError) else (-1, repr(e))
                 if code == AUTH_REQUIRED:
                     self.state, self.connected = "auth_required", False
+                if s.backlog:
+                    message += " (%d queued message%s not sent)" % (len(s.backlog), "" if len(s.backlog) == 1 else "s")
                 with s.lock:
                     s.active = False
+                    for queued, _ in s.backlog:  # kept in the transcript so the user can see and resend them
+                        s.msgs.append({"id": str(uuid.uuid4()), "type": "user", "content": {"text": queued},
+                                       "createdAt": now_iso()})
                     s.backlog.clear()
                     s.updated = now_iso()
+                    s.error = {"apiErrorCode": "auth_required" if code == AUTH_REQUIRED else "acp_error",
+                               "errorPresentation": {"message": self.name + ": " + message}}
                 s.drop_perms()
                 self._save(s)
-                s.emit("session_error", apiErrorCode="auth_required" if code == AUTH_REQUIRED else "acp_error",
-                       errorPresentation={"message": self.name + ": " + message})
+                s.emit("session_error", **s.error)
                 return
             s.drop_perms()
             with s.lock:
@@ -654,7 +684,7 @@ class AcpAgent:
         d = os.path.join(self.cwd, "uploads")
         os.makedirs(d, exist_ok=True)
         safe = re.sub(r"[^\w.\- ]+", "_", os.path.basename(filename)).strip() or "file"
-        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S-") + safe)
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6] + "-" + safe)
         with open(path, "wb") as f:
             f.write(data)
         return {"success": True, "path": path, "filename": filename, "size": len(data)}
@@ -774,6 +804,7 @@ def gamut_config(slug=None):
 
 
 def gamut_body(body):
+    body.pop("title", None)  # the panel's title hint is for ACP sessions; Gamut names its own
     cfg = body.pop("config", None)
     cfg = cfg if isinstance(cfg, dict) else {}
     model = cfg.get("model")
@@ -789,6 +820,7 @@ def gamut_body(body):
 
 class Gateway:
     def __init__(self):
+        self.token = load_token()
         cfg = load_config()
         mcp = [{"name": m["name"], "command": expand(m["command"]), "args": [expand(a) for a in m.get("args", [])],
                 "env": [{"name": k, "value": expand(v)} for k, v in (m.get("env") or {}).items()]}
@@ -838,6 +870,9 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
         if host not in ALLOWED_HOSTS:
             return "unexpected Host"
+        if self.path.split("?", 1)[0] != "/health" and not hmac.compare_digest(
+                (self.headers.get("Authorization") or "").encode(), ("Bearer " + GW.token).encode()):
+            return "missing or wrong gateway token (%s)" % TOKEN_FILE
         ctype = self.headers.get("Content-Type") or ""
         upload = self.path.split("?", 1)[0].endswith("/upload-file")
         if self.raw and "json" not in ctype and not (upload and ctype.startswith("multipart/form-data")):
@@ -933,7 +968,8 @@ class Handler(BaseHTTPRequestHandler):
                 msg = str(b.get("message") or "").strip()
                 if not msg:
                     return self.reply(400, {"error": "Message is required"})
-                return self.reply(201, a.create(msg, b.get("config")).public())
+                title = b.get("title") if isinstance(b.get("title"), str) else None
+                return self.reply(201, a.create(msg, b.get("config"), title).public())
         if len(rest) >= 2 and rest[0] == "sessions":
             s = a.sessions.get(rest[1])
             if not s:
@@ -985,6 +1021,7 @@ class Handler(BaseHTTPRequestHandler):
             turn = s.msgs[-1] if active and s.msgs and s.msgs[-1]["type"] == "assistant" else None
             replay_text = turn["content"]["text"] if turn else ""
             replay_tools = [tc.get("name") for tc in turn.get("toolCalls") or []] if turn else []
+            error = None if active else s.error
         try:
             write({"type": "connected", "isActive": active})
             for name in replay_tools:
@@ -993,6 +1030,8 @@ class Handler(BaseHTTPRequestHandler):
                 write({"type": "stream_delta", "text": replay_text})
             for ev in pending:
                 write(dict(ev, type="permission_request"))
+            if error:
+                write(dict(error, type="session_error"))
             while not q.dead:
                 try:
                     d = q.get(timeout=15)

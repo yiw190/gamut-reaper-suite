@@ -95,6 +95,9 @@ command (the Kimi entry ships kimi.ai = `--region global` and kimi.com = `--regi
 repo's MCP server, so every backend can drive REAPER. The panel shows model / effort / mode pickers for both kinds
 (Gamut's model catalog, ACP config options), permission buttons when an ACP agent asks before a tool call, and a
 login button when the agent needs one. If the gateway isn't running the panel falls back to Gamut directly.
+Every request except `/health` needs `Authorization: Bearer <token>` from `~/.config/agent-gateway/token` (created
+with mode 0600 on first start; the panel reads it). Docker and Lima forward `host.docker.internal` /
+`host.lima.internal` to the Mac's loopback, so without the token any container on the Mac could start a host agent.
 
 ```bash
 sh gateway/install_macos.sh          # LaunchAgent + Node (~/.local/node) + Codex/Claude/Kimi; WITH_CODEX=0 to skip

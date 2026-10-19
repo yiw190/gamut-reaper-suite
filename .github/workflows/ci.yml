@@ -33,6 +33,8 @@ jobs:
       - run: pip install lupa
       - name: bridge.lua against a fake ReaScript API
         run: python python/test_bridge_lua.py
+      - name: chat panel against fake reaper/ImGui
+        run: python gamut-chat/test_panel.py
       - name: bridge copies in sync
         run: cmp lua/bridge.lua reaper_mcp/bridge.lua
       - name: every .lua compiles (Lua 5.4), every .sh parses

@@ -18,6 +18,7 @@ local function sh(cmd)
   if not p then return '' end
   local o = p:read('*a'); p:close(); return o or ''
 end
+if GAMUTCHAT_TEST then sh = GAMUTCHAT_TEST.sh end -- headless tests record the curl commands instead of running them
 local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
 local DIR = (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'gamutchat/'
@@ -2479,4 +2480,8 @@ end)
 if S.agent ~= '' then cfg_load() end
 S.boot = true
 load_agents()
+if GAMUTCHAT_TEST then -- gamut-chat/test_panel.py drives the panel from here, without a window
+  return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
+    greq_card = greq_card, decode = decode, jstr = jstr }
+end
 reaper.defer(frame)

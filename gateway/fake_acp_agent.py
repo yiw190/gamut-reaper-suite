@@ -14,6 +14,7 @@ model = {"v": "fast"}
 pending = {}
 next_id = [1000]
 cancelled = set()
+inflight = set()  # a cancel only applies to a prompt in flight, as in real agents
 
 
 def send(msg):
@@ -44,6 +45,15 @@ def ask(method, params):
 
 def prompt(rid, p):
     sid = p["sessionId"]
+    cancelled.discard(sid)
+    inflight.add(sid)
+    try:
+        _prompt(rid, p, sid)
+    finally:
+        inflight.discard(sid)
+
+
+def _prompt(rid, p, sid):
     text = p["prompt"][0]["text"]
     update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "[" + model["v"] + "] "}})
     if "crash" in text:
@@ -61,7 +71,8 @@ def prompt(rid, p):
         cancelled.discard(sid)
         send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "cancelled"}})
         return
-    update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": " echo: " + text}})
+    kinds = ",".join(b.get("type", "?") for b in p["prompt"])
+    update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": " echo: " + text + " blocks=" + kinds}})
     send({"jsonrpc": "2.0", "id": rid, "result": {"stopReason": "end_turn"}})
 
 
@@ -79,7 +90,7 @@ for line in sys.stdin:
         continue
     m, p, rid = msg["method"], msg.get("params") or {}, msg.get("id")
     if m == "initialize":
-        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": False},
+        send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": 1, "agentCapabilities": {"loadSession": False, "promptCapabilities": {"image": True}},
               "authMethods": [{"id": "login", "name": "Log in", "description": "fake"}]}})
     elif m == "authenticate":
         need_auth = False
@@ -96,6 +107,7 @@ for line in sys.stdin:
     elif m == "session/prompt":
         threading.Thread(target=prompt, args=(rid, p), daemon=True).start()
     elif m == "session/cancel":
-        cancelled.add(p["sessionId"])
+        if p["sessionId"] in inflight:
+            cancelled.add(p["sessionId"])
     elif rid is not None:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32601, "message": "no " + m}})

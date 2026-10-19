@@ -57,7 +57,11 @@ class FakeGamut(BaseHTTPRequestHandler):
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
-        GAMUT_BODIES.append((self.path, json.loads(self.rfile.read(n) or b"{}")))
+        raw = self.rfile.read(n)
+        if self.path.endswith("/upload-file"):
+            ok = (self.headers.get("Content-Type") or "").startswith("multipart/form-data") and b"PNGDATA" in raw
+            return self.j({"success": ok, "path": "/workspace/uploads/shot.png"} if ok else {"error": "bad"}, 200 if ok else 400)
+        GAMUT_BODIES.append((self.path, json.loads(raw or b"{}")))
         self.j({"id": "gs1"}, 201)
 
 
@@ -67,6 +71,14 @@ def free_port():
     p = s.getsockname()[1]
     s.close()
     return p
+
+
+def multipart(filename, data):
+    boundary = "gwtestboundary"
+    body = ("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"%s\"\r\n"
+            "Content-Type: application/octet-stream\r\n\r\n" % (boundary, filename)).encode() + data + \
+        ("\r\n--%s--\r\n" % boundary).encode()
+    return body, "multipart/form-data; boundary=" + boundary
 
 
 class GW:
@@ -101,6 +113,15 @@ class GW:
         h = {"Content-Type": "application/json"}
         h.update(headers or {})
         req = urllib.request.Request(self.url(path), data=json.dumps(body).encode(), method="POST", headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.status, json.load(r)
+        except urllib.error.HTTPError as e:
+            return e.code, json.load(e)
+
+    def upload(self, path, filename, data):
+        body, ctype = multipart(filename, data)
+        req = urllib.request.Request(self.url(path), data=body, method="POST", headers={"Content-Type": ctype})
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return r.status, json.load(r)
@@ -212,13 +233,44 @@ def main():
         msgs = g.get("/api/agents/acp-fake/sessions/%s/messages" % sid)
         check("interrupt cancels permission", "permission=cancelled" in msgs[-1]["content"]["text"])
         check("sessions listed", [x["id"] for x in g.get("/api/agents/acp-fake/sessions")] == [sid])
+
+        code, r = g.upload("/api/agents/g1/upload-file", "shot.png", b"\x89PNGDATA")
+        check("gamut upload proxied as multipart", code == 200 and r["path"] == "/workspace/uploads/shot.png")
+        body, ctype = multipart("x.txt", b"hi")
+        req = urllib.request.Request(g.url("/api/agents/acp-fake/sessions"), data=body, method="POST",
+                                     headers={"Content-Type": ctype})
+        try:
+            urllib.request.urlopen(req, timeout=10)
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("multipart refused outside upload routes", code == 403)
+        code, img = g.upload("/api/agents/acp-fake/upload-file", "shot.png", b"\x89PNG\r\n\x1a\n" + b"0" * 64)
+        code2, doc = g.upload("/api/agents/acp-fake/sessions/%s/upload-file" % sid, "notes.txt", b"hello")
+        check("acp uploads saved", code == 200 and code2 == 200 and os.path.isfile(img["path"])
+              and open(doc["path"], "rb").read() == b"hello")
+        for _ in range(100):  # let the previous turn finish so this message isn't queued behind it
+            if not g.get("/api/agents/acp-fake/sessions/%s" % sid)["isActive"]:
+                break
+            time.sleep(0.05)
+        before = len(g.get("/api/agents/acp-fake/sessions/%s/messages" % sid))
+        g.post("/api/agents/acp-fake/sessions/%s/messages" % sid,
+               {"content": "look\n\n[Attached files:]\n- %s\n- %s" % (img["path"], doc["path"])})
+        msgs = []
+        for _ in range(100):  # poll the transcript for this turn's user message + reply
+            msgs = g.get("/api/agents/acp-fake/sessions/%s/messages" % sid)
+            if len(msgs) >= before + 2 and msgs[-1]["type"] == "assistant" and " echo: look" in msgs[-1]["content"]["text"]:
+                break
+            time.sleep(0.05)
+        check("attachments become image + resource_link blocks",
+              "blocks=text,image,resource_link" in msgs[-1]["content"]["text"])
     finally:
         g.stop()
 
     g = GW(tmp, gport)
     try:
         msgs = g.get("/api/agents/acp-fake/sessions/%s/messages" % sid)
-        check("transcript survives restart", len(msgs) == 4)
+        check("transcript survives restart", len(msgs) >= 4 and msgs[0]["type"] == "user")
         q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid)
         g.post("/api/agents/acp-fake/sessions/%s/messages" % sid, {"content": "after restart"})
         seen = until(q, "session_idle")

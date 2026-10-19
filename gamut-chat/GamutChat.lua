@@ -123,6 +123,16 @@ local function http_url(method, url, body, cb)
     ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
   pending[#pending + 1] = { b = b, cb = cb }
 end
+-- multipart upload of a local file (curl -F), same completion files as http_url
+local function http_upload(url, path, cb)
+  reqn = reqn + 1
+  local b = DIR .. 'req' .. RUN .. '_' .. reqn
+  local field = 'file=@"' .. (path:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
+  sh('( /usr/bin/curl -s -m 300 -F ' .. q(field) .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
+    ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
+  pending[#pending + 1] = { b = b, cb = cb }
+end
+
 local function poll_http()
   for i = #pending, 1, -1 do
     local r = pending[i]
@@ -152,6 +162,7 @@ local S = {
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
   cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil, acp_status = {},
   greqs = {}, greq_at = 0, gans = {}, card_h = {}, gen = 0,
+  files = {}, uploading = false, -- attachments waiting to be sent: { path, name }
 }
 local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
 local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
@@ -721,23 +732,7 @@ local function utf8_prefix(str, n)
   return cut and str:sub(1, cut - 1) or str
 end
 
-local function send()
-  if S.agent == '' then return end
-  if S.sid == '' and S.creating then return end -- the first message is still opening the session
-  local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
-  if text == '' then return end
-  -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
-  -- Enter (or key repeat) re-sent it; the composer clears ImGui's buffer next frame (S.clear_input) and exact
-  -- repeats are dropped here
-  S.clear_input = true
-  local now = reaper.time_precise()
-  if text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
-  S.last_sent, S.last_sent_at = text, now
-  local payload = text
-  if S.ctx_level > 0 then
-    local ctx_text = context(true, S.ctx_level == 2)
-    payload = CTX_OPEN .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
-  end
+local function deliver(payload, text)
   S.msgs[#S.msgs + 1] = { role = 'user', text = payload }
   S.live, S.err, S.input, S.focus, S.active = {}, nil, '', true, true
   scroll()
@@ -772,6 +767,52 @@ local function send()
   end
 end
 
+local function send()
+  if S.agent == '' then return end
+  if S.sid == '' and S.creating then return end -- the first message is still opening the session
+  local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
+  if text == '' and #S.files == 0 then return end
+  if S.uploading then return end
+  -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
+  -- Enter (or key repeat) re-sent it; the composer clears ImGui's buffer next frame (S.clear_input) and exact
+  -- repeats are dropped here
+  S.clear_input = true
+  local now = reaper.time_precise()
+  if #S.files == 0 and text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
+  S.last_sent, S.last_sent_at = text, now
+  local payload = text
+  if S.ctx_level > 0 then
+    local ctx_text = context(true, S.ctx_level == 2)
+    payload = CTX_OPEN .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
+  end
+  if #S.files == 0 then return deliver(payload, text) end
+  -- upload the attachments first, then send the message with Gamut's "[Attached files:]" block
+  local files = S.files
+  S.files, S.uploading, S.input, S.err = {}, #files, '', nil
+  local gen, paths, failed = S.gen, {}, {}
+  local url = api(S.sid ~= '' and ('/sessions/' .. S.sid .. '/upload-file') or '/upload-file')
+  for n, f in ipairs(files) do
+    http_upload(url, f.path, function(code, body)
+      if gen ~= S.gen then return end
+      local r = decode(body)
+      if code >= 200 and code < 300 and type(r) == 'table' and sval(r.path) then paths[n] = r.path
+      else failed[#failed + 1] = f.name end
+      S.uploading = S.uploading - 1
+      if S.uploading > 0 then return end
+      S.uploading = false
+      if #failed > 0 then -- hand everything back so nothing is lost
+        S.err = 'Upload failed: ' .. table.concat(failed, ', ')
+        S.files, S.input = files, text
+        return
+      end
+      local lines = {}
+      for m = 1, #files do lines[#lines + 1] = '- ' .. paths[m] end
+      deliver(payload .. (payload ~= '' and '\n\n' or '') .. '[Attached files:]\n' .. table.concat(lines, '\n'),
+        text ~= '' and text or files[1].name)
+    end)
+  end
+end
+
 local function stop()
   if S.sid ~= '' then http('POST', '/sessions/' .. S.sid .. '/interrupt', '{}') end
 end
@@ -783,6 +824,7 @@ local function reset_view()
   S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
   S.last_sent, S.last_sent_at = nil, nil
   S.stream.fails = 0
+  S.uploading = false
 end
 
 local function new_chat()
@@ -1561,6 +1603,28 @@ local function tools_line(m)
 end
 
 ---------------------------------------------------------------- UI
+local function add_file(path)
+  if type(path) ~= 'string' or path == '' then return end
+  local f = io.open(path, 'rb')
+  if not f then return end
+  f:close()
+  for _, x in ipairs(S.files) do if x.path == path then return end end
+  S.files[#S.files + 1] = { path = path, name = path:match('[^/]+$') or path }
+end
+local function accept_file_drop() -- call right after the item that should take dropped files
+  if ImGui.BeginDragDropTarget(ctx) then
+    local rv, count = ImGui.AcceptDragDropPayloadFiles(ctx)
+    if rv then
+      for i = 0, count - 1 do
+        local _, fn = ImGui.GetDragDropPayloadFile(ctx, i)
+        add_file(fn)
+      end
+      S.focus = true
+    end
+    ImGui.EndDragDropTarget(ctx)
+  end
+end
+
 local function truncate(str, w)
   if ImGui.CalcTextSize(ctx, str) <= w then return str end
   local n = utf8.len(str) or #str
@@ -2221,16 +2285,30 @@ local function frame()
           and ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_C) then
         ImGui.SetClipboardText(ctx, selected_text(S.sel))
       end
-      local composer_h = 98 + cards_height(cards)
+      local composer_h = 98 + cards_height(cards) + (#S.files > 0 and 30 or 0)
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
         for _, m in ipairs(S.msgs) do
           if m.role == 'user' then
-            if m._had == nil then m._body, m._had = split_context(m.text) end
+            if m._had == nil then
+              m._body, m._had = split_context(m.text)
+              local at = m._body:find('[Attached files:]', 1, true)
+              if at then
+                local names = {}
+                for path in m._body:sub(at):gmatch('\n%- ([^\n]+)') do names[#names + 1] = path:match('[^/]+$') or path end
+                m._files = table.concat(names, ', ')
+                m._body = m._body:sub(1, at - 1):gsub('%s+$', '')
+              end
+            end
             local body, had = m._body, m._had
             if had then ImGui.TextDisabled(ctx, '◆ REAPER context') end
-            bubble(m, body)
+            if body ~= '' then bubble(m, body) end
+            if m._files then
+              ImGui.PushTextWrapPos(ctx, 0)
+              ImGui.TextDisabled(ctx, 'Attached: ' .. m._files)
+              ImGui.PopTextWrapPos(ctx)
+            end
             ImGui.Spacing(ctx)
           else
             if m.text ~= '' then md(m, m.text) end
@@ -2248,8 +2326,14 @@ local function frame()
         if S.err then ImGui.TextColored(ctx, C.danger, S.err) end
         ImGui.EndChild(ctx)
       end
+      accept_file_drop() -- files dropped on the conversation attach too
 
       for _, c in ipairs(cards) do card(c) end
+      for n, f in ipairs(S.files) do -- attachments waiting to be sent; click to remove
+        if n > 1 then ImGui.SameLine(ctx, 0, 4) end
+        if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
+        if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, f.path .. '\nClick to remove') end
+      end
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
       local ime = ime_scan()
@@ -2270,6 +2354,7 @@ local function frame()
       local before = S.input
       local entered
       entered, S.input = ImGui.InputTextMultiline(ctx, '##input', S.input, -1, 62, flags, ime_cb)
+      accept_file_drop()
       -- callback flags are one-frame requests: an inactive input never ran the callback, so drop them here
       ImGui.Function_SetValue(ime_cb, 'clear', 0)
       ImGui.Function_SetValue(ime_cb, 'restore', 0)
@@ -2282,10 +2367,18 @@ local function frame()
       ImGui.DrawList_AddRect(ImGui.GetWindowDrawList(ctx), x1, y1, x2, y2,
         focused and C.accent or C.border, 6, 0, focused and 2 or 1)
       if entered then send() end
+      if chip('attach', '+ File', C.muted, false) then
+        local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
+        if ok then add_file(fn) end
+      end
+      if ImGui.IsItemHovered(ctx) then ImGui.SetTooltip(ctx, 'Attach a file (or drop files on the panel)') end
+      ImGui.SameLine(ctx, 0, 2)
       context_chip()
       ImGui.SameLine(ctx, 0, 2)
       model_chip()
-      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or 'Enter to send'
+      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime)
+        or (S.uploading and ('Uploading ' .. S.uploading .. (S.uploading == 1 and ' file…' or ' files…')))
+        or 'Enter to send'
       ImGui.PushFont(ctx, font_for(hint), FONT_SIZE) -- measure and draw in the same font
       local hw = ImGui.CalcTextSize(ctx, hint)
       ImGui.SameLine(ctx)

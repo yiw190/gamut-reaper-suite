@@ -67,7 +67,10 @@ panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamu
 
 What it does: pick an agent and a session, streamed replies with a markdown renderer, every message carries a
 `[REAPER context]` block (project, tempo, cursor, region, selection, MIDI editor notes, focused FX). Enter sends,
-Shift+Enter is a newline. When the agent asks a question or needs an approval, the panel jumps to that session in
+Shift+Enter is a newline. Drag to select message text and Cmd+C to copy. Attach files with **+ File** or by
+dropping them on the panel: they're uploaded to the agent (Gamut's `upload-file`; for ACP agents the gateway stores
+them and sends images as image blocks) and listed in the message as `[Attached files:]`. Latin text uses the REAPER
+theme's UI font. When the agent asks a question or needs an approval, the panel jumps to that session in
 Gamut (`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
 ReaImGui passes keys to both the IME and ImGui, so the panel undoes ImGui's half of Backspace / arrows / Esc / Enter
 while a composition is open and shows the pending pinyin under the input.

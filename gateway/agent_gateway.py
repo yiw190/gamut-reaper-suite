@@ -19,20 +19,31 @@ Gemini CLI, ...) run as stdio subprocesses and are served under the same routes,
                                                      permission_resolved, config_options
   POST /api/agents/<slug>/sessions/<id>/interrupt
   POST /api/agents/<slug>/sessions/<id>/permission {requestId, optionId|null}
+  POST /api/agents/<slug>[/sessions/<id>]/upload-file   multipart "file" -> {success, path, filename, size}
+
+Attachments use Gamut's convention: the message ends with "[Attached files:]" and "- <path>" lines. For ACP agents
+the gateway also sends each file as a prompt block (an image block when the agent accepts images, otherwise a
+resource_link).
 
 Stdlib only; runs on macOS' /usr/bin/python3 (3.9). Listens on 127.0.0.1 only and refuses browser requests
 (any Origin header) and foreign Host headers, so web pages can't drive local agents.
 """
 
+import base64
+import email
+import email.policy
 import json
+import mimetypes
 import os
 import queue
+import re
 import socket
 import subprocess
 import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timezone
@@ -48,6 +59,9 @@ AUTH_REQUIRED = -32000
 # localhost plus the names container runtimes give the host (Lima, Docker, Podman)
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "host.docker.internal", "host.lima.internal", "host.containers.internal"}
 SSE_QUEUE_MAX = 2000
+MAX_UPLOAD = 50 * 1024 * 1024
+MAX_IMAGE_BLOCK = 10 * 1024 * 1024
+ATTACHED = "[Attached files:]"  # Gamut's attachment block, appended to a message as "- <path>" lines
 
 
 def log(*a):
@@ -72,6 +86,49 @@ class AcpError(Exception):
     def __init__(self, code, message):
         super().__init__(message)
         self.code, self.message = code, message
+
+
+def parse_multipart(content_type, body):
+    """[(field name, filename, bytes)] for the file parts of a multipart/form-data body."""
+    msg = email.message_from_bytes(b"Content-Type: " + content_type.encode() + b"\r\nMIME-Version: 1.0\r\n\r\n" + body,
+                                   policy=email.policy.HTTP)
+    out = []
+    for part in msg.iter_parts():
+        name = part.get_filename()
+        if name:
+            out.append((part.get_param("name", header="content-disposition"), name, part.get_payload(decode=True) or b""))
+    return out
+
+
+def attached_paths(text):
+    i = text.find(ATTACHED)
+    if i < 0:
+        return []
+    paths = []
+    for line in text[i + len(ATTACHED):].splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if not line.startswith("- "):
+            break
+        paths.append(line[2:].strip())
+    return paths
+
+
+def prompt_blocks(text, caps):
+    blocks = [{"type": "text", "text": text}]
+    images = bool((caps.get("promptCapabilities") or {}).get("image"))
+    for path in attached_paths(text):
+        if not os.path.isfile(path):
+            continue
+        mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
+        if images and mime.startswith("image/") and os.path.getsize(path) <= MAX_IMAGE_BLOCK:
+            with open(path, "rb") as f:
+                blocks.append({"type": "image", "mimeType": mime, "data": base64.b64encode(f.read()).decode()})
+        else:
+            blocks.append({"type": "resource_link", "uri": "file://" + urllib.parse.quote(path),
+                           "name": os.path.basename(path), "mimeType": mime})
+    return blocks
 
 
 # ---------------------------------------------------------------- sessions
@@ -488,7 +545,7 @@ class AcpAgent:
                 s.emit("session_active")
                 if not s.cancelled:
                     res = self.request("session/prompt", {"sessionId": s.acp_id,
-                                                          "prompt": [{"type": "text", "text": text}]})
+                                                          "prompt": prompt_blocks(text, self.caps)})
                     if res.get("stopReason") not in (None, "end_turn", "cancelled"):
                         s.emit("notice", text="Stopped: " + str(res.get("stopReason")))
             except Exception as e:
@@ -548,6 +605,15 @@ class AcpAgent:
             self.respond(rid, {"outcome": {"outcome": "cancelled"}})
         s.emit("permission_resolved", requestId=request_id)
         return True
+
+    def save_upload(self, filename, data):
+        d = os.path.join(self.cwd, "uploads")
+        os.makedirs(d, exist_ok=True)
+        safe = re.sub(r"[^\w.\- ]+", "_", os.path.basename(filename)).strip() or "file"
+        path = os.path.join(d, time.strftime("%Y%m%d-%H%M%S-") + safe)
+        with open(path, "wb") as f:
+            f.write(data)
+        return {"success": True, "path": path, "filename": filename, "size": len(data)}
 
     def probe(self):
         """Start the agent and open a warm session so the picker knows whether it is logged in."""
@@ -667,12 +733,20 @@ class Handler(BaseHTTPRequestHandler):
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
         if host not in ALLOWED_HOSTS:
             return "unexpected Host"
-        if self.raw and "json" not in (self.headers.get("Content-Type") or ""):
+        ctype = self.headers.get("Content-Type") or ""
+        upload = self.path.split("?", 1)[0].endswith("/upload-file")
+        if self.raw and "json" not in ctype and not (upload and ctype.startswith("multipart/form-data")):
             return "JSON body required"
         return None
 
     def route(self, method):
-        n = int(self.headers.get("Content-Length") or 0)
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if not 0 <= n <= MAX_UPLOAD:
+            self.raw, self.json = b"", {}
+            return self.reply(413, {"error": "bad or too large Content-Length"})
         self.raw = self.rfile.read(n) if n > 0 else b""
         try:
             self.json = json.loads(self.raw) if self.raw else {}
@@ -740,6 +814,12 @@ class Handler(BaseHTTPRequestHandler):
             return self.reply(202, {"state": "authenticating"})
         if method == "GET" and rest == ["config"]:
             return self.reply(200, {"configOptions": a.get_config()})
+        if method == "POST" and rest[-1:] == ["upload-file"] and (len(rest) == 1 or rest[0] == "sessions"):
+            files = parse_multipart(self.headers.get("Content-Type") or "", self.raw)
+            f = next((x for x in files if x[0] == "file"), files[0] if files else None)
+            if not f:
+                return self.reply(400, {"error": "No file provided"})
+            return self.reply(200, a.save_upload(f[1], f[2]))
         if rest == ["sessions"]:
             if method == "GET":
                 ss = sorted(a.sessions.values(), key=lambda s: s.updated, reverse=True)

@@ -271,6 +271,25 @@ def main():
         r = rpc(proc, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
                        "params": {"name": "nope", "arguments": {}}})
         check("unknown tool errors", "error" in r)
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                       "params": {"name": "track", "arguments": {"action": "delete"}}})
+        check("missing argument is named", r["result"].get("isError")
+              and r["result"]["content"][0]["text"] == "missing argument: index")
+
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                       "params": {"name": "batch", "arguments": {"calls": [
+                           {"func": "track", "arguments": {"action": "delete"}},
+                           {"func": "run_lua", "code": "return 1"}]}}})
+        body = json.loads(r["result"]["content"][0]["text"])  # the fake bridge echoes funcs, it doesn't run Lua
+        check("batch: a bad slot doesn't abort the rest", not r["result"].get("isError")
+              and len(body) == 2 and body[0]["echo"] == "run_lua")
+
+        proc.stdin.write("[1, 2]\n")
+        proc.stdin.flush()
+        bad = json.loads(proc.stdout.readline())
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 12, "method": "ping"})
+        check("non-object input answered, server alive", bad["error"]["code"] == -32600 and r.get("result") == {})
     finally:
         stop.set()
         proc.kill()

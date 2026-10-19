@@ -21,6 +21,8 @@ GAMUT_BODIES = []
 
 
 class FakeGamut(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"  # chunked SSE, like Gamut's Node server
+
     def log_message(self, *a):
         pass
 
@@ -41,10 +43,15 @@ class FakeGamut(BaseHTTPRequestHandler):
         if self.path.endswith("/stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             for d in ({"type": "connected", "isActive": True}, {"type": "stream_delta", "text": "hi"}):
-                self.wfile.write(("event: message\ndata: " + json.dumps(d) + "\n\n").encode())
+                chunk = ("event: message\ndata: " + json.dumps(d) + "\n\n").encode()
+                for part in (chunk[:10], chunk[10:]):  # an event split across chunks
+                    self.wfile.write(b"%x\r\n%s\r\n" % (len(part), part))
                 self.wfile.flush()
+            self.wfile.write(b"0\r\n\r\n")
+            self.close_connection = True
             return
         self.j({"error": "nope"}, 404)
 
@@ -90,9 +97,10 @@ class GW:
         with urllib.request.urlopen(self.url(path), timeout=10) as r:
             return json.load(r)
 
-    def post(self, path, body):
-        req = urllib.request.Request(self.url(path), data=json.dumps(body).encode(), method="POST",
-                                     headers={"Content-Type": "application/json"})
+    def post(self, path, body, headers=None):
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        req = urllib.request.Request(self.url(path), data=json.dumps(body).encode(), method="POST", headers=h)
         try:
             with urllib.request.urlopen(req, timeout=20) as r:
                 return r.status, json.load(r)
@@ -107,11 +115,13 @@ class GW:
             c.request("GET", path)
             r = c.getresponse()
             while True:
-                line = r.fp.readline()
+                line = r.readline()
                 if not line:
                     break
                 if line.startswith(b"data: "):
                     q.put(json.loads(line[6:]))
+                elif line.strip() and not line.startswith((b"event:", b":")):
+                    q.put({"type": "garbage", "line": line.decode(errors="replace")})
         threading.Thread(target=run, daemon=True).start()
         return q
 
@@ -159,7 +169,12 @@ def main():
         check("gamut config -> llmProviderId/model/effort",
               code == 201 and body == {"message": "hi", "llmProviderId": "c1", "model": "m1", "effort": "high"})
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
-        check("gamut SSE proxied", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
+        check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
+
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Origin": "https://evil.example"})
+        check("browser Origin refused", code == 403)
+        code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Host": "evil.example"})
+        check("foreign Host refused", code == 403)
 
         g.get("/api/agents/acp-fake/status?probe=1")
         for _ in range(100):
@@ -207,6 +222,20 @@ def main():
         g.post("/api/agents/acp-fake/sessions/%s/messages" % sid, {"content": "after restart"})
         seen = until(q, "session_idle")
         check("revive starts fresh ACP session", "notice" in [d["type"] for d in seen])
+    finally:
+        g.stop()
+
+    tmp3 = tempfile.mkdtemp()
+    g = GW(tmp3, gport, {"FAKE_ACP_NOISE": "1"})
+    try:
+        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "please crash"})
+        q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % s["id"])
+        seen = until(q, "session_error")
+        check("noise ignored, crash mid-turn ends the turn", code == 201 and seen[-1]["type"] == "session_error")
+        check("session not stuck after crash", g.get("/api/agents/acp-fake/sessions/%s" % s["id"])["isActive"] is False)
+        g.post("/api/agents/acp-fake/sessions/%s/messages" % s["id"], {"content": "again"})
+        seen = until(q, "session_idle")
+        check("agent restarts on next message", "notice" in [d["type"] for d in seen])
     finally:
         g.stop()
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Minimal ACP agent over stdio for gateway tests: config options, streamed chunks, a tool call that asks for
-permission, cancel, and an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called)."""
+permission, cancel, an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called), stray non-object
+stdout lines (FAKE_ACP_NOISE=1) and a prompt containing "crash" that kills the process mid-turn."""
 
 import json
 import os
@@ -45,6 +46,8 @@ def prompt(rid, p):
     sid = p["sessionId"]
     text = p["prompt"][0]["text"]
     update(sid, {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "[" + model["v"] + "] "}})
+    if "crash" in text:
+        os._exit(3)
     if "tool" in text:
         update(sid, {"sessionUpdate": "tool_call", "toolCallId": "t1", "title": "Edit REAPER project", "kind": "edit",
                      "status": "pending"})
@@ -64,6 +67,10 @@ def prompt(rid, p):
 
 for line in sys.stdin:
     msg = json.loads(line)
+    if os.environ.get("FAKE_ACP_NOISE") == "1":
+        with lock:
+            sys.stdout.write("42\nnot json\n")
+            sys.stdout.flush()
     if "method" not in msg:
         box = pending.get(msg.get("id"))
         if box:

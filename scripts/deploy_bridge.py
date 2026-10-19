@@ -7,7 +7,8 @@ handoff -- patch `reaper.defer` so the old tick chain ends, and load the new
 file on a timer so the request that triggered the swap still gets answered.
 
     python3 scripts/deploy_bridge.py stage    # write files, verify hashes
-    python3 scripts/deploy_bridge.py swap     # back up live, hand off
+    python3 scripts/deploy_bridge.py swap     # back up live, hand off (falls back to the backup if the new one fails)
+    python3 scripts/deploy_bridge.py restart  # bounce the HTTP front so it loads the new server.py
     python3 scripts/deploy_bridge.py verify   # confirm which build is live
 
 Needs REAPER_MCP_HOSTNAME / REAPER_MCP_BEARER (or -H / -T).
@@ -37,7 +38,7 @@ FILES = [
 ]
 LAUNCH_LABEL = "com.yitian.reaper-mcp"
 
-# Seconds to keep the old process alive while Python reads the swap response.
+# Defer ticks (~30 per second) the old bridge keeps answering while Python reads the swap response.
 HANDOFF_TICKS = 30
 
 
@@ -148,33 +149,52 @@ if reaper.defer ~= noop then
   reaper.defer = real
   return {{ ret = {{ swapped = false, error = "reaper.defer is not patchable" }} }}
 end
-local function expand(p) return p:gsub("^~", os.getenv("HOME")) end
-local live, stage = expand({live}), expand({stage_path})
--- back up the running script first
-local src = io.open(live, "rb")
-if src then
-  local cur = src:read("*a"); src:close()
-  local b = io.open(live .. ".bak", "wb")
-  if b then b:write(cur) b:close() end
-end
-local s = io.open(stage, "rb")
-if not s then reaper.defer = real return {{ ret = {{ swapped = false, error = "no staged file" }} }} end
-local data = s:read("*a"); s:close()
-local o = io.open(live, "wb")
-if not o then reaper.defer = real return {{ ret = {{ swapped = false, error = "cannot write live" }} }} end
-o:write(data) o:close()
-local countdown = {HANDOFF_TICKS}
-local function waiter()
-  countdown = countdown - 1
-  if countdown > 0 then real(waiter) return end
-  reaper.defer = real
-  local chunk, cerr = loadfile(live)
-  if not chunk then reaper.ShowConsoleMsg("reaper-mcp reload failed: " .. tostring(cerr) .. "\\n") return end
-  local ok, e = pcall(chunk)
-  if not ok then reaper.ShowConsoleMsg("reaper-mcp reload error: " .. tostring(e) .. "\\n") end
-end
-real(waiter)
-return {{ ret = {{ swapped = true, bytes = #data, live = live }} }}
+-- everything below runs under pcall: any error puts reaper.defer back, so the running bridge keeps going
+local ok, res = pcall(function()
+  local function expand(p) return (p:gsub("^~", os.getenv("HOME") or "~")) end
+  local live, stage = expand({live}), expand({stage_path})
+  local s = io.open(stage, "rb")
+  if not s then return {{ swapped = false, error = "no staged file" }} end
+  local data = s:read("*a"); s:close()
+  local chunk_ok, cerr = load(data, "=reaper_mcp_bridge.lua")
+  if not chunk_ok then return {{ swapped = false, error = "staged bridge does not compile: " .. tostring(cerr) }} end
+  local src = io.open(live, "rb") -- back up the running script first
+  local cur = src and src:read("*a")
+  if src then src:close() end
+  if cur then
+    local b = io.open(live .. ".bak", "wb")
+    if not b then return {{ swapped = false, error = "cannot write backup" }} end
+    b:write(cur) b:close()
+  end
+  local o = io.open(live, "wb")
+  if not o then return {{ swapped = false, error = "cannot write live" }} end
+  o:write(data) o:close()
+  local countdown = {HANDOFF_TICKS}
+  local function run(path)
+    local chunk, e = loadfile(path)
+    if not chunk then return false, e end
+    return pcall(chunk)
+  end
+  local function waiter()
+    countdown = countdown - 1
+    if countdown > 0 then real(waiter) return end
+    reaper.defer = real
+    local started, e = run(live)
+    if not started then -- new bridge failed: restore and start the previous one so the agent isn't locked out
+      reaper.ShowConsoleMsg("reaper-mcp: new bridge failed (" .. tostring(e) .. "), restoring the backup\\n")
+      if cur then
+        local w = io.open(live, "wb")
+        if w then w:write(cur) w:close() end
+        run(live)
+      end
+    end
+  end
+  real(waiter)
+  return {{ swapped = true, bytes = #data, live = live }}
+end)
+if not ok or not res.swapped then reaper.defer = real end
+if not ok then return {{ ret = {{ swapped = false, error = tostring(res) }} }} end
+return {{ ret = res }}
 """
     res = rpc(host, bearer, code)["ret"]
     print(res)

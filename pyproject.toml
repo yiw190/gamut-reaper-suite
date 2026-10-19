@@ -1,9 +1,9 @@
 [project]
 name = "reaper-mcp"
-version = "0.1.0"
+version = "0.3.0"
 description = "MCP server for controlling Cockos REAPER."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 license = { text = "MIT" }
 authors = [{ name = "yiw190" }]
 keywords = ["reaper", "mcp", "daw", "reascript"]

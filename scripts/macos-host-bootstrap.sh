@@ -11,7 +11,7 @@ LAUNCH="$HOME/Library/LaunchAgents"
 LOGDIR="$HOME/Library/Logs"
 REPO="$HOME/reaper-mcp"
 mkdir -p "$BIN" "$CFG" "$LAUNCH" "$LOGDIR"
-export PATH="$BIN:$HOME/.local/bin:$PATH"
+export PATH="$BIN:$PATH"
 
 if [ -f "$CFG/env" ]; then
   set -a
@@ -25,13 +25,6 @@ fi
 REAPER_MCP_PORT="${REAPER_MCP_PORT:-8787}"
 REAPER_MCP_HOSTNAME="${REAPER_MCP_HOSTNAME:-reaper.yitian.wang}"
 
-if ! command -v uv >/dev/null 2>&1; then
-  echo "installing uv"
-  curl -LsSf https://astral.sh/uv/install.sh | sh
-  export PATH="$HOME/.local/bin:$PATH"
-fi
-command -v uv || true
-uv --version || true
 
 if [ ! -x "$BIN/cloudflared" ]; then
   echo "installing cloudflared"
@@ -59,7 +52,7 @@ fi
 if [ ! -d "$REPO/.git" ]; then
   git clone https://github.com/yiw190/gamut-reaper-suite.git "$REPO"
 else
-  git -C "$REPO" pull --ff-only || true
+  git -C "$REPO" pull --ff-only || echo "WARNING: could not fast-forward $REPO; running the checked-out version" >&2
 fi
 
 if [ ! -f "$REPO/python/http_server.py" ]; then
@@ -77,8 +70,9 @@ CLOUDFLARE_TUNNEL_TOKEN=$CLOUDFLARE_TUNNEL_TOKEN
 ENVEOF
 chmod 600 "$CFG/env"
 
-python3 - << PY
+python3 - << 'PY'
 from pathlib import Path
+from xml.sax.saxutils import escape
 home = Path.home()
 repo = home / "reaper-mcp"
 launch = home / "Library/LaunchAgents"
@@ -91,8 +85,8 @@ for line in cfg.read_text().splitlines():
         vals[k] = v
 
 def plist(label, args, env, logfile):
-    env_xml = "\n".join(f"    <key>{k}</key><string>{v}</string>" for k, v in env.items())
-    args_xml = "\n".join(f"    <string>{a}</string>" for a in args)
+    env_xml = "\n".join(f"    <key>{escape(k)}</key><string>{escape(v)}</string>" for k, v in env.items())
+    args_xml = "\n".join(f"    <string>{escape(a)}</string>" for a in args)
     env_block = ""
     if env:
         env_block = "  <key>EnvironmentVariables</key>\n  <dict>\n" + env_xml + "\n  </dict>\n"
@@ -122,8 +116,8 @@ def plist(label, args, env, logfile):
 ))
 (launch / "com.yitian.cloudflared-reaper.plist").write_text(plist(
     "com.yitian.cloudflared-reaper",
-    [str(home / ".local/bin/cloudflared"), "tunnel", "run", "--token", vals["CLOUDFLARE_TUNNEL_TOKEN"]],
-    {},
+    [str(home / ".local/bin/cloudflared"), "tunnel", "run"],
+    {"TUNNEL_TOKEN": vals["CLOUDFLARE_TUNNEL_TOKEN"]},  # env, not argv: argv is visible to every user via ps
     str(logdir / "cloudflared-reaper"),
 ))
 print("wrote launch agents")

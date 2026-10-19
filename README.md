@@ -30,22 +30,22 @@ cd gamut-reaper-suite
 python3 python/install_bridge.py
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.1.0 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.3.0 ready`.
 
-MCP client config (Claude Code / Claude Desktop / Cursor):
+MCP client config (any client that runs stdio servers):
 
 ```json
 {
   "mcpServers": {
     "reaper": {
       "command": "python3",
-      "args": ["/absolute/path/to/reaper-mcp/python/server.py"]
+      "args": ["/absolute/path/to/gamut-reaper-suite/python/server.py"]
     }
   }
 }
 ```
 
-Use native Windows Python, not WSL.
+On Windows use native Python, not WSL (they don't share the mailbox).
 
 ```
 REAPER_MCP_IPC_DIR     mailbox override (must match on both sides)
@@ -53,7 +53,8 @@ REAPER_MCP_TIMEOUT     default 10s
 REAPER_MCP_DEBUG=1     Lua request log
 ```
 
-Mailbox is `%APPDATA%/reaper-mcp/ipc` (ASCII path both sides derive). Time is **beats**. Indices are 0-based.
+Mailbox: `~/Library/Application Support/reaper-mcp/ipc` on macOS, `%APPDATA%/reaper-mcp/ipc` on Windows,
+`$XDG_DATA_HOME/reaper-mcp/ipc` on Linux. Time is **beats**. Indices are 0-based.
 
 ## Gamut Chat panel (macOS)
 
@@ -116,7 +117,7 @@ uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under
 CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12, plus a
 check that `lua/bridge.lua` and `reaper_mcp/bridge.lua` are identical.
 
-Neither needs REAPER. The second one skips if lupa is not installed.
+None of these need REAPER. The Lua-based ones need `lupa` (CI installs it).
 
 ## License
 

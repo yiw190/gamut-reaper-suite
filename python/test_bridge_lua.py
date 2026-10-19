@@ -23,7 +23,7 @@ FAKE = Path(__file__).resolve().parent / "fake_reaper.lua"
 
 PPQ = 960.0
 
-# Lua 5.1 (LuaJIT, what lupa ships) versus the 5.3+ the bridge targets.
+# Shims for older Lua runtimes lupa may load; the bridge targets REAPER's Lua 5.4.
 COMPAT = """
 if not table.pack then
   table.pack = function(...) return {n = select('#', ...), ...} end
@@ -167,7 +167,7 @@ def main() -> None:
     # --- list_items property reads -----------------------------------
     clear()
     n_items = len(g.tracks[1]["items"])
-    rpc("list_items", [0])
+    r = rpc("list_items", [0])
     reads = sum(count(f"item.{k}") for k in ("D_POSITION", "D_LENGTH", "D_VOL"))
     check("list_items reads 3 properties per item",
           r.get("ok") and reads == 3 * n_items, f"reads={reads} items={n_items}")
@@ -273,6 +273,29 @@ def main() -> None:
     g.pump(60)  # one second of idle ticks
     writes = count("heartbeat_writes")
     check("idle heartbeat writes throttled", 1 <= writes <= 3, f"writes={writes}")
+
+    # --- JSON regressions (null args, emoji, nil batch slots) ----------
+    n_tracks = len(g.tracks)
+    r = rpc("add_track", [None, 0])
+    check("null name keeps the index in place", r.get("ok") and r["ret"]["index"] == 0
+          and len(g.tracks) == n_tracks + 1 and r["ret"].get("name") != "0", r)
+    r = rpc("add_track", ["\U0001F3B5 Lead", 0])  # json.dump escapes it as a surrogate pair
+    names = [t["name"] for t in rpc("list_tracks")["ret"]]
+    check("emoji survives the mailbox", "\U0001F3B5 Lead" in names, names[:3])
+    r = rpc("batch", [[{"func": "run_lua", "code": "return nil"}, {"func": "ping"}]])
+    r2 = rpc("batch", [[{"func": "run_lua", "code": 'error("missing argument: index", 0)'}, {"func": "ping"}]])
+    check("batch error slot carries the message", r2.get("ok") and r2["ret"][0] == {"error": "missing argument: index"}
+          and r2["ret"][1]["pong"] is True, r2)
+    check("batch keeps nil slots as null", r.get("ok") and isinstance(r["ret"], list) and len(r["ret"]) == 2
+          and r["ret"][0] is None, r)
+
+    # --- delete_midi_notes ignores repeats and out-of-range indices --
+    item = rpc("create_midi_item", [0, 0.0, 4.0])["ret"]["item_index"]
+    rpc("add_midi_notes", [0, item, [{"pitch": 60, "start_beats": 0, "length_beats": 1},
+                                     {"pitch": 62, "start_beats": 1, "length_beats": 1}]])
+    r = rpc("delete_midi_notes", [0, item, [0, 0, 99]])
+    left = rpc("get_midi_notes", [0, item])["ret"]
+    check("delete [0,0,99] removes one note", r.get("ok") and r["ret"]["deleted"] == 1 and len(left) == 1, r)
 
     # --- the bridge is still responsive -------------------------------
     r = rpc("ping")

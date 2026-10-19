@@ -26,7 +26,7 @@ if [ "${WITH_CODEX:-1}" = 1 ]; then
   echo "installing ACP adapters: codex-acp, claude-agent-acp"
   PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/npm" install -g --no-fund --no-audit \
     @agentclientprotocol/codex-acp @agentclientprotocol/claude-agent-acp
-  PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/codex-acp" --version || true
+  PATH="$NODE_DIR/bin:$PATH" "$NODE_DIR/bin/codex-acp" --version < /dev/null || true
 fi
 
 if [ ! -f "$CFG/config.json" ]; then
@@ -79,5 +79,9 @@ cat > "$LA/$LABEL.plist" << EOF
 EOF
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$LA/$LABEL.plist"
-sleep 1
-curl -fsS http://127.0.0.1:47892/health && echo " gateway up"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  curl -fsS http://127.0.0.1:47892/health 2>/dev/null && echo " gateway up" && exit 0
+  sleep 1
+done
+echo "gateway did not answer; see ~/Library/Logs/agent-gateway.log" >&2
+exit 1

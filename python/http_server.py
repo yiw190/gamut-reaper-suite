@@ -2,6 +2,7 @@
 """Bearer-protected Streamable HTTP front for reaper-mcp stdio."""
 from __future__ import annotations
 
+import hmac
 import json
 import os
 import subprocess
@@ -16,25 +17,32 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER = ROOT / "python" / "server.py"
 
 
+MAX_BODY = 16 * 1024 * 1024
+
+
 class StdioClient:
     def __init__(self) -> None:
-        env = os.environ.copy()
+        self.proc = None
+        self.lock = threading.Lock()
+
+    def _start(self) -> None:
+        # stderr goes to our (launchd) log so tracebacks aren't lost and a full pipe can't block the child
         self.proc = subprocess.Popen(
             [sys.executable, str(SERVER)],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
             text=True,
+            encoding="utf-8",
             bufsize=1,
-            env=env,
         )
-        self.lock = threading.Lock()
 
     def rpc(self, msg: dict):
         line = json.dumps(msg, ensure_ascii=False)
         with self.lock:
-            if self.proc.poll() is not None:
-                raise RuntimeError("stdio MCP exited")
+            if self.proc is None or self.proc.poll() is not None:
+                if self.proc is not None:
+                    sys.stderr.write("stdio MCP exited (%s); restarting\n" % self.proc.returncode)
+                self._start()
             assert self.proc.stdin and self.proc.stdout
             self.proc.stdin.write(line + "\n")
             self.proc.stdin.flush()
@@ -50,7 +58,7 @@ class StdioClient:
                 return json.loads(out)
 
 
-CLIENT = StdioClient()
+CLIENT = StdioClient()  # the child starts on the first request
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -79,7 +87,7 @@ class Handler(BaseHTTPRequestHandler):
         if not BEARER:
             return False
         header = self.headers.get("Authorization", "")
-        return header == f"Bearer {BEARER}"
+        return hmac.compare_digest(header.encode(), f"Bearer {BEARER}".encode())
 
     def do_GET(self) -> None:  # noqa: N802
         if self.path.split("?", 1)[0] in ("/healthz", "/health"):
@@ -98,12 +106,21 @@ class Handler(BaseHTTPRequestHandler):
         if not self._auth_ok():
             self._unauthorized()
             return
-        n = int(self.headers.get("Content-Length") or "0")
+        try:
+            n = int(self.headers.get("Content-Length") or "0")
+        except ValueError:
+            n = -1
+        if not 0 <= n <= MAX_BODY:
+            self._send(413, b'{"error":"bad Content-Length"}', "application/json")
+            return
         raw = self.rfile.read(n) if n else b"{}"
         try:
             msg = json.loads(raw.decode("utf-8") or "{}")
         except ValueError:
             self._send(400, b'{"error":"invalid json"}', "application/json")
+            return
+        if not isinstance(msg, dict):
+            self._send(400, b'{"error":"send one JSON-RPC request object"}', "application/json")
             return
         try:
             result = CLIENT.rpc(msg)

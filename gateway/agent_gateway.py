@@ -1,31 +1,33 @@
 #!/usr/bin/env python3
 """Agent gateway: one local REST + SSE API for the REAPER chat panel.
 
-Gamut agents are proxied to the Gamut desktop API unchanged. ACP agents (Codex, Claude Code, Gemini CLI, ...)
-are run as stdio subprocesses and exposed under the same routes as Gamut, as agents with slug `acp-<slug>`:
+Gamut agents are forwarded to the Gamut desktop API (POST bodies' "config" is turned into Gamut's
+model/llmProviderId/effort; GET /config is generated from Gamut's model catalog). ACP agents (Codex, Claude Code,
+Gemini CLI, ...) run as stdio subprocesses and are served under the same routes, as agents with slug `acp-<slug>`:
 
   GET  /api/agents                                   Gamut agents + ACP agents
   GET  /api/agents/<slug>/config                     model / effort / mode selectors (normalized config options)
-  GET  /api/agents/<slug>/status                     ACP: {state, authMethods, error}
+  GET  /api/agents/<slug>/status[?probe=1]           ACP: {state, connected, authMethods, error}; probe starts it
   POST /api/agents/<slug>/auth          {methodId}   ACP: start login
   GET  /api/agents/<slug>/sessions
   POST /api/agents/<slug>/sessions      {message, config}
+  GET  /api/agents/<slug>/sessions/<id>
   POST /api/agents/<slug>/sessions/<id>/messages {content, config}
   GET  /api/agents/<slug>/sessions/<id>/messages
-  GET  /api/agents/<slug>/sessions/<id>/stream       SSE: connected, stream_delta, tool_use_ready, session_idle,
-                                                     session_error, permission_request, permission_resolved,
-                                                     config_options
+  GET  /api/agents/<slug>/sessions/<id>/stream       SSE: connected, session_active, stream_delta, tool_use_ready,
+                                                     session_idle, session_error, notice, permission_request,
+                                                     permission_resolved, config_options
   POST /api/agents/<slug>/sessions/<id>/interrupt
   POST /api/agents/<slug>/sessions/<id>/permission {requestId, optionId|null}
 
-Stdlib only; runs on macOS' /usr/bin/python3 (3.9). Listens on 127.0.0.1 only.
+Stdlib only; runs on macOS' /usr/bin/python3 (3.9). Listens on 127.0.0.1 only and refuses browser requests
+(any Origin header) and foreign Host headers, so web pages can't drive local agents.
 """
-
-from __future__ import annotations
 
 import json
 import os
 import queue
+import socket
 import subprocess
 import sys
 import threading
@@ -43,6 +45,9 @@ CONFIG = Path(os.environ.get("AGENT_GATEWAY_CONFIG", "~/.config/agent-gateway/co
 STATE = Path(os.environ.get("AGENT_GATEWAY_STATE", str(CONFIG.parent / "sessions"))).expanduser()
 ACP_PREFIX = "acp-"
 AUTH_REQUIRED = -32000
+# localhost plus the names container runtimes give the host (Lima, Docker, Podman)
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "host.docker.internal", "host.lima.internal", "host.containers.internal"}
+SSE_QUEUE_MAX = 2000
 
 
 def log(*a):
@@ -64,9 +69,9 @@ def load_config():
 
 
 class AcpError(Exception):
-    def __init__(self, code, message, data=None):
+    def __init__(self, code, message):
         super().__init__(message)
-        self.code, self.message, self.data = code, message, data
+        self.code, self.message = code, message
 
 
 # ---------------------------------------------------------------- sessions
@@ -81,10 +86,10 @@ class Session:
         self.updated = self.created
         self.msgs = []
         self.active = False
+        self.cancelled = False
         self.subs = set()
-        self.perms = {}  # requestId -> (rpc id, params)
+        self.perms = {}  # requestId -> (JSON-RPC id, event)
         self.config = []
-        self.applied = {}
         self.backlog = []
         self.loading = False
         self.lock = threading.RLock()
@@ -94,7 +99,10 @@ class Session:
         with self.lock:
             subs = list(self.subs)
         for q in subs:
-            q.put(data)
+            try:
+                q.put_nowait(data)
+            except queue.Full:  # a client that stopped reading; its SSE loop drops it
+                q.dead = True
 
     def public(self):
         return {"id": self.id, "name": self.title or "New chat", "isActive": self.active,
@@ -106,31 +114,43 @@ class Session:
                               "toolCalls": [], "createdAt": now_iso()})
         return self.msgs[-1]
 
-    def path(self):
-        return STATE / self.agent.slug / (self.id + ".json")
+    def tool_title(self, tool_call_id):
+        with self.lock:
+            for m in reversed(self.msgs):
+                for tc in m.get("toolCalls") or []:
+                    if tc.get("id") == tool_call_id:
+                        return tc.get("name")
+        return None
+
+    def drop_perms(self):
+        with self.lock:
+            perms, self.perms = self.perms, {}
+        for _, ev in perms.values():
+            self.emit("permission_resolved", requestId=ev["requestId"])
+        return perms
 
     def persist(self):
-        p = self.path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"id": self.id, "acp_id": self.acp_id, "title": self.title,
-                                   "created": self.created, "updated": self.updated, "msgs": self.msgs}))
+        p = STATE / self.agent.slug / (self.id + ".json")
+        p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with self.lock:
+            data = json.dumps({"id": self.id, "acp_id": self.acp_id, "title": self.title,
+                               "created": self.created, "updated": self.updated, "msgs": self.msgs})
+        tmp = p.with_name(p.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+        tmp.write_text(data)
         tmp.replace(p)
 
-    # ACP session/update
     def on_update(self, u):
-        kind = u.get("sessionUpdate")
-        if self.loading:
+        if self.loading or not isinstance(u, dict):
             return
+        kind = u.get("sessionUpdate")
         if kind == "agent_message_chunk":
             c = u.get("content") or {}
             if c.get("type") == "text" and c.get("text"):
                 with self.lock:
-                    m = self.assistant()
-                    m["content"]["text"] += c["text"]
+                    self.assistant()["content"]["text"] += c["text"]
                 self.emit("stream_delta", text=c["text"])
         elif kind == "tool_call":
-            title = u.get("title") or u.get("name") or u.get("kind") or "tool"
+            title = u.get("title") or u.get("kind") or "tool"
             with self.lock:
                 self.assistant()["toolCalls"].append({"id": u.get("toolCallId"), "name": title})
             self.emit("tool_use_ready", toolName=title)
@@ -177,10 +197,12 @@ class AcpAgent:
         self.spec = spec
         self.slug = ACP_PREFIX + spec["slug"]
         self.name = spec.get("name", spec["slug"])
+        self.cwd = os.path.abspath(expand(spec.get("cwd", "~")))
         self.mcp_servers = mcp_servers
         self.proc = None
-        self.lock = threading.RLock()
-        self.wlock = threading.Lock()
+        self.lock = threading.RLock()      # process lifecycle + request ids
+        self.wlock = threading.Lock()      # stdin writes
+        self.cfg_lock = threading.Lock()   # warm session / config cache
         self.next_id = 0
         self.pending = {}
         self.state = "stopped"
@@ -191,11 +213,10 @@ class AcpAgent:
         self.caps = {}
         self.sessions = {}
         self.by_acp = {}
-        self.config_cache = []
+        self.config_cache = None  # None = not fetched yet; [] = agent has no options
         self.warm = None
         self.load_persisted()
 
-    # -- persistence
     def load_persisted(self):
         d = STATE / self.slug
         if not d.is_dir():
@@ -203,33 +224,51 @@ class AcpAgent:
         for p in d.glob("*.json"):
             try:
                 j = json.loads(p.read_text())
-            except ValueError:
+                s = Session(self, p.stem, j.get("title", ""), j.get("created"))
+                s.updated = j.get("updated", s.created)
+                s.msgs = j.get("msgs") if isinstance(j.get("msgs"), list) else []
+                s.acp_id = j.get("acp_id")
+            except Exception as e:
+                log(self.slug, "skipping", p.name, e)
                 continue
-            s = Session(self, j["id"], j.get("title", ""), j.get("created"))
-            s.updated = j.get("updated", s.created)
-            s.msgs = j.get("msgs", [])
-            s.acp_id = j.get("acp_id")
             self.sessions[s.id] = s
 
     # -- process + JSON-RPC
     def ensure(self):
         with self.lock:
-            if self.proc and self.proc.poll() is None and self.state in ("ready", "auth_required"):
+            if self.proc and self.proc.poll() is None and self.state not in ("error", "stopped"):
                 return
             self.start()
 
+    def _fail_pending(self, message):
+        pending, self.pending = self.pending, {}
+        for box in pending.values():
+            box["error"] = {"code": -1, "message": message}
+            box["ev"].set()
+
     def start(self):
+        old = self.proc
+        if old and old.poll() is None:
+            old.terminate()
+            try:
+                old.wait(3)
+            except subprocess.TimeoutExpired:
+                old.kill()
+        self._fail_pending("agent restarted")
         env = dict(os.environ)
         for k, v in (self.spec.get("env") or {}).items():
             env[k] = expand(v)
         cmd = [expand(c) for c in self.spec["command"]]
-        cwd = expand(self.spec.get("cwd", "~"))
-        os.makedirs(cwd, exist_ok=True)
+        os.makedirs(self.cwd, exist_ok=True)
         log("starting", self.slug, cmd)
-        self.state, self.error = "starting", None
-        self.proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE, bufsize=0)
+        self.state, self.error, self.connected = "starting", None, False
         self.by_acp.clear()
+        try:
+            self.proc = subprocess.Popen(cmd, cwd=self.cwd, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE)
+        except OSError as e:
+            self.proc, self.state, self.error = None, "error", str(e)
+            raise AcpError(-1, "cannot start %s: %s" % (self.name, e))
         threading.Thread(target=self._reader, args=(self.proc,), daemon=True).start()
         threading.Thread(target=self._stderr, args=(self.proc,), daemon=True).start()
         try:
@@ -238,8 +277,11 @@ class AcpAgent:
                 "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
                 "clientInfo": {"name": "gamut-reaper-gateway", "title": "Gamut REAPER gateway", "version": "0.1.0"},
             }, timeout=120)
-        except Exception as e:
-            self.state, self.error = "error", str(e)
+            if res.get("protocolVersion") != 1:
+                raise AcpError(-1, "%s speaks ACP protocol %s, gateway speaks 1" % (self.name, res.get("protocolVersion")))
+        except AcpError as e:
+            self.state, self.error = "error", e.message
+            self.proc.terminate()
             raise
         self.caps = res.get("agentCapabilities") or {}
         self.auth_methods = res.get("authMethods") or []
@@ -247,9 +289,13 @@ class AcpAgent:
 
     def _send(self, msg):
         data = (json.dumps(msg) + "\n").encode()
-        with self.wlock:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
+        proc = self.proc
+        try:
+            with self.wlock:
+                proc.stdin.write(data)
+                proc.stdin.flush()
+        except (AttributeError, OSError, ValueError):
+            raise AcpError(-1, self.name + " is not running")
 
     def request(self, method, params, timeout=None):
         with self.lock:
@@ -257,13 +303,17 @@ class AcpAgent:
             rid = self.next_id
             box = {"ev": threading.Event()}
             self.pending[rid] = box
-        self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        try:
+            self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        except AcpError:
+            self.pending.pop(rid, None)
+            raise
         if not box["ev"].wait(timeout):
             self.pending.pop(rid, None)
             raise AcpError(-1, method + " timed out")
         if "error" in box:
             e = box["error"]
-            raise AcpError(e.get("code"), e.get("message", "error"), e.get("data"))
+            raise AcpError(e.get("code"), e.get("message", "error"))
         return box.get("result") or {}
 
     def notify(self, method, params):
@@ -278,100 +328,96 @@ class AcpAgent:
         self._send(msg)
 
     def _reader(self, proc):
-        for line in proc.stdout:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                msg = json.loads(line)
-            except ValueError:
-                log(self.slug, "non-json:", line[:200])
-                continue
-            if "method" not in msg and "id" in msg:
-                box = self.pending.pop(msg["id"], None)
-                if box:
-                    if "error" in msg:
-                        box["error"] = msg["error"]
-                    else:
-                        box["result"] = msg.get("result")
-                    box["ev"].set()
-            elif "method" in msg and "id" in msg:
-                threading.Thread(target=self._on_request, args=(msg,), daemon=True).start()
-            elif "method" in msg:
-                self._on_notification(msg)
-        log(self.slug, "exited", proc.poll())
-        if proc is self.proc:
-            self.state = "stopped"
-            for box in list(self.pending.values()):
-                box["error"] = {"code": -1, "message": "agent process exited"}
+        try:
+            for line in proc.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                    if not isinstance(msg, dict):
+                        raise ValueError("not an object")
+                    self._dispatch(msg)
+                except Exception as e:  # one bad line must not kill the reader
+                    log(self.slug, "bad message:", e, line[:200])
+        finally:
+            log(self.slug, "exited", proc.poll())
+            if proc is self.proc:
+                self.state, self.connected = "stopped", False
+                self._fail_pending(self.name + " exited")
+                for s in list(self.sessions.values()) + ([self.warm] if self.warm else []):
+                    s.drop_perms()
+
+    def _dispatch(self, msg):
+        if "method" not in msg and "id" in msg:
+            box = self.pending.pop(msg["id"], None)
+            if box:
+                if "error" in msg:
+                    box["error"] = msg["error"] if isinstance(msg["error"], dict) else {"message": str(msg["error"])}
+                else:
+                    box["result"] = msg.get("result")
                 box["ev"].set()
-            self.pending.clear()
+        elif "method" in msg and "id" in msg:
+            self._on_request(msg)
+        elif msg.get("method") == "session/update":
+            p = msg.get("params") or {}
+            s = self.by_acp.get(p.get("sessionId"))
+            if s:
+                s.on_update(p.get("update") or {})
 
     def _stderr(self, proc):
         for line in proc.stderr:
             log(self.slug, "stderr:", line.decode(errors="replace").rstrip()[:300])
 
-    def _session(self, acp_id):
-        return self.by_acp.get(acp_id)
-
-    def _on_notification(self, msg):
-        p = msg.get("params") or {}
-        if msg["method"] == "session/update":
-            s = self._session(p.get("sessionId"))
-            if s:
-                s.on_update(p.get("update") or {})
-
     def _on_request(self, msg):
         method, p = msg["method"], msg.get("params") or {}
-        if method == "session/request_permission":
-            s = self._session(p.get("sessionId"))
-            if not s:
-                self.respond(msg["id"], {"outcome": {"outcome": "cancelled"}})
-                return
-            req = str(uuid.uuid4())[:8]
-            tc = p.get("toolCall") or {}
-            title = tc.get("title") or tc.get("name") or tc.get("kind") or "Run tool"
-            ev = {"requestId": req, "title": title, "options": [
-                {"optionId": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
-                for o in p.get("options") or []]}
-            with s.lock:
-                s.perms[req] = (msg["id"], ev)
-            s.emit("permission_request", **ev)
-        else:
+        if method != "session/request_permission":
             self.respond(msg["id"], error={"code": -32601, "message": "client does not support " + method})
+            return
+        s = self.by_acp.get(p.get("sessionId"))
+        if not s:
+            self.respond(msg["id"], {"outcome": {"outcome": "cancelled"}})
+            return
+        tc = p.get("toolCall") or {}
+        title = tc.get("title") or s.tool_title(tc.get("toolCallId")) or tc.get("kind") or "Run tool"
+        ev = {"requestId": uuid.uuid4().hex[:8], "title": title, "options": [
+            {"optionId": o.get("optionId"), "name": o.get("name"), "kind": o.get("kind")}
+            for o in p.get("options") or []]}
+        with s.lock:
+            s.perms[ev["requestId"]] = (msg["id"], ev)
+            s.emit("permission_request", **ev)
 
     # -- sessions
-    def new_acp_session(self):
+    def open_session(self, s):
+        """Give `s` a fresh ACP session (starting the agent if needed)."""
         self.ensure()
-        cwd = expand(self.spec.get("cwd", "~"))
         try:
-            res = self.request("session/new", {"cwd": cwd, "mcpServers": self.mcp_servers}, timeout=180)
+            res = self.request("session/new", {"cwd": self.cwd, "mcpServers": self.mcp_servers}, timeout=180)
         except AcpError as e:
             if e.code == AUTH_REQUIRED:
                 self.state, self.connected = "auth_required", False
             raise
+        if not res.get("sessionId"):
+            raise AcpError(-1, self.name + " returned no sessionId")
         self.state, self.connected = "ready", True
-        cfg = normalize_config(res)
-        if cfg:
-            self.config_cache = cfg
-        return res["sessionId"], cfg
+        s.acp_id, s.config = res["sessionId"], normalize_config(res)
+        self.config_cache = s.config
+        self.by_acp[s.acp_id] = s
 
     def get_config(self):
-        if not self.config_cache:
-            acp_id, cfg = self.new_acp_session()
-            w = Session(self)
-            w.acp_id, w.config = acp_id, cfg
-            self.by_acp[acp_id] = w
-            self.warm = w
-        return self.config_cache
+        with self.cfg_lock:
+            if self.config_cache is None:
+                w = Session(self)
+                self.open_session(w)
+                self.warm = w
+            return self.config_cache
 
     def create(self, message, config):
-        with self.lock:
+        with self.cfg_lock:
             s, self.warm = self.warm, None
         if s is None:
             s = Session(self)
-            s.acp_id, s.config = self.new_acp_session()
-            self.by_acp[s.acp_id] = s
+            self.open_session(s)
         s.title = message.strip().splitlines()[0][:60] if message.strip() else "New chat"
         self.sessions[s.id] = s
         self.send(s, message, config)
@@ -382,21 +428,20 @@ class AcpAgent:
         if s.acp_id and s.acp_id in self.by_acp and self.proc and self.proc.poll() is None:
             return
         self.ensure()
-        cwd = expand(self.spec.get("cwd", "~"))
         if s.acp_id and self.caps.get("loadSession"):
+            s.loading = True
+            self.by_acp[s.acp_id] = s
             try:
-                s.loading = True
-                self.by_acp[s.acp_id] = s
-                res = self.request("session/load", {"sessionId": s.acp_id, "cwd": cwd,
+                res = self.request("session/load", {"sessionId": s.acp_id, "cwd": self.cwd,
                                                     "mcpServers": self.mcp_servers}, timeout=180)
                 s.config = normalize_config(res) or s.config
                 return
             except AcpError as e:
                 log(self.slug, "session/load failed:", e.message)
+                self.by_acp.pop(s.acp_id, None)
             finally:
                 s.loading = False
-        s.acp_id, s.config = self.new_acp_session()
-        self.by_acp[s.acp_id] = s
+        self.open_session(s)
         s.emit("notice", text="Started a fresh " + self.name + " session; earlier context is not loaded.")
 
     def apply_config(self, s, config):
@@ -425,51 +470,69 @@ class AcpAgent:
             if s.active:
                 s.backlog.append((text, config))
                 return
-            s.active = True
+            s.active, s.cancelled = True, False
         threading.Thread(target=self._turn, args=(s, text, config), daemon=True).start()
 
     def _turn(self, s, text, config):
         while True:
             try:
                 self.revive(s)
-                self.apply_config(s, config)
+                try:
+                    self.apply_config(s, config)
+                except AcpError as e:  # a stale pick must not cost the message
+                    s.emit("notice", text="Kept the previous settings: " + e.message)
                 with s.lock:
                     s.msgs.append({"id": str(uuid.uuid4()), "type": "user", "content": {"text": text},
                                    "createdAt": now_iso()})
                     s.updated = now_iso()
                 s.emit("session_active")
-                res = self.request("session/prompt", {"sessionId": s.acp_id,
-                                                      "prompt": [{"type": "text", "text": text}]})
-                if res.get("stopReason") not in (None, "end_turn", "cancelled"):
-                    s.emit("notice", text="Stopped: " + str(res.get("stopReason")))
-            except AcpError as e:
+                if not s.cancelled:
+                    res = self.request("session/prompt", {"sessionId": s.acp_id,
+                                                          "prompt": [{"type": "text", "text": text}]})
+                    if res.get("stopReason") not in (None, "end_turn", "cancelled"):
+                        s.emit("notice", text="Stopped: " + str(res.get("stopReason")))
+            except Exception as e:
+                code, message = (e.code, e.message) if isinstance(e, AcpError) else (-1, repr(e))
+                if code == AUTH_REQUIRED:
+                    self.state, self.connected = "auth_required", False
                 with s.lock:
                     s.active = False
                     s.backlog.clear()
-                s.updated = now_iso()
-                s.persist()
-                code = "auth_required" if e.code == AUTH_REQUIRED else "acp_error"
-                s.emit("session_error", apiErrorCode=code,
-                       errorPresentation={"message": self.name + ": " + e.message})
+                    s.updated = now_iso()
+                s.drop_perms()
+                self._save(s)
+                s.emit("session_error", apiErrorCode="auth_required" if code == AUTH_REQUIRED else "acp_error",
+                       errorPresentation={"message": self.name + ": " + message})
                 return
+            s.drop_perms()
             with s.lock:
                 s.updated = now_iso()
                 nxt = s.backlog.pop(0) if s.backlog else None
                 if nxt is None:
                     s.active = False
-            s.persist()
+                else:
+                    s.cancelled = False
+            self._save(s)
             if nxt is None:
                 s.emit("session_idle")
                 return
             text, config = nxt
 
+    def _save(self, s):
+        try:
+            s.persist()
+        except OSError as e:
+            log(self.slug, "could not save transcript:", e)
+
     def interrupt(self, s):
         with s.lock:
-            perms, s.perms = s.perms, {}
             s.backlog.clear()
-        for rid, ev in perms.values():
-            self.respond(rid, {"outcome": {"outcome": "cancelled"}})
-            s.emit("permission_resolved", requestId=ev["requestId"])
+            s.cancelled = s.active
+        for rid, _ in s.drop_perms().values():
+            try:
+                self.respond(rid, {"outcome": {"outcome": "cancelled"}})
+            except AcpError:
+                pass
         if s.acp_id and self.proc and self.proc.poll() is None:
             self.notify("session/cancel", {"sessionId": s.acp_id})
 
@@ -488,21 +551,22 @@ class AcpAgent:
 
     def probe(self):
         """Start the agent and open a warm session so the picker knows whether it is logged in."""
-        if self.probing or self.connected:
-            return
-        self.probing = True
+        with self.lock:
+            if self.probing or self.connected:
+                return
+            self.probing = True
         try:
             self.get_config()
         except Exception as e:  # surfaced through state/error
-            if self.state not in ("auth_required",):
+            if self.state != "auth_required":
                 self.error = str(e)
         finally:
             self.probing = False
 
     def authenticate(self, method_id):
-        self.ensure()
-        self.state = "authenticating"
         try:
+            self.ensure()
+            self.state = "authenticating"
             self.request("authenticate", {"methodId": method_id}, timeout=900)
             self.state, self.error, self.connected = "ready", None, True
         except AcpError as e:
@@ -522,15 +586,12 @@ def gamut_json(path, timeout=10):
 def gamut_config():
     """Gamut's model catalog as ACP-style config options; value = '<connectionId>|<modelId>'."""
     conns = gamut_json("/api/llm-connections").get("connections") or []
-    models, efforts = [], []
+    models = []
     for c in conns:
         for m in c.get("catalog") or []:
             models.append({"value": c["id"] + "|" + m["id"], "name": m.get("label") or m["id"],
                            "group": c.get("name", ""), "efforts": m.get("supportedEfforts") or []})
-    seen = set()
-    for m in models:
-        for e in m["efforts"]:
-            seen.add(e)
+    seen = {e for m in models for e in m["efforts"]}
     efforts = [e for e in EFFORTS if e in seen]
     out = [{"id": "model", "name": "Model", "category": "model", "type": "select", "currentValue": None,
             "options": [{"value": "", "name": "Agent default"}] + models}]
@@ -542,9 +603,10 @@ def gamut_config():
 
 
 def gamut_body(body):
-    cfg = body.pop("config", None) or {}
+    cfg = body.pop("config", None)
+    cfg = cfg if isinstance(cfg, dict) else {}
     model = cfg.get("model")
-    if model:
+    if isinstance(model, str) and model:
         conn, _, mid = model.partition("|")
         body["llmProviderId"], body["model"] = conn, mid
     if cfg.get("effort"):
@@ -581,17 +643,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         self.wfile.write(data)
-
-    def body(self):
-        n = int(self.headers.get("Content-Length") or 0)
-        if not n:
-            return {}
-        try:
-            return json.loads(self.rfile.read(n))
-        except ValueError:
-            return {}
 
     def do_GET(self):
         self.route("GET")
@@ -605,33 +660,65 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.route("DELETE")
 
+    def refuse(self):
+        """Only local, non-browser clients: no Origin, a host name we expect, JSON bodies."""
+        if self.headers.get("Origin") is not None:
+            return "browser requests are not accepted"
+        host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
+        if host not in ALLOWED_HOSTS:
+            return "unexpected Host"
+        if self.raw and "json" not in (self.headers.get("Content-Type") or ""):
+            return "JSON body required"
+        return None
+
     def route(self, method):
+        n = int(self.headers.get("Content-Length") or 0)
+        self.raw = self.rfile.read(n) if n > 0 else b""
+        try:
+            self.json = json.loads(self.raw) if self.raw else {}
+        except ValueError:
+            self.json = {}
+        if not isinstance(self.json, dict):
+            self.json = {}
         path = self.path.split("?", 1)[0]  # acp_route reads the query (?probe=1) from self.path
         parts = [p for p in path.split("/") if p]
         try:
+            why = self.refuse()
+            if why:
+                return self.reply(403, {"error": why})
+            if not path.startswith("/"):
+                return self.reply(400, {"error": "bad path"})
             if path == "/health":
                 return self.reply(200, {"ok": True})
             if method == "GET" and parts == ["api", "agents"]:
                 return self.agents()
             if len(parts) >= 3 and parts[:2] == ["api", "agents"]:
-                slug = parts[2]
-                rest = parts[3:]
+                slug, rest = parts[2], parts[3:]
                 if slug in GW.acp:
                     return self.acp_route(method, GW.acp[slug], rest)
                 if method == "GET" and rest == ["config"]:
                     return self.reply(200, {"configOptions": gamut_config()})
-            return self.proxy(method)
+            return self.proxy(method, path)
         except AcpError as e:
             code = 401 if e.code == AUTH_REQUIRED else 502
             return self.reply(code, {"error": "auth_required" if code == 401 else e.message, "message": e.message})
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
             return None
+        except (urllib.error.URLError, OSError) as e:
+            return self.reply(502, {"error": "Gamut not reachable: " + str(e)})
+        except Exception as e:
+            log("unhandled", method, self.path, repr(e))
+            try:
+                return self.reply(500, {"error": repr(e)})
+            except OSError:
+                return None
 
     def agents(self):
         out = []
         try:
             g = gamut_json("/api/agents", timeout=5)
-            out = g.get("agents", g) if isinstance(g, dict) else g
+            g = g.get("agents", []) if isinstance(g, dict) else g
+            out = [a for a in g if isinstance(a, dict)] if isinstance(g, list) else []
             for a in out:
                 a.setdefault("backend", "gamut")
         except (urllib.error.URLError, OSError, ValueError) as e:
@@ -642,14 +729,14 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(200, out)
 
     def acp_route(self, method, a, rest):
+        b = self.json
         if method == "GET" and rest == ["status"]:
             if "probe=1" in self.path and not a.connected and a.state in ("stopped", "ready", "error"):
                 threading.Thread(target=a.probe, daemon=True).start()
             return self.reply(200, {"state": "starting" if a.probing else a.state, "connected": a.connected,
                                     "error": a.error, "authMethods": a.auth_methods})
         if method == "POST" and rest == ["auth"]:
-            mid = self.body().get("methodId")
-            threading.Thread(target=a.authenticate, args=(mid,), daemon=True).start()
+            threading.Thread(target=a.authenticate, args=(b.get("methodId"),), daemon=True).start()
             return self.reply(202, {"state": "authenticating"})
         if method == "GET" and rest == ["config"]:
             return self.reply(200, {"configOptions": a.get_config()})
@@ -658,23 +745,23 @@ class Handler(BaseHTTPRequestHandler):
                 ss = sorted(a.sessions.values(), key=lambda s: s.updated, reverse=True)
                 return self.reply(200, [s.public() for s in ss])
             if method == "POST":
-                b = self.body()
-                msg = (b.get("message") or "").strip()
+                msg = str(b.get("message") or "").strip()
                 if not msg:
                     return self.reply(400, {"error": "Message is required"})
-                s = a.create(msg, b.get("config"))
-                return self.reply(201, s.public())
+                return self.reply(201, a.create(msg, b.get("config")).public())
         if len(rest) >= 2 and rest[0] == "sessions":
             s = a.sessions.get(rest[1])
             if not s:
                 return self.reply(404, {"error": "Session not found"})
             tail = rest[2:]
+            if method == "GET" and tail == []:
+                return self.reply(200, s.public())
             if method == "GET" and tail == ["messages"]:
                 with s.lock:
-                    return self.reply(200, list(s.msgs))
+                    msgs = list(s.msgs)
+                return self.reply(200, msgs)
             if method == "POST" and tail == ["messages"]:
-                b = self.body()
-                text = (b.get("content") or "").strip()
+                text = str(b.get("content") or "").strip()
                 if not text:
                     return self.reply(400, {"error": "Content is required"})
                 a.send(s, text, b.get("config"))
@@ -685,34 +772,34 @@ class Handler(BaseHTTPRequestHandler):
                 a.interrupt(s)
                 return self.reply(200, {"ok": True})
             if method == "POST" and tail == ["permission"]:
-                b = self.body()
                 ok = a.answer(s, b.get("requestId"), b.get("optionId"))
                 return self.reply(200 if ok else 404, {"ok": ok})
-            if method == "GET" and tail == []:
-                return self.reply(200, s.public())
         return self.reply(404, {"error": "not found"})
 
     def sse(self, s):
-        q = queue.Queue()
+        q = queue.Queue(SSE_QUEUE_MAX)
+        q.dead = False
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True
+        self.connection.settimeout(30)  # a client that stops reading can't pin this thread forever
 
         def write(d):
             self.wfile.write(("event: message\ndata: " + json.dumps(d) + "\n\n").encode())
             self.wfile.flush()
 
-        with s.lock:
+        with s.lock:  # subscribe and snapshot together so a permission request is neither missed nor doubled
             s.subs.add(q)
             pending = [ev for _, ev in s.perms.values()]
+            active = s.active
         try:
-            write({"type": "connected", "isActive": s.active})
+            write({"type": "connected", "isActive": active})
             for ev in pending:
                 write(dict(ev, type="permission_request"))
-            while True:
+            while not q.dead:
                 try:
                     d = q.get(timeout=15)
                 except queue.Empty:
@@ -720,38 +807,33 @@ class Handler(BaseHTTPRequestHandler):
                     self.wfile.flush()
                     continue
                 write(d)
-        except (BrokenPipeError, ConnectionResetError, OSError):
+        except (OSError, socket.timeout):
             pass
         finally:
             with s.lock:
                 s.subs.discard(q)
 
-    def proxy(self, method):
-        body = None
-        n = int(self.headers.get("Content-Length") or 0)
-        if n:
-            body = self.rfile.read(n)
-            if method == "POST" and "/sessions" in self.path:
-                try:
-                    body = json.dumps(gamut_body(json.loads(body))).encode()
-                except ValueError:
-                    pass
+    def proxy(self, method, path):
+        body = self.raw or None
+        if body and method == "POST" and "/sessions" in path and self.json:
+            body = json.dumps(gamut_body(dict(self.json))).encode()
+        stream = path.endswith("/stream")
         req = urllib.request.Request(GAMUT + self.path, data=body, method=method)
         for h in ("Content-Type", "Accept"):
             if self.headers.get(h):
                 req.add_header(h, self.headers[h])
         try:
-            resp = urllib.request.urlopen(req, timeout=None if self.path.endswith("/stream") else 60)
+            resp = urllib.request.urlopen(req, timeout=None if stream else 60)
         except urllib.error.HTTPError as e:
             data = e.read()
             self.send_response(e.code)
             self.send_header("Content-Type", e.headers.get("Content-Type", "application/json"))
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
+            self.close_connection = True
             self.wfile.write(data)
             return
-        except (urllib.error.URLError, OSError) as e:
-            return self.reply(502, {"error": "Gamut not reachable: " + str(e)})
         ctype = resp.headers.get("Content-Type", "")
         if "text/event-stream" in ctype:
             self.send_response(resp.status)
@@ -762,7 +844,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             try:
                 while True:
-                    line = resp.fp.readline()
+                    line = resp.readline()  # HTTPResponse.readline decodes chunked transfer encoding
                     if not line:
                         break
                     self.wfile.write(line)
@@ -775,7 +857,9 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(resp.status)
         self.send_header("Content-Type", ctype or "application/json")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("Connection", "close")
         self.end_headers()
+        self.close_connection = True
         self.wfile.write(data)
 
 

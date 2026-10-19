@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """reaper-mcp — stdio MCP server. Zero third-party deps.
 
-Talks to lua/bridge.lua over a JSON mailbox. Prefer a handful of grouped
+Talks to the Lua bridge (lua/bridge.lua, installed in REAPER as reaper_mcp_bridge.lua) over a JSON mailbox. Prefer a handful of grouped
 tools plus batch / run_lua instead of dumping the whole ReaScript API.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import os
-import struct
 import sys
 import time
 import uuid
@@ -22,7 +20,7 @@ else:
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
-SERVER_VERSION = "0.3.0"
+from reaper_mcp import __version__ as SERVER_VERSION  # noqa: E402
 HEARTBEAT_STALE = float(os.environ.get("REAPER_MCP_HEARTBEAT_STALE", "5"))
 POLL = float(os.environ.get("REAPER_MCP_POLL", "0.015"))
 # A fast bridge answers inside the first few milliseconds, so poll tightly at
@@ -82,7 +80,7 @@ class Bridge:
         self.busy = os.path.join(self.dir, "busy")
         self.mutex = os.path.join(self.dir, "ipc.mutex")
         self.timeout = float(os.environ.get("REAPER_MCP_TIMEOUT", "10"))
-        os.makedirs(self.dir, exist_ok=True)
+        os.makedirs(self.dir, mode=0o700, exist_ok=True)  # the mailbox accepts run_lua: keep it private
 
     def _heartbeat_ok(self) -> bool:
         try:
@@ -103,7 +101,7 @@ class Bridge:
             )
         raise BridgeError(
             "REAPER bridge not running or heartbeat stale. In REAPER: Actions > "
-            "Load ReaScript > lua/bridge.lua > Run."
+            "reaper_mcp_bridge.lua > Run (install it with python/install_bridge.py)."
         )
 
     def _lock(self, timeout: float):
@@ -150,11 +148,11 @@ class Bridge:
         wait = timeout if timeout is not None else self.timeout
         fd = self._lock(wait)
         try:
-            deadline = time.time() + wait
+            deadline = time.monotonic() + wait
             while True:
                 if self._heartbeat_ok() and not self._busy():
                     break
-                if time.time() >= deadline:
+                if time.monotonic() >= deadline:
                     if self._busy():
                         raise BridgeError(
                             "Timed out waiting for REAPER to finish the previous request."
@@ -173,11 +171,11 @@ class Bridge:
                 pass
             tmp = self.req + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(payload, f)
+                json.dump(payload, f, ensure_ascii=False)  # raw UTF-8: no surrogate-pair escapes for emoji
             os.replace(tmp, self.req)
 
             started = time.monotonic()
-            while time.time() < deadline:
+            while time.monotonic() < deadline:
                 if os.path.exists(self.resp):
                     try:
                         with open(self.resp, "rb") as f:
@@ -196,9 +194,19 @@ class Bridge:
                         raise BridgeError(data.get("error", "unknown bridge error"))
                     return data.get("ret")
                 time.sleep(_poll_wait(started))
-            raise BridgeError(
-                "Timed out waiting for REAPER. Is lua/bridge.lua running?"
-            )
+            # Not picked up: withdraw it, or REAPER would run it later on its own (a retry would run it twice).
+            withdrawn = False
+            try:
+                with open(self.req, "r", encoding="utf-8") as f:
+                    if json.load(f).get("id") == rid:
+                        os.remove(self.req)
+                        withdrawn = True
+            except (OSError, ValueError):
+                pass
+            if withdrawn:
+                raise BridgeError("REAPER did not pick up the request in time (a modal dialog open?). "
+                                  "It was withdrawn and will not run.")
+            raise BridgeError("Timed out waiting for REAPER to finish the request; it may still complete.")
         finally:
             self._unlock(fd)
 
@@ -495,7 +503,8 @@ tool(
     "render",
     "Render. No undo. Long timeout. "
     "bounds: project | time_selection | custom | items. "
-    "stems=true renders selected tracks (pass track_indices to select).",
+    "Default: the master mix. stems=true renders the selected tracks as stems instead (pass track_indices to "
+    "select them). path is the output folder; the file name comes from pattern.",
     obj({
         "path": {"type": "string"},
         "bounds": {"type": "string",
@@ -606,7 +615,10 @@ def _normalize_batch(calls):
         expanded = None
         call_timeout = None
         if isinstance(arguments, dict):
-            expanded, call_timeout = _expand_grouped(func, arguments)
+            try:
+                expanded, call_timeout = _expand_grouped(func, arguments)
+            except KeyError as e:  # one bad slot reports its own error; the rest still run
+                expanded = {"func": "run_lua", "code": "error(%s, 0)" % json.dumps("missing argument: %s" % e.args[0])}
         if expanded is not None:
             out.append(expanded)
         else:
@@ -667,14 +679,10 @@ def handle_request(bridge, msg):
             return make_result(rid, {
                 "content": [{"type": "text", "text": text}],
             })
-        except BridgeError as e:
+        except Exception as e:  # noqa: BLE001 - BridgeError and builder errors alike go back as tool errors
+            text = "missing argument: %s" % e.args[0] if isinstance(e, KeyError) else str(e)
             return make_result(rid, {
-                "content": [{"type": "text", "text": str(e)}],
-                "isError": True,
-            })
-        except Exception as e:  # noqa: BLE001
-            return make_result(rid, {
-                "content": [{"type": "text", "text": str(e)}],
+                "content": [{"type": "text", "text": text}],
                 "isError": True,
             })
     if rid is None:
@@ -697,10 +705,13 @@ def main():
             msg = json.loads(line)
         except ValueError:
             continue
-        try:
-            response = handle_request(bridge, msg)
-        except Exception as e:  # noqa: BLE001
-            response = make_error(msg.get("id"), -32603, f"internal error: {e}")
+        if not isinstance(msg, dict):
+            response = make_error(None, -32600, "expected a single JSON-RPC request object")
+        else:
+            try:
+                response = handle_request(bridge, msg)
+            except Exception as e:  # noqa: BLE001
+                response = make_error(msg.get("id"), -32603, f"internal error: {e}")
         if response is not None:
             sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
             sys.stdout.flush()

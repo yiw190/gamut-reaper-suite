@@ -114,6 +114,13 @@ do
     local mt = getmetatable(t)
     return mt ~= nil and mt.__jsontype == "object"
   end
+  -- explicit JSON null, so arrays with nulls keep their length and positions
+  json.null = setmetatable({}, { __jsontype = "null" })
+  -- decoded arrays remember their length (a null element leaves a nil hole that # can't see)
+  json.len = function(t)
+    local mt = getmetatable(t)
+    return mt and mt.__n or #t
+  end
   json.userdata_hook = function(_) return nil end
   encode = function(v, seen)
     local tv = type(v)
@@ -124,10 +131,11 @@ do
       if v == math.floor(v) and math.abs(v) < 1e15 then
         return string.format("%d", v)
       end
-      return string.format("%.10g", v)
+      return string.format("%.17g", v)
     elseif tv == "string" then return esc_str(v)
     elseif tv == "userdata" then return encode(json.userdata_hook(v), seen)
     elseif tv == "table" then
+      if v == json.null then return "null" end
       seen = seen or {}
       if seen[v] then return "null" end
       seen[v] = true
@@ -174,17 +182,18 @@ do
         else error("expected , or }") end
       end
     elseif c == "[" then
-      local arr = {}
+      local arr, n = {}, 0
       i = ws(i + 1)
       if s:sub(i, i) == "]" then return arr, i + 1 end
       while true do
         local val
         val, i = decode(s, i)
-        arr[#arr + 1] = val
+        n = n + 1
+        arr[n] = val
         i = ws(i)
         local ch = s:sub(i, i)
         if ch == "," then i = i + 1
-        elseif ch == "]" then return arr, i + 1
+        elseif ch == "]" then return setmetatable(arr, { __n = n }), i + 1
         else error("expected , or ]") end
       end
     elseif c == '"' then
@@ -199,12 +208,25 @@ do
                         ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
           if e == "u" then
             local cp = tonumber(s:sub(j + 2, j + 5), 16) or 0
+            -- a UTF-16 surrogate pair (\uD83C\uDFB5) is one code point: combine it, don't emit two halves
+            local lo = cp >= 0xD800 and cp <= 0xDBFF and s:sub(j + 6, j + 7) == "\\u"
+              and tonumber(s:sub(j + 8, j + 11), 16)
+            if lo and lo >= 0xDC00 and lo <= 0xDFFF then
+              cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+              j = j + 6
+            end
             if cp < 0x80 then buf[#buf + 1] = string.char(cp)
             elseif cp < 0x800 then
               buf[#buf + 1] = string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
-            else
+            elseif cp < 0x10000 then
               buf[#buf + 1] = string.char(
                 0xE0 + math.floor(cp / 0x1000),
+                0x80 + math.floor(cp / 0x40) % 0x40,
+                0x80 + cp % 0x40)
+            else
+              buf[#buf + 1] = string.char(
+                0xF0 + math.floor(cp / 0x40000),
+                0x80 + math.floor(cp / 0x1000) % 0x40,
                 0x80 + math.floor(cp / 0x40) % 0x40,
                 0x80 + cp % 0x40)
             end
@@ -658,6 +680,15 @@ end
 
 function DSL.delete_midi_notes(ti, ii, indices)
   local take = midi_take_at(ti, ii)
+  local _, total = reaper.MIDI_CountEvts(take)
+  local uniq, seen = {}, {}
+  for _, i in ipairs(indices or {}) do
+    if math.type(i) == "integer" and i >= 0 and i < total and not seen[i] then
+      seen[i] = true
+      uniq[#uniq + 1] = i
+    end
+  end
+  indices = uniq
   table.sort(indices, function(a, b) return a > b end)
   for _, i in ipairs(indices) do reaper.MIDI_DeleteNote(take, i) end
   reaper.MIDI_Sort(take)
@@ -761,9 +792,14 @@ end
 
 function DSL.move_track_fx(ti, fxi, dest_index)
   local t = track_at(ti)
-  if not reaper.TrackFX_CopyToTrack(t, fxi, t, dest_index, true) then
-    error("could not move FX")
+  local n = reaper.TrackFX_GetCount(t)
+  if fxi < 0 or fxi >= n or dest_index < 0 or dest_index >= n then
+    error(("FX index out of range (track has %d FX)"):format(n))
   end
+  local _, name = reaper.TrackFX_GetFXName(t, fxi, "")
+  reaper.TrackFX_CopyToTrack(t, fxi, t, dest_index, true) -- returns nothing; check the result instead
+  local _, moved = reaper.TrackFX_GetFXName(t, dest_index, "")
+  if moved ~= name then error("could not move FX") end
   return { ret = { fx_index = dest_index } }
 end
 
@@ -931,7 +967,6 @@ function DSL.list_envelopes(ti)
   for i = 0, reaper.CountTrackEnvelopes(t) - 1 do
     local env = reaper.GetTrackEnvelope(t, i)
     local _, name = reaper.GetEnvelopeName(env, "")
-    local vis = reaper.GetEnvelopeInfo_Value and reaper.GetEnvelopeInfo_Value(env, "VISIBLE") or 1
     out[#out + 1] = { index = i, name = name, n_points = reaper.CountEnvelopePoints(env) }
   end
   return { ret = out }
@@ -1017,7 +1052,7 @@ function DSL.render_project(path, opts)
   local flag = 1
   if bounds == "custom" then flag = 0
   elseif bounds == "time_selection" then flag = 2
-  elseif bounds == "items" then flag = 3
+  elseif bounds == "items" then flag = 4 -- selected media items (3 would be all project regions)
   end
   reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", flag, true)
   if bounds == "custom" then
@@ -1030,9 +1065,11 @@ function DSL.render_project(path, opts)
   if opts.channels then
     reaper.GetSetProjectInfo(0, "RENDER_CHANNELS", opts.channels, true)
   end
-  local settings = 1
+  -- 0 = master mix only; 2 = stems of the selected tracks. (1 rendered master + every selected track's stem,
+  -- which is why renders used to need "deselect all tracks first"; 8 is the render matrix.)
+  local settings = 0
   if opts.stems then
-    settings = 8
+    settings = 2
     if opts.track_indices then
       reaper.Main_OnCommand(40297, 0)
       for _, i in ipairs(opts.track_indices) do
@@ -1068,7 +1105,7 @@ function DSL.batch(calls)
   local results = {}
   batch_depth = batch_depth + 1
   local ok, err = pcall(function()
-    for i = 1, #(calls or {}) do
+    for i = 1, json.len(calls or {}) do
       local cok, r = pcall(dispatch, calls[i])
       if not cok then
         results[i] = { error = tostring(r) }
@@ -1077,6 +1114,7 @@ function DSL.batch(calls)
       else
         results[i] = r and r.ret
       end
+      if results[i] == nil then results[i] = json.null end
     end
   end)
   batch_depth = batch_depth - 1
@@ -1109,11 +1147,12 @@ dispatch = function(req)
   end
 
   local args = req.args or {}
-  for i = 1, #args do args[i] = unmarshal(args[i]) end
+  local nargs = json.len(args)
+  for i = 1, nargs do args[i] = unmarshal(args[i]) end
 
   if DSL[func] then
     local run = function()
-      local res = DSL[func](table.unpack(args))
+      local res = DSL[func](table.unpack(args, 1, nargs))
       res = res or {}
       if res.ok == nil then res.ok = true end
       return res
@@ -1135,12 +1174,12 @@ dispatch = function(req)
 
   local fn = reaper[func]
   if type(fn) == "function" then
-    local packed = table.pack(pcall(fn, table.unpack(args)))
+    local packed = table.pack(pcall(fn, table.unpack(args, 1, nargs)))
     if not packed[1] then
       return { ok = false, error = "error calling " .. func .. ": " .. tostring(packed[2]) }
     end
     local rets = {}
-    for i = 2, packed.n do rets[#rets + 1] = packed[i] end
+    for i = 2, packed.n do rets[i - 1] = packed[i] == nil and json.null or packed[i] end
     if #rets <= 1 then return { ok = true, ret = rets[1] }
     else return { ok = true, ret = rets } end
   end
@@ -1159,8 +1198,7 @@ os.remove(BUSY)
 touch_heartbeat()
 reaper.ShowConsoleMsg("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR .. "\n")
 
-local function tick()
-  touch_heartbeat()
+local function handle_mailbox()
   local raw = read_file(REQ)
   if raw then
     os.remove(REQ)
@@ -1183,6 +1221,19 @@ local function tick()
     write_atomic(RESP, out, TMP)
     os.remove(BUSY)
     touch_heartbeat(true)
+  end
+end
+
+local tick_error_shown = false
+local function tick()
+  touch_heartbeat()
+  local ok, err = pcall(handle_mailbox)
+  if not ok then
+    os.remove(BUSY)
+    if not tick_error_shown then -- once, not every 30 ms
+      tick_error_shown = true
+      reaper.ShowConsoleMsg("reaper-mcp bridge: " .. tostring(err) .. "\n")
+    end
   end
   reaper.defer(tick)
 end

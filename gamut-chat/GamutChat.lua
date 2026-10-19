@@ -97,21 +97,26 @@ do
     if ok then return v end
   end
 end
+local JSON_ESC = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
 local function jstr(s)
-  return '"' .. (s:gsub('[%c"\\]', function(c)
-    local m = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
-    return m[c] or string.format('\\u%04x', c:byte())
+  return '"' .. (tostring(s):gsub('[%c"\\]', function(c)
+    return JSON_ESC[c] or string.format('\\u%04x', c:byte())
   end)) .. '"'
 end
 
 ---------------------------------------------------------------- http (background curl)
+-- the run id keeps a curl left over from a closed panel from answering this run's request of the same number
+local RUN = ('%x'):format(math.floor(reaper.time_precise() * 1000) % 0xFFFFFF)
 local reqn, pending = 0, {}
 local function http_url(method, url, body, cb)
   reqn = reqn + 1
-  local b = DIR .. 'req' .. reqn
+  local b = DIR .. 'req' .. RUN .. '_' .. reqn
   local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"'
   if body then
-    local f = io.open(b .. '.json', 'wb'); f:write(body); f:close()
+    local f = io.open(b .. '.json', 'wb')
+    if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(b .. '.json', 'wb') end
+    if not f then if cb then cb(0, '') end; return end
+    f:write(body); f:close()
     args = args .. ' --data-binary @' .. q(b .. '.json')
   end
   sh('( /usr/bin/curl ' .. args .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
@@ -137,7 +142,7 @@ end
 ---------------------------------------------------------------- state
 local S = {
   agent = reaper.GetExtState(EXT, 'agent'), agent_name = reaper.GetExtState(EXT, 'agent_name'),
-  agents = {}, agents_at = 0,
+  agents = {},
   sid = '', title = '',
   msgs = {}, live = {},
   active = false, waiting = false, err = nil,
@@ -146,7 +151,7 @@ local S = {
   sessions = {}, sess_at = 0,
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
   cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil, acp_status = {},
-  greqs = {}, greq_at = 0, gans = {}, card_h = {},
+  greqs = {}, greq_at = 0, gans = {}, card_h = {}, gen = 0,
 }
 local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
 local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
@@ -227,12 +232,15 @@ local function stream_start()
   if S.sid == '' then return end
   local st = S.stream
   st.file = DIR .. 'stream.sse'
-  local f = io.open(st.file, 'wb'); f:close()
+  local f = io.open(st.file, 'wb')
+  if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(st.file, 'wb') end
+  if f then f:close() end
   st.off, st.buf, st.check = 0, '', reaper.time_precise()
-  os.remove(st.file .. '.dead')
-  -- the wrapper drops a .dead file when curl exits, so liveness is a file check instead of a per-3s popen (fork stalls the UI)
+  st.starts = (st.starts or 0) + 1
+  st.dead = st.file .. '.dead' .. st.starts -- per start, so a late write from the previous curl can't fake a death
+  -- the wrapper drops the .dead file when curl exits, so liveness is a file check, not a periodic popen (forks stall the UI)
   local out = sh('( /usr/bin/curl -s -N ' .. q(api('/sessions/' .. S.sid .. '/stream')) ..
-    ' >> ' .. q(st.file) .. '; : > ' .. q(st.file .. '.dead') .. ' ) >/dev/null 2>&1 & echo $!')
+    ' >> ' .. q(st.file) .. '; : > ' .. q(st.dead) .. ' ) >/dev/null 2>&1 & echo $!')
   st.pid = tonumber(out:match('%d+'))
 end
 
@@ -269,15 +277,18 @@ local function on_event(d)
     S.waiting = true
     S.greq_at = 0 -- frame() fetches the pending requests and draws them as cards
   elseif t == 'permission_request' then
-    for _, p in ipairs(S.perms) do if p.id == d.requestId then return end end
-    S.perms[#S.perms + 1] = { id = d.requestId, title = d.title or 'Run tool', options = d.options or {} }
+    local rid = sval(d.requestId)
+    if not rid then return end
+    for _, p in ipairs(S.perms) do if p.id == rid then return end end
+    S.perms[#S.perms + 1] = { id = rid, title = sval(d.title) or 'Run tool',
+      options = type(d.options) == 'table' and d.options or {} }
     scroll()
   elseif t == 'permission_resolved' then
     for i = #S.perms, 1, -1 do if S.perms[i].id == d.requestId then table.remove(S.perms, i) end end
   elseif t == 'config_options' then
     if type(d.configOptions) == 'table' then S.cfg_opts = d.configOptions end
   elseif t == 'notice' then
-    S.live[#S.live + 1] = { kind = 'tool', text = tostring(d.text or '') }
+    S.live[#S.live + 1] = { kind = 'tool', text = sval(d.text) or '' }
   elseif t == 'session_input_provided' then
     S.greq_at = 0
   elseif t == 'user_request_created' then
@@ -294,16 +305,16 @@ local function on_event(d)
     end
   elseif t == 'user_request_resolved' then
     for i = #S.greqs, 1, -1 do if S.greqs[i].id == d.requestId then table.remove(S.greqs, i) end end
-    S.gans[tostring(d.requestId)] = nil
+    if sval(d.requestId) then S.gans[sval(d.requestId)] = nil end
     if #S.greqs == 0 then S.waiting = false end
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
     refresh_messages()
   elseif t == 'session_error' then
     S.active, S.perms = false, {}
-    if d.apiErrorCode == 'auth_required' then S.auth = S.auth or { methods = {} } end
+    if d.apiErrorCode == 'auth_required' and is_acp() then S.auth = S.auth or { methods = {} } end
     local p = d.errorPresentation
-    S.err = (type(p) == 'table' and (p.message or p.title)) or d.apiErrorCode or 'error'
+    S.err = (type(p) == 'table' and (sval(p.message) or sval(p.title))) or sval(d.apiErrorCode) or 'error'
     refresh_messages()
   end
 end
@@ -317,6 +328,7 @@ local function poll_stream()
     local chunk = f:read('*a') or ''
     f:close()
     if #chunk > 0 then
+      st.fails = 0
       st.off = st.off + #chunk
       st.buf = (st.buf .. chunk):gsub('\r\n', '\n')
       while true do
@@ -335,11 +347,15 @@ local function poll_stream()
     end
   end
   local now = reaper.time_precise()
-  if S.sid ~= '' and now - st.check > 3 then
+  -- 3 s, doubling up to 60 s while the stream keeps dying (host down, session deleted): no fork storm
+  if S.sid ~= '' and now - st.check > math.min(60, 3 * 2 ^ (st.fails or 0)) then
     st.check = now
-    local dead = io.open(st.file .. '.dead', 'rb')
-    if dead then dead:close() end
-    if not st.pid or dead then stream_start() end
+    local dead = st.dead and io.open(st.dead, 'rb')
+    if dead then dead:close(); os.remove(st.dead) end
+    if not st.pid or dead then
+      st.fails = (st.fails or 0) + 1
+      stream_start()
+    end
   end
 end
 
@@ -698,8 +714,14 @@ end
 
 ---------------------------------------------------------------- actions
 local ime_cb -- created with the ImGui context below; send() clears the input through it
+local function utf8_prefix(str, n)
+  local cut = utf8.offset(str, n + 1)
+  return cut and str:sub(1, cut - 1) or str
+end
+
 local function send()
   if S.agent == '' then return end
+  if S.sid == '' and S.creating then return end -- the first message is still opening the session
   local text = S.input:gsub('^%s+', ''):gsub('%s+$', '')
   if text == '' then return end
   -- a still-active InputText keeps its own buffer and hands the old text back next frame, so a quick second
@@ -716,17 +738,19 @@ local function send()
   S.msgs[#S.msgs + 1] = { role = 'user', text = payload }
   S.live, S.err, S.input, S.focus, S.active = {}, nil, '', true, true
   scroll()
+  local gen = S.gen
   if S.sid == '' then
-    local agent = S.agent
+    S.creating = true
     http('POST', '/sessions', '{"message":' .. jstr(payload) .. cfg_json() .. '}', function(code, body)
       local r = decode(body)
-      if agent ~= S.agent then return end
-      if code >= 200 and code < 300 and type(r) == 'table' and type(r.id) == 'string' then
+      if gen ~= S.gen then return end -- the user switched agent/session meanwhile
+      S.creating = false
+      if code >= 200 and code < 300 and type(r) == 'table' and sval(r.id) then
         S.sid = r.id
-        S.title = text:sub(1, 60)
+        S.title = utf8_prefix(text, 60)
         save_agent_session()
         stream_start()
-      elseif code == 401 then
+      elseif code == 401 and is_acp() then
         S.active, S.auth = false, S.auth or { methods = {} }
         S.err = (S.agent_name ~= '' and S.agent_name or S.agent) .. ' needs a login first'
       else
@@ -736,6 +760,7 @@ local function send()
     end)
   else
     http('POST', '/sessions/' .. S.sid .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
+      if gen ~= S.gen then return end
       if code < 200 or code >= 300 then
         S.active = false
         S.err = ('send failed (%d)'):format(code)
@@ -750,8 +775,11 @@ end
 
 local function reset_view()
   stream_stop()
+  S.gen = S.gen + 1 -- late callbacks from the previous view check this and drop their result
   S.msgs, S.live, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, false, nil, false, {}, 0
-  S.perms, S.greqs, S.waiting = {}, {}, false
+  S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
+  S.last_sent, S.last_sent_at = nil, nil
+  S.stream.fails = 0
 end
 
 local function new_chat()
@@ -794,7 +822,6 @@ end
 local load_config, load_requests
 local function load_agents(try)
   try = try or 1
-  S.agents_at = reaper.time_precise()
   local host = HOSTS[try]
   http_url('GET', host .. '/api/agents', nil, function(code, body)
     if code ~= 200 then
@@ -862,7 +889,7 @@ function load_config()
     local r = decode(body)
     if code == 200 and type(r) == 'table' and type(r.configOptions) == 'table' then
       S.cfg_opts = r.configOptions
-    elseif code == 401 then
+    elseif code == 401 and is_acp() then
       S.auth = S.auth or { methods = {} }
       load_status()
     end
@@ -886,19 +913,19 @@ function load_requests()
     local list = type(r) == 'table' and r.requests
     local out = {}
     if type(list) == 'table' then
-      for _, q in ipairs(list) do
-        if type(q) == 'table' and sval(q.id) and sval(q.kind) and q.autoApproved ~= true then
-          q.payload = type(q.payload) == 'table' and q.payload or {}
-          out[#out + 1] = q
+      for _, req in ipairs(list) do
+        if type(req) == 'table' and sval(req.id) and sval(req.kind) and req.autoApproved ~= true then
+          req.payload = type(req.payload) == 'table' and req.payload or {}
+          out[#out + 1] = req
         end
       end
     end
     -- merge: events are the source of truth (user_request_resolved removes cards); this only fills in
     -- requests created before the stream connected
-    for _, q in ipairs(out) do
+    for _, req in ipairs(out) do
       local known = false
-      for _, old in ipairs(S.greqs) do if old.id == q.id then known = true end end
-      if not known then S.greqs[#S.greqs + 1] = q end
+      for _, old in ipairs(S.greqs) do if old.id == req.id then known = true end end
+      if not known then S.greqs[#S.greqs + 1] = req end
     end
     if #S.greqs > 0 then S.waiting = true end
   end)
@@ -906,8 +933,10 @@ end
 
 local function answer_request(req, path, body)
   req.sending, req.err = true, nil
+  local gen = S.gen
   http('POST', path, body, function(code, resp)
     req.sending = false
+    if gen ~= S.gen then return end
     if code >= 200 and code < 300 then
       for i = #S.greqs, 1, -1 do if S.greqs[i] == req then table.remove(S.greqs, i) end end
       S.gans[req.id] = nil
@@ -1344,12 +1373,15 @@ local function bubble(holder, text)
   if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
 end
 
-local function tools_line(tools)
-  if not tools or #tools == 0 then return end
-  local names = {}
-  for _, n in ipairs(tools) do names[#names + 1] = tool_label(n) end
+local function tools_line(m)
+  if not m.tools or #m.tools == 0 then return end
+  if not m._tools then
+    local names = {}
+    for _, n in ipairs(m.tools) do names[#names + 1] = tool_label(n) end
+    m._tools = '→ ' .. table.concat(names, ' · ')
+  end
   ImGui.PushTextWrapPos(ctx, 0)
-  ImGui.TextDisabled(ctx, '→ ' .. table.concat(names, ' · '))
+  ImGui.TextDisabled(ctx, m._tools)
   ImGui.PopTextWrapPos(ctx)
 end
 
@@ -1365,11 +1397,14 @@ local function truncate(str, w)
   return '…'
 end
 
+local function push_btn(bg, hovered, active, text) -- pop with ImGui.PopStyleColor(ctx, 4)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, bg)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, hovered)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, active)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Text, text)
+end
 local function flat_push(col)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, 0)
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C.hover)
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C.hover)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, col or C.muted)
+  push_btn(0, C.hover, C.hover, col or C.muted)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 6, 3)
 end
 local function flat_pop()
@@ -1647,10 +1682,7 @@ local function context_chip()
   local clicked
   if lv == 2 then
     local bg = C.dark_pill
-    ImGui.PushStyleColor(ctx, ImGui.Col_Button, bg)
-    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, alpha(bg, 0xE0))
-    ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, alpha(bg, 0xC0))
-    ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFFFFFFF)
+    push_btn(bg, alpha(bg, 0xE0), alpha(bg, 0xC0), 0xFFFFFFFF)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 8, 3)
     ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 10)
     clicked = ImGui.Button(ctx, '◆ REAPER all details##chip_ctx')
@@ -1688,10 +1720,7 @@ local function cards_height(L)
   return h
 end
 local function primary(label)
-  ImGui.PushStyleColor(ctx, ImGui.Col_Button, C.accent)
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, alpha(C.accent, 0xDD))
-  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, alpha(C.accent, 0xBB))
-  ImGui.PushStyleColor(ctx, ImGui.Col_Text, 0xFFFFFFFF)
+  push_btn(C.accent, alpha(C.accent, 0xDD), alpha(C.accent, 0xBB), 0xFFFFFFFF)
   local clicked = ImGui.Button(ctx, label)
   ImGui.PopStyleColor(ctx, 4)
   return clicked
@@ -1712,7 +1741,7 @@ local GAMUT_ASKS = {
   mcp_reauth_required = function(p) return 'Reconnect ' .. (sval(p.mcpName) or 'an MCP server') end,
 }
 
-local function question_card(q, who)
+local function question_card(q)
   local p, id = q.payload, q.id
   local st = S.gans[id] or { sel = {}, other = {} }
   S.gans[id] = st
@@ -1777,7 +1806,7 @@ local function greq_card(q, who)
   local sid = S.sid
   local tid = '"toolUseId":' .. jstr(id)
   if kind == 'question' then
-    question_card(q, who)
+    question_card(q)
   elseif kind == 'secret' then
     wrapped(sval(p.reason) or (who .. ' needs a secret'))
     ImGui.TextDisabled(ctx, sval(p.secretName) or '')
@@ -1889,29 +1918,14 @@ local function card(c)
       if primary('Answer in Gamut') then open_in_gamut() end
     end
     ImGui.EndChild(ctx)
+    local _, h = ImGui.GetItemRectSize(ctx)
+    S.card_h[c.key] = h
   end
-  local _, h = ImGui.GetItemRectSize(ctx)
-  S.card_h[c.key] = h
   ImGui.PopStyleColor(ctx, 2)
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
 local DOCK_FLAG = 'docked_v2'
-
-local perf = { n = 0, sum = 0, max = 0, gap = 0, last = reaper.time_precise(), at = reaper.time_precise() }
-local function perf_tick(t0)
-  local t1 = reaper.time_precise()
-  local dt = t1 - t0
-  perf.n, perf.sum = perf.n + 1, perf.sum + dt
-  if dt > perf.max then perf.max = dt end
-  if t0 - perf.last > perf.gap then perf.gap = t0 - perf.last end
-  perf.last = t0
-  if t1 - perf.at >= 1 then
-    reaper.SetExtState(EXT, 'perf', ('fps=%.1f lua_avg_ms=%.2f lua_max_ms=%.2f max_gap_ms=%.1f'):format(
-      perf.n / (t1 - perf.at), perf.sum / perf.n * 1000, perf.max * 1000, perf.gap * 1000), false)
-    perf.n, perf.sum, perf.max, perf.gap, perf.at = 0, 0, 0, 0, t1
-  end
-end
 
 -- Port of Gamut's follow engine (SuperAgent use-message-list-scroll.ts): following pins the live edge as content
 -- grows; an upward wheel escapes at once; coming back within ATTACH_PX re-engages. Motion is a time-based
@@ -1958,24 +1972,6 @@ local function perf_tick(t0)
     reaper.SetExtState(EXT, 'perf', ('fps=%.1f lua_avg_ms=%.2f lua_max_ms=%.2f max_gap_ms=%.1f'):format(
       perf.n / (t1 - perf.at), perf.sum / perf.n * 1000, perf.max * 1000, perf.gap * 1000), false)
     perf.n, perf.sum, perf.max, perf.gap, perf.at = 0, 0, 0, 0, t1
-  end
-end
-
--- REAPER's defer caps ReaImGui at ~33 fps, so ImGui's 5-line wheel jumps look choppy; ease toward a target instead
-local function smooth_scroll()
-  local cur, maxy = ImGui.GetScrollY(ctx), ImGui.GetScrollMaxY(ctx)
-  if not S.sy_target or math.abs(cur - (S.sy_last or cur)) > 0.5 then S.sy_target = cur end
-  local wheel = ImGui.IsWindowHovered(ctx) and ImGui.GetMouseWheel(ctx) or 0
-  if wheel ~= 0 then
-    S.sy_target = math.max(0, math.min(maxy, S.sy_target - wheel * FONT_SIZE * 5))
-  end
-  local d = S.sy_target - cur
-  if math.abs(d) > 0.5 then
-    local ny = cur + d * 0.45
-    ImGui.SetScrollY(ctx, ny)
-    S.sy_last = ny
-  else
-    S.sy_last = cur
   end
 end
 
@@ -2044,13 +2040,14 @@ local function frame()
         scroll_engine()
         for _, m in ipairs(S.msgs) do
           if m.role == 'user' then
-            local body, had = split_context(m.text)
+            if m._had == nil then m._body, m._had = split_context(m.text) end
+            local body, had = m._body, m._had
             if had then ImGui.TextDisabled(ctx, '◆ REAPER context') end
             bubble(m, body)
             ImGui.Spacing(ctx)
           else
             if m.text ~= '' then md(m, m.text) end
-            tools_line(m.tools)
+            tools_line(m)
             ImGui.Spacing(ctx)
           end
         end

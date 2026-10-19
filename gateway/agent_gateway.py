@@ -105,10 +105,25 @@ def terminal_auth(method, spec):
         argv, env = [expand(c) for c in spec["command"]] + list(method.get("args") or []), method.get("env") or {}
     else:
         return None
-    argv += [str(a) for a in spec.get("loginArgs") or []]  # e.g. kimi: ["--region", "global"]
+    argv += [str(a) for a in method.get("loginArgs") or []]
     merged = dict(spec.get("env") or {})
     merged.update(env)
     return argv, merged
+
+
+def login_variants(methods, spec):
+    """Split each terminal login into the config's loginVariants (e.g. Kimi: one button per region)."""
+    variants = spec.get("loginVariants") or []
+    out = []
+    for m in methods:
+        if not variants or not terminal_auth(m, {"command": spec["command"]}):
+            out.append(m)
+            continue
+        for v in variants:
+            out.append(dict(m, id="%s:%s" % (m.get("id"), v["id"]), name=v.get("name", v["id"]),
+                            description=v.get("description", m.get("description")),
+                            loginArgs=[str(a) for a in v.get("args") or []]))
+    return out
 
 
 class AcpError(Exception):
@@ -370,7 +385,7 @@ class AcpAgent:
             self.proc.terminate()
             raise
         self.caps = res.get("agentCapabilities") or {}
-        self.auth_methods = res.get("authMethods") or []
+        self.auth_methods = login_variants(res.get("authMethods") or [], self.spec)
         self.state = "ready"
 
     def _send(self, msg):

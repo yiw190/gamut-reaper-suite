@@ -92,7 +92,9 @@ class GW:
         cfg = Path(tmp) / "config.json"
         cfg.write_text(json.dumps({
             "acp": [{"slug": "fake", "name": "Fake", "command": [sys.executable, str(HERE / "fake_acp_agent.py")],
-                     "env": acp_env or {}, "cwd": tmp, "loginArgs": ["--region", "global"]}],
+                     "env": acp_env or {}, "cwd": tmp, "loginVariants": [
+                         {"id": "global", "name": "Log in (global)", "args": ["--region", "global"]},
+                         {"id": "cn", "name": "Log in (China)", "args": ["--region", "mainland-cn"]}]}],
             "mcpServers": [{"name": "reaper", "command": sys.executable, "args": ["-c", "pass"]}],
         }))
         env = dict(os.environ, AGENT_GATEWAY_PORT=str(self.port), GAMUT_URL="http://127.0.0.1:%d" % gamut_port,
@@ -330,8 +332,9 @@ def main():
     try:
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         st = g.get("/api/agents/acp-fake/status")
-        check("terminal auth method surfaced", code == 401 and st["authMethods"][0].get("type") == "terminal")
-        g.post("/api/agents/acp-fake/auth", {"methodId": "login"})
+        check("terminal login split into variants", code == 401 and [m["id"] for m in st["authMethods"]]
+              == ["login:global", "login:cn"] and st["authMethods"][1]["name"] == "Log in (China)")
+        g.post("/api/agents/acp-fake/auth", {"methodId": "login:global"})
         for _ in range(100):
             st = g.get("/api/agents/acp-fake/status")
             if st["connected"]:

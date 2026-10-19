@@ -90,8 +90,8 @@ It proxies Gamut agents unchanged and adds [ACP](https://agentclientprotocol.com
 `@agentclientprotocol/codex-acp`, Claude Code via `@agentclientprotocol/claude-agent-acp`, Kimi Code CLI (`kimi acp`),
 and anything else that speaks ACP — under the same API. Subscriptions work: Codex logs in with ChatGPT, Claude Code
 reuses the local `claude` login, Kimi's login button opens `kimi login` (device code) in Terminal. An agent's
-`loginArgs` are appended to its login command — for Kimi outside mainland China use `["--region", "global"]`
-(kimi.ai). Each ACP session gets this
+`loginVariants` turn its terminal login into one button per variant, each appending its `args` to the login
+command (the Kimi entry ships kimi.ai = `--region global` and kimi.com = `--region mainland-cn`). Each ACP session gets this
 repo's MCP server, so every backend can drive REAPER. The panel shows model / effort / mode pickers for both kinds
 (Gamut's model catalog, ACP config options), permission buttons when an ACP agent asks before a tool call, and a
 login button when the agent needs one. If the gateway isn't running the panel falls back to Gamut directly.

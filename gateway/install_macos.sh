@@ -57,6 +57,10 @@ if [ ! -f "$CFG/config.json" ]; then
       "description": "Kimi Code CLI over ACP; uses the Kimi Code subscription login",
       "command": ["$NODE_DIR/bin/kimi", "acp"],
       "env": {"PATH": "$NODE_DIR/bin:/usr/bin:/bin:/usr/sbin:/sbin"},
+      "loginVariants": [
+        {"id": "global", "name": "Log in with kimi.ai", "description": "International account (kimi.ai)", "args": ["--region", "global"]},
+        {"id": "cn", "name": "Log in with kimi.com", "description": "Mainland China account (kimi.com)", "args": ["--region", "mainland-cn"]}
+      ],
       "cwd": "~/Documents/REAPER Media"
     }
   ],

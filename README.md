@@ -22,11 +22,21 @@ MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge
 
 Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. Call `status` first; on a new project pass `detail=true` for arrangement facts (time signature, length in beats, markers, MIDI vs audio) — not chords. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
 
-## Setup
+## Install on a Mac with Gamut
 
 ```bash
-git clone https://github.com/yiw190/gamut-reaper-suite.git
-cd gamut-reaper-suite
+git clone https://github.com/yiw190/gamut-reaper-suite.git ~/gamut-reaper-suite
+sh ~/gamut-reaper-suite/install.sh        # WITH_AGENTS=1 also installs the agent gateway (Codex, Claude Code, Kimi)
+```
+
+It installs the bridge, the Gamut Chat panel, ReaImGui and the REAPER startup hook, runs the MCP on
+`127.0.0.1:8787` as a LaunchAgent (bearer token in `~/.config/reaper-mcp/token`) and registers it in Gamut as
+**REAPER**. Keep the clone: the LaunchAgent runs from it. Re-run after `git pull` to upgrade. Then restart REAPER and
+give an agent the REAPER MCP server in Gamut.
+
+## Manual setup (any MCP client)
+
+```bash
 python3 python/install_bridge.py
 ```
 
@@ -107,7 +117,7 @@ python3 gateway/test_gateway.py      # fake Gamut + fake ACP agent, no network
 Agents are listed in `~/.config/agent-gateway/config.json` (`acp: [{slug, name, command, env, cwd}]`,
 `mcpServers: [...]`). Transcripts of ACP sessions are kept in `~/.config/agent-gateway/sessions/`.
 
-Gamut desktop on the same Mac: register the MCP as `http://localhost:8787/mcp` (no tunnel). Agent running somewhere
+Gamut desktop on the same Mac: `install.sh` registers the MCP as `http://localhost:8787/mcp` (no tunnel). Agent running somewhere
 else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/remote-host.md).
 
 ## Tools

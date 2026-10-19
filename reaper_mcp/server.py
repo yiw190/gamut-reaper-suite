@@ -471,7 +471,7 @@ tool(
 tool(
     "project",
     "Project-level edits. action: tempo | time_signature | time_selection | marker | save. "
-    "save with path writes a copy (no dialog). save without path needs an already-named project.",
+    "save with path creates missing folders and writes a copy (no dialog); an untitled project adopts that path. save without path needs an already-named project.",
     obj({
         "action": {"type": "string",
                    "enum": ["tempo", "time_signature", "time_selection", "marker", "save"]},

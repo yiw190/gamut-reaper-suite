@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.3.0"
+local VERSION = "0.3.1"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -1032,7 +1032,15 @@ end
 
 function DSL.save_project(path)
   if path and path ~= "" then
+    local dir = path:match("^(.*)[/\\]")
+    if dir then reaper.RecursiveCreateDirectory(dir, 0) end
     reaper.Main_SaveProjectEx(0, path, 0)
+    local _, cur = reaper.EnumProjects(-1, "")
+    if cur == "" then
+      -- an untitled project adopts the path instead of leaving a stray copy
+      reaper.Main_openProject("noprompt:" .. path)
+      return { ret = { saved = true, path = path, copy = false } }
+    end
     return { ret = { saved = true, path = path, copy = true } }
   end
   local _, proj = reaper.EnumProjects(-1, "")

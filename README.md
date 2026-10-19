@@ -30,7 +30,7 @@ cd gamut-reaper-suite
 python3 python/install_bridge.py
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.3.0 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.3.1 ready`.
 
 MCP client config (any client that runs stdio servers):
 

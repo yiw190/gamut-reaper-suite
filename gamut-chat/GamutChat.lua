@@ -1033,17 +1033,18 @@ local function font_file(path, index)
   f:close()
   return ImGui.CreateFontFromFile(path, index or 0)
 end
-local HIRA = '/System/Library/Fonts/Hiragino Sans GB.ttc'
+-- CJK (and everything the theme font lacks): PingFang SC, macOS's own UI face for Chinese. It lives in a
+-- versioned asset folder, so it's loaded by family name; ReaImGui resolves that through the system.
 local F = {
-  reg = font_file(HIRA, 0) or ImGui.CreateFont('sans-serif'),
-  bold = font_file(HIRA, 2) or ImGui.CreateFont('sans-serif', ImGui.FontFlags_Bold),
+  reg = ImGui.CreateFont('PingFang SC'),
+  bold = ImGui.CreateFont('PingFang SC', ImGui.FontFlags_Bold),
   mono = font_file('/System/Library/Fonts/Menlo.ttc', 0) or ImGui.CreateFont('monospace'),
 }
 for _, f in pairs(F) do ImGui.Attach(ctx, f) end
 
 -- Latin text follows the REAPER theme's UI font. The .ReaperTheme stores fonts as LOGFONT hex (face name from byte
 -- 28); the face used most is the theme's UI font. It usually has no CJK glyphs and ReaImGui has no glyph fallback,
--- so Chinese (and symbols like ◆ →) stay on Hiragino: see font_for() and the per-token pick in layout_inline.
+-- so Chinese (and symbols like ◆ →) stay on PingFang: see font_for() and the per-token pick in layout_inline.
 local FONT_DIRS = { (os.getenv('HOME') or '') .. '/Library/Fonts', '/Library/Fonts', '/System/Library/Fonts',
   '/System/Library/Fonts/Supplemental' }
 local function theme_face(theme)
@@ -1095,7 +1096,7 @@ local function load_theme_fonts()
   S.theme_font = face and (face .. (reg and '' or ' (not installed)')) or 'none'
   reaper.SetExtState(EXT, 'theme_font', S.theme_font .. ' | ' .. tostring(reg) .. ' | ' .. tostring(bold), false)
 end
--- plain Latin (ASCII + Latin-1, e.g. "·") in the theme font; anything from U+2000 up (CJK, ◆, →) in Hiragino
+-- plain Latin (ASCII + Latin-1, e.g. "·") in the theme font; anything from U+2000 up (CJK, ◆, →) in PingFang
 local function font_for(str) return str:find('[\226-\244]') and F.reg or F.ui end
 -- key + char of one keystroke must land in the same frame for the IME guard below
 ImGui.SetConfigVar(ctx, ImGui.ConfigVar_InputTrickleEventQueue, 0)

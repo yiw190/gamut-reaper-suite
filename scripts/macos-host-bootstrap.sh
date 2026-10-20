@@ -146,4 +146,6 @@ else
   ls /Applications 2>/dev/null | head -50 || true
 fi
 
+bash "$REPO/scripts/install-watchdog.sh"
+
 echo "=== bootstrap done $(date) ==="

@@ -251,8 +251,14 @@ local function refresh_messages()
 end
 
 ---------------------------------------------------------------- SSE stream
+-- curl carries a fixed user agent so every panel stream can be found by name, including orphans whose
+-- panel died without atexit (REAPER crash / watchdog kill): they kept appending to the same file and
+-- every delta showed up 2-3 times. "[c]url" keeps pkill from matching the sh -c running it.
+local STREAM_UA = 'GamutChatPanel'
+local RUN = tostring(os.time())
+
 local function stream_stop()
-  if S.stream.pid then sh('pkill -P ' .. S.stream.pid .. ' 2>/dev/null; kill ' .. S.stream.pid .. ' 2>/dev/null') end
+  sh('/usr/bin/pkill -f ' .. q('[c]url -s -N -A ' .. STREAM_UA) .. ' 2>/dev/null; /bin/rm -f ' .. q(DIR) .. 'stream*')
   S.stream.pid = nil
 end
 
@@ -260,16 +266,17 @@ local function stream_start()
   stream_stop()
   if S.sid == '' then return end
   local st = S.stream
-  st.file = DIR .. 'stream.sse'
+  st.starts = (st.starts or 0) + 1
+  -- a fresh file per start: a writer that outlives its kill can't interleave into the live stream
+  st.file = DIR .. 'stream-' .. RUN .. '-' .. st.starts .. '.sse'
+  st.dead = st.file .. '.dead'
   local f = io.open(st.file, 'wb')
   if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(st.file, 'wb') end
   if f then f:close() end
   st.off, st.buf, st.check = 0, '', reaper.time_precise()
-  st.starts = (st.starts or 0) + 1
-  st.dead = st.file .. '.dead' .. st.starts -- per start, so a late write from the previous curl can't fake a death
   -- the wrapper drops the .dead file when curl exits, so liveness is a file check, not a periodic popen (forks stall the UI)
   local url = api('/sessions/' .. S.sid .. '/stream')
-  local out = sh('( /usr/bin/curl -s -N' .. auth_args(url) .. ' ' .. q(url) ..
+  local out = sh('( /usr/bin/curl -s -N -A ' .. STREAM_UA .. auth_args(url) .. ' ' .. q(url) ..
     ' >> ' .. q(st.file) .. '; : > ' .. q(st.dead) .. ' ) >/dev/null 2>&1 & echo $!')
   st.pid = tonumber(out:match('%d+'))
 end

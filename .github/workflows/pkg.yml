@@ -54,7 +54,7 @@ jobs:
   windows:
     name: build + install the .exe on Windows
     runs-on: windows-latest
-    timeout-minutes: 25
+    timeout-minutes: 10  # a normal run takes ~3 min
     defaults:
       run:
         shell: pwsh

@@ -161,7 +161,9 @@ do
 end
 local JSON_ESC = { ['"'] = '\\"', ['\\'] = '\\\\', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t' }
 local function jstr(s)
-  return '"' .. (tostring(s):gsub('[%c"\\]', function(c)
+  -- explicit byte ranges, not %c: MSVC's iscntrl() (REAPER on Windows) also flags some bytes >= 0x80,
+  -- which split UTF-8 (Chinese) into \u00xx escapes
+  return '"' .. (tostring(s):gsub('[\0-\31\127"\\]', function(c)
     return JSON_ESC[c] or string.format('\\u%04x', c:byte())
   end)) .. '"'
 end

@@ -563,22 +563,34 @@ end
 
 local function spos(t) return (pos(t):gsub('%.00$', '')) end
 
-local SEL_HELP = {
-  razor = 'Razor area: a rectangle, this time range on these tracks only.\nDraw one with Alt + right-drag in the arrange view.',
-  time = 'Time selection: this time range across ALL tracks.\nDrag on the ruler or on empty arrange space.',
-  tracks = 'Selected tracks: whole tracks, picked by clicking the track header.',
-  items = 'Selected items: individual clips on the timeline.',
-  notes = 'Selected MIDI notes in the open MIDI editor.',
-  env = 'Selected envelope (automation lane).',
-  fx = 'Focused FX window.',
-}
 
 -- one pill per selection kind for the row above the input; rebuilt when a selection changes
+-- tooltips carry data only: positions, lengths, names, chord markers
 local function sel_pills(proj)
   local P = {}
   local function add(k, label, detail) P[#P + 1] = { k = k, label = label, detail = detail } end
+  local function span(t0, t1)
+    local num = reaper.TimeMap_GetTimeSigAtTime(proj, t0)
+    local qn = reaper.TimeMap2_timeToQN(proj, t1) - reaper.TimeMap2_timeToQN(proj, t0)
+    local bars = qn / (num or 4)
+    return ('%s – %s  (%s bar%s)'):format(pos(t0), pos(t1),
+      math.abs(bars - math.floor(bars + 0.5)) < 1e-6 and math.floor(bars + 0.5) or ('%.2f'):format(bars), bars == 1 and '' or 's')
+  end
+  local function chords(t0, t1)
+    local out = {}
+    local _, nm, nr = reaper.CountProjectMarkers(proj)
+    for i = 0, (nm or 0) + (nr or 0) - 1 do
+      local _, isr, p0, _, name, num = reaper.EnumProjectMarkers3(proj, i)
+      if not isr and p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 and #out < 12 then out[#out + 1] = num .. ' ' .. name end
+    end
+    return #out > 0 and ('\n' .. table.concat(out, ' · ')) or ''
+  end
+  local function len_of(m)
+    local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
+    return p0, p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
+  end
   local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
-  local rz, rt = {}, {}
+  local rz, rt, lines = {}, {}, {}
   for i = 0, reaper.CountTracks(proj) - 1 do
     local tr = reaper.GetTrack(proj, i)
     local _, v = reaper.GetSetMediaTrackInfo_String(tr, 'P_RAZOREDITS', '', false)
@@ -588,47 +600,77 @@ local function sel_pills(proj)
       for sa, sb in v:gmatch('(%S+) (%S+) "[^"]*"') do
         local a, b = tonumber(sa), tonumber(sb)
         rz.t0, rz.t1 = math.min(rz.t0 or a, a), math.max(rz.t1 or b, b)
+        if #lines < 12 then lines[#lines + 1] = ('#%d %s   %s – %s'):format(i + 1, tn, pos(a), pos(b)) end
       end
     end
   end
   if #rt > 0 then
     add('razor', ('Razor  %s–%s · %s'):format(spos(rz.t0), spos(rz.t1), #rt == 1 and rt[1]:gsub('^#%d+ ', '') or (#rt .. ' tracks')),
-      table.concat(rt, '\n'))
+      table.concat(lines, '\n') .. chords(rz.t0, rz.t1))
   end
-  if e > s then add('time', ('Time  %s–%s'):format(spos(s), spos(e))) end
+  if e > s then add('time', ('Time  %s–%s'):format(spos(s), spos(e)), span(s, e) .. chords(s, e)) end
   local nt = reaper.CountSelectedTracks(proj)
   if nt > 0 then
     local names = {}
     for i = 0, math.min(nt, 12) - 1 do
       local t = reaper.GetSelectedTrack(proj, i)
-      names[#names + 1] = ('#%d %s'):format(trnum(t), select(2, reaper.GetTrackName(t)))
+      local ni_ = reaper.CountTrackMediaItems(t)
+      names[#names + 1] = ('#%d %s   %d item%s%s'):format(trnum(t), select(2, reaper.GetTrackName(t)), ni_, ni_ == 1 and '' or 's',
+        reaper.GetMediaTrackInfo_Value(t, 'B_MUTE') == 1 and ', muted' or '')
     end
-    add('tracks', nt == 1 and ('Track  ' .. names[1]:gsub('^#%d+ ', '')) or ('Tracks  ' .. nt), table.concat(names, '\n'))
+    if nt > 12 then names[#names + 1] = ('… +%d'):format(nt - 12) end
+    add('tracks', nt == 1 and ('Track  ' .. select(2, reaper.GetTrackName(reaper.GetSelectedTrack(proj, 0))))
+      or ('Tracks  ' .. nt), table.concat(names, '\n'))
   end
   local ni = reaper.CountSelectedMediaItems(proj)
   if ni > 0 then
+    local L = {}
+    for i = 0, math.min(ni, 10) - 1 do
+      local m = reaper.GetSelectedMediaItem(proj, i)
+      local p0, p1 = len_of(m)
+      local tk = reaper.GetActiveTake(m)
+      local tkn = tk and select(2, reaper.GetSetMediaItemTakeInfo_String(tk, 'P_NAME', '', false)) or ''
+      L[#L + 1] = ('%s   %s – %s%s'):format(select(2, reaper.GetTrackName(reaper.GetMediaItem_Track(m))), pos(p0), pos(p1),
+        tkn ~= '' and ('   "' .. tkn .. '"') or '')
+    end
+    if ni > 10 then L[#L + 1] = ('… +%d'):format(ni - 10) end
     local m = reaper.GetSelectedMediaItem(proj, 0)
-    local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
+    local p0, p1 = len_of(m)
     local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
-    add('items', ni == 1 and ('Item  %s %s–%s'):format(tn, spos(p0), spos(p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')))
-      or ('Items  ' .. ni))
+    add('items', ni == 1 and ('Item  %s %s–%s'):format(tn, spos(p0), spos(p1)) or ('Items  ' .. ni), table.concat(L, '\n'))
   end
   local ed = reaper.MIDIEditor_GetActive()
   local take = ed and reaper.MIDIEditor_GetTake(ed)
   if SEL.sig.notes and SEL.sig.notes ~= '' and take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
-    local n, idx = 0, reaper.MIDI_EnumSelNotes(take, -1)
-    while idx ~= -1 do n = n + 1; idx = reaper.MIDI_EnumSelNotes(take, idx) end
+    local n, lo, hi, t0, t1 = 0, 128, -1, nil, nil
+    local idx = reaper.MIDI_EnumSelNotes(take, -1)
+    while idx ~= -1 do
+      local _, _, _, sp, ep, _, pitch = reaper.MIDI_GetNote(take, idx)
+      n, lo, hi = n + 1, math.min(lo, pitch), math.max(hi, pitch)
+      local a, b = reaper.MIDI_GetProjTimeFromPPQPos(take, sp), reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
+      t0, t1 = math.min(t0 or a, a), math.max(t1 or b, b)
+      idx = reaper.MIDI_EnumSelNotes(take, idx)
+    end
     local _, tn = reaper.GetTrackName(reaper.GetMediaItemTake_Track(take))
-    add('notes', ('Notes  %d in %s'):format(n, tn))
+    add('notes', ('Notes  %d in %s'):format(n, tn),
+      ('%d note%s, %s–%s\n%s – %s'):format(n, n == 1 and '' or 's', note_name(lo), note_name(hi), pos(t0), pos(t1)))
   end
   local env = reaper.GetSelectedEnvelope(proj)
-  if env then add('env', 'Envelope  ' .. select(2, reaper.GetEnvelopeName(env))) end
+  if env then
+    local _, en = reaper.GetEnvelopeName(env)
+    local tr = reaper.Envelope_GetParentTrack(env)
+    local np = reaper.CountEnvelopePoints(env)
+    add('env', 'Envelope  ' .. en, ('%s on %s\n%d point%s'):format(en,
+      tr and ('#%d %s'):format(trnum(tr), select(2, reaper.GetTrackName(tr))) or '?', np, np == 1 and '' or 's'))
+  end
   local rv, tnum, _, fnum = reaper.GetFocusedFX2()
   if rv and rv ~= 0 and rv & 2 == 0 then
     local tr = tnum == 0 and reaper.GetMasterTrack(proj) or reaper.GetTrack(proj, tnum - 1)
     if tr then
       local _, fn = reaper.TrackFX_GetFXName(tr, fnum)
-      add('fx', 'FX  ' .. (fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')))
+      add('fx', 'FX  ' .. (fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')),
+        ('%s\non %s%s'):format(fn, tnum == 0 and 'MASTER' or ('#%d %s'):format(tnum, select(2, reaper.GetTrackName(tr))),
+          reaper.TrackFX_GetEnabled(tr, fnum) and '' or ' (bypassed)'))
     end
   end
   return P
@@ -2277,7 +2319,7 @@ local function agent_picker()
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local x2, y2 = x1 + w, y1 + h
   local dl = ImGui.GetWindowDrawList(ctx)
-  ImGui.DrawList_AddRectFilled(dl, x1, y1, x2, y2, (ImGui.IsItemHovered(ctx) or S.cfgwin) and C.btn_down or C.field, RND)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x2, y2, ImGui.IsItemHovered(ctx) and C.btn_down or C.field, RND)
   ImGui.DrawList_AddText(dl, x1 + 28, y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2, C.field_text, name)
   ImGui.PopFont(ctx)
   if cur then provider_icon(dl, cur, x1 + 14, (y1 + y2) / 2, 16) else dot(C.muted, x1 + 14, (y1 + y2) / 2) end
@@ -2406,7 +2448,7 @@ local function model_chip()
     local _, v = cur_of(mode)
     for _, it in ipairs(opt_items(mode)) do if it.value == v then parts[#parts + 1] = it.name or v end end
   end
-  if chip('model', table.concat(parts, ' · '), S.cfgwin and C.accent or C.muted) then
+  if chip('model', table.concat(parts, ' · '), C.muted) then
     S.cfgwin = not S.cfgwin
     local _, y1 = ImGui.GetItemRectMin(ctx)
     local wx = ImGui.GetWindowPos(ctx)
@@ -2668,7 +2710,7 @@ local function cfg_window()
         local kind, value = p.label:match('^(%S+)  (.*)$')
         label((kind or p.label) .. ':', x0)
         ImGui.Text(ctx, truncate(value or '', w - LW - 70))
-        if ImGui.IsItemHovered(ctx) then show_tip(SEL_HELP[p.k] .. (p.detail and ('\n\n' .. p.detail) or '')) end
+        if ImGui.IsItemHovered(ctx) and p.detail then show_tip(p.detail) end
         local a_ = SEL.at[p.k] and age(p.k) or 'before open'
         ImGui.SameLine(ctx)
         ImGui.SetCursorScreenPos(ctx, x0 + w - ImGui.CalcTextSize(ctx, a_), select(2, ImGui.GetCursorScreenPos(ctx)))
@@ -2816,9 +2858,7 @@ local function sel_row()
     ImGui.DrawList_AddText(dl, x1 + 8 + kw + 6, ty, stale and C.lane_text or C.field_text, value)
     ImGui.PopFont(ctx)
     if hovered then
-      show_tip(SEL_HELP[p.k] .. (p.detail and ('\n\n' .. p.detail) or '') ..
-        '\n\n' .. (d and ('Set ' .. age(p.k) .. '.') or 'Already set when the panel opened.') ..
-        (stale and '\nOld selections stay in REAPER until you change them; the agent is told which one is newest.' or ''))
+      show_tip(p.detail or p.label)
     end
   end
 end

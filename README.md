@@ -150,8 +150,10 @@ Mailbox: `~/Library/Application Support/reaper-mcp/ipc` on macOS, `%APPDATA%/rea
 
 ## Hibiki panel (macOS, Windows)
 
-Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and the Gamut desktop app running on the same Mac — the
-panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamut's own UI uses.
+Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and an agent: Gamut or one of the CLI agents (see
+[Connect an agent](#connect-an-agent-step-4)). The panel talks to the [agent gateway](#agent-gateway-codex-claude-code-kimi--in-the-same-panel)
+on `127.0.0.1:47892`; for Gamut it uses the desktop app's local REST + SSE API (`127.0.0.1:47891`), the same one
+Gamut's own UI uses.
 
 The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua` to `<REAPER resource path>/Scripts/Hibiki/`, then **Actions → Load ReaScript** and run it.
 2. Optional: run `panel/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
@@ -247,6 +249,10 @@ uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under
 CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12.
 
 None of these need REAPER. The Lua-based ones need `lupa` (CI installs it).
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Report security issues privately: [SECURITY.md](SECURITY.md).
 
 ## License
 

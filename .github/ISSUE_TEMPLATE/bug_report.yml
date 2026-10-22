@@ -1,0 +1,45 @@
+name: Bug report
+description: Something in Hibiki doesn't work
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: hibiki doctor
+      description: Paste the output of `hibiki doctor`. It shows file paths but no tokens.
+      render: text
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: OS
+      placeholder: macOS 15.4 (Apple Silicon) / Windows 11
+    validations:
+      required: true
+  - type: input
+    id: reaper
+    attributes:
+      label: REAPER version
+      placeholder: "7.30"
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent
+      description: Which agent and model the panel was using.
+      placeholder: Gamut / Claude Code / Codex / Kimi / MiniMax / Grok / other MCP client
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Anything from the REAPER console, and `reaper-mcp.log` / `agent-gateway.log` from `~/Library/Logs` (macOS) or `%LOCALAPPDATA%\Hibiki\logs` (Windows).
+      render: text

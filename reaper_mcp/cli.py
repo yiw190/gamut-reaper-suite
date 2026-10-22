@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import os
 import sys
+
+if not __package__:  # run by path (the .pkg's bin/gamut-reaper-suite): make the package importable
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "uninstall"}
 USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | uninstall]

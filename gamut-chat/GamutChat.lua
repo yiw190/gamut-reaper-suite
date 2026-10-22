@@ -1179,11 +1179,9 @@ local function load_agents(try)
     local out = {}
     for _, a in ipairs(list) do
       if type(a.slug) == 'string' then
-        local av = type(a.avatar) == 'table' and a.avatar or {}
         out[#out + 1] = { slug = a.slug, name = type(a.name) == 'string' and a.name or a.slug,
           desc = type(a.description) == 'string' and a.description or '', acp = a.backend == 'acp',
-          color = type(av.color) == 'string' and av.color or nil, shape = type(av.shape) == 'string' and av.shape or nil,
-          status = type(a.status) == 'string' and a.status or nil, sessions = tonumber(a.sessionCount) }
+          status = type(a.status) == 'string' and a.status or nil }
       end
     end
     S.agents, S.agents_err = out, nil
@@ -2058,164 +2056,6 @@ local function tool_lane(labels, id)
   end
 end
 
----------------------------------------------------------------- agent avatars
-local avatar, provider_icon
-do
--- Gamut's own orbs (SuperAgent src/renderer/components/agents/agent-avatar: avatar-orbs.ts colourways,
--- orb-shapes.ts outlines), so an agent looks the same here as in the Gamut sidebar; core inside rim, no face
-local ORB = {
-  ['tonal-red'] = { 0xFA8274FF, 0xDE0223FF }, ['tonal-orange'] = { 0xFCA864FF, 0xEA490CFF },
-  ['tonal-amber'] = { 0xFFD065FF, 0xF28307FF }, ['tonal-green'] = { 0x98E844FF, 0x0DA13BFF },
-  ['tonal-forest'] = { 0x0B953DFF, 0x005521FF }, ['tonal-teal'] = { 0x3BE4D9FF, 0x14868DFF },
-  ['tonal-blue'] = { 0x9CCEFCFF, 0x2B79FAFF }, ['tonal-cobalt'] = { 0x4890FCFF, 0x1834DEFF },
-  ['tonal-purple'] = { 0xC39EFBFF, 0x7A1FFDFF }, ['tonal-blush'] = { 0xFDC4E5FF, 0xFB67C5FF },
-  ['tonal-pink'] = { 0xFDA0D1FF, 0xF11898FF }, ['tonal-brown'] = { 0xEC7622FF, 0x7D3B0AFF },
-  ['tonal-chocolate'] = { 0xC08A5AFF, 0x4E2C14FF }, ['tonal-white'] = { 0xFFFFFFFF, 0xC2BEBAFF },
-  ['tonal-grey'] = { 0xC9C5C2FF, 0x5F5D5CFF }, ['tonal-black'] = { 0x5C5050FF, 0x151212FF },
-}
-local DUO = { -- rim colour, core colour
-  ['duo-red-amber'] = { 'tonal-red', 'tonal-amber' }, ['duo-green-amber'] = { 'tonal-green', 'tonal-amber' },
-  ['duo-forest-teal'] = { 'tonal-forest', 'tonal-teal' }, ['duo-teal-blush'] = { 'tonal-teal', 'tonal-blush' },
-  ['duo-blue-amber'] = { 'tonal-blue', 'tonal-amber' }, ['duo-cobalt-teal'] = { 'tonal-cobalt', 'tonal-teal' },
-  ['duo-pink-blue'] = { 'tonal-pink', 'tonal-blue' }, ['duo-brown-amber'] = { 'tonal-brown', 'tonal-amber' },
-}
-local function orb_colors(name)
-  local d = DUO[name]
-  if d then return ORB[d[2]][1], ORB[d[1]][2] end
-  local o = ORB[name] or ORB['tonal-grey']
-  return o[1], o[2]
-end
-
-local orb_unit = {}
-local function orb_outline(shape) -- unit points in [-1, 1], same construction as orb-shapes.ts
-  if orb_unit[shape] then return orb_unit[shape] end
-  local P = {}
-  local function polar(n, f) for i = 0, n - 1 do local x, y = f(i / n * math.pi * 2); P[#P + 1] = { x, y } end end
-  local function regular(n, r, start, dy)
-    local v = {}
-    for i = 0, n - 1 do local a = math.rad(start + i * 360 / n); v[#v + 1] = { r * math.cos(a), r * math.sin(a) + (dy or 0) } end
-    return v
-  end
-  local function rounded(v, frac, seg)
-    local n = #v
-    for i = 1, n do
-      local c, pv, nx = v[i], v[(i - 2) % n + 1], v[i % n + 1]
-      local ax, ay = c[1] + (pv[1] - c[1]) * frac, c[2] + (pv[2] - c[2]) * frac
-      local bx, by = c[1] + (nx[1] - c[1]) * frac, c[2] + (nx[2] - c[2]) * frac
-      for k = 0, seg do
-        local t = k / seg
-        local u = 1 - t
-        P[#P + 1] = { u * u * ax + 2 * u * t * c[1] + t * t * bx, u * u * ay + 2 * u * t * c[2] + t * t * by }
-      end
-    end
-  end
-  local function arc(cx, cy, r, from, to, n)
-    for i = 0, n do local a = math.rad(from + (to - from) * i / n); P[#P + 1] = { cx + r * math.cos(a), cy + r * math.sin(a) } end
-  end
-  local function spow(v, e) return (v < 0 and -1 or 1) * math.abs(v) ^ e end
-  if shape == 'squircle' then polar(48, function(t) return 0.9 * spow(math.cos(t), 2 / 4.5), 0.9 * spow(math.sin(t), 2 / 4.5) end)
-  elseif shape == 'triangle' then rounded(regular(3, 1.14, -90, 0.17), 0.2, 6)
-  elseif shape == 'diamond' then rounded(regular(4, 1.0, -90), 0.2, 6)
-  elseif shape == 'hexagon' then rounded(regular(6, 1.0, -90), 0.18, 5)
-  elseif shape == 'pill' then arc(0.36, 0, 0.6, -90, 90, 14); arc(-0.36, 0, 0.6, 90, 270, 14)
-  elseif shape == 'arch' then arc(0, -0.1, 0.82, 180, 360, 18); arc(0.62, 0.72, 0.2, 0, 90, 5); arc(-0.62, 0.72, 0.2, 90, 180, 5)
-  elseif shape == 'bloom' then polar(64, function(t) local r = 0.87 + 0.08 * math.cos(8 * t); return r * math.cos(t), r * math.sin(t) end)
-  else polar(40, function(t) return 0.96 * math.cos(t), 0.96 * math.sin(t) end) end
-  orb_unit[shape] = P
-  return P
-end
-
-local poly_fill = ImGui.DrawList_AddConcavePolyFilled or ImGui.DrawList_AddConvexPolyFilled
-local function orb_poly(dl, P, cx, cy, r, col)
-  local arr = reaper.new_array(#P * 2)
-  for i, p in ipairs(P) do arr[i * 2 - 1] = cx + p[1] * r; arr[i * 2] = cy + p[2] * r end
-  poly_fill(dl, arr, col)
-end
-
--- a = agent record; ACP agents (local CLIs) have no Gamut avatar: dark squircle with a prompt glyph
-function avatar(dl, a, cx, cy, size)
-  local r = size / 2
-  if a.acp then
-    orb_poly(dl, orb_outline('squircle'), cx, cy, r, 0x2B2B2BFF)
-    local s = size / 18
-    ImGui.DrawList_AddLine(dl, cx - 4.5 * s, cy - 3 * s, cx - 1.5 * s, cy, 0xE6E6E6FF, 1.4 * s)
-    ImGui.DrawList_AddLine(dl, cx - 1.5 * s, cy, cx - 4.5 * s, cy + 3 * s, 0xE6E6E6FF, 1.4 * s)
-    ImGui.DrawList_AddLine(dl, cx + 0.5 * s, cy + 3.2 * s, cx + 4.5 * s, cy + 3.2 * s, 0xE6E6E6FF, 1.4 * s)
-    return
-  end
-  local core, rim = orb_colors(a.color)
-  local P = orb_outline(a.shape or 'circle')
-  orb_poly(dl, P, cx, cy, r, rim)
-  orb_poly(dl, P, cx, cy - r * 0.04, r * 0.7, core)
-end
-
--- provider marks for the agent list: Gamut's own app icon (converted once from Gamut.app), drawn marks for the
--- local CLIs (Claude spark, OpenAI blossom, Kimi K), a prompt glyph for anything else
-local ICON_DIR = reaper.GetResourcePath() .. '/Scripts/GamutChat/icons/'
-local gamut_img
-local function gamut_icon()
-  if gamut_img == nil then
-    local f = ICON_DIR .. 'gamut.png'
-    if not reaper.file_exists(f) then
-      sh('mkdir -p ' .. q(ICON_DIR) .. ' && /usr/bin/sips -s format png --resampleHeightWidth 64 64 '
-        .. '/Applications/Gamut.app/Contents/Resources/icon.icns --out ' .. q(f) .. ' >/dev/null 2>&1')
-    end
-    gamut_img = false
-    if reaper.file_exists(f) then
-      local ok, img = pcall(ImGui.CreateImage, f)
-      if ok and img then gamut_img = img; ImGui.Attach(ctx, img) end
-    end
-  end
-  return gamut_img
-end
-
-local function provider(a)
-  if not a.acp then return 'gamut' end
-  local k = (a.slug .. ' ' .. a.name):lower()
-  if k:find('codex') or k:find('openai') then return 'openai' end
-  if k:find('claude') then return 'claude' end
-  if k:find('kimi') or k:find('moonshot') then return 'kimi' end
-  return 'cli'
-end
-
-function provider_icon(dl, a, cx, cy, size)
-  local r, kind = size / 2, provider(a)
-  local sq = orb_outline('squircle')
-  if kind == 'gamut' then
-    local img = gamut_icon()
-    if img then
-      local e = size * 0.62 -- the icns carries macOS icon-grid padding; scale it up to fill the slot
-      ImGui.DrawList_AddImage(dl, img, cx - e, cy - e, cx + e, cy + e)
-    else
-      avatar(dl, a, cx, cy, size)
-    end
-  elseif kind == 'claude' then
-    orb_poly(dl, sq, cx, cy, r, 0xD97757FF)
-    for i = 0, 11 do
-      local t = i / 12 * math.pi * 2 + 0.2
-      local len = (i % 3 == 0) and 0.62 or ((i % 2 == 0) and 0.48 or 0.54)
-      ImGui.DrawList_AddLine(dl, cx + math.cos(t) * r * 0.12, cy + math.sin(t) * r * 0.12,
-        cx + math.cos(t) * r * len, cy + math.sin(t) * r * len, 0xFAF9F5FF, math.max(1.2, size / 14))
-    end
-  elseif kind == 'openai' then
-    orb_poly(dl, sq, cx, cy, r, 0x0D0D0DFF)
-    for i = 0, 5 do
-      local t = i / 6 * math.pi * 2
-      ImGui.DrawList_AddCircle(dl, cx + math.cos(t) * r * 0.2, cy + math.sin(t) * r * 0.2, r * 0.36, 0xFFFFFFFF, 0, math.max(1, size / 18))
-    end
-  elseif kind == 'kimi' then
-    orb_poly(dl, sq, cx, cy, r, 0x0D0D0DFF)
-    ImGui.PushFont(ctx, F.bold, math.floor(size * 0.62))
-    local tw = ImGui.CalcTextSize(ctx, 'K')
-    ImGui.DrawList_AddText(dl, cx - tw / 2 - r * 0.08, cy - ImGui.GetTextLineHeight(ctx) / 2, 0xFFFFFFFF, 'K')
-    ImGui.PopFont(ctx)
-    ImGui.DrawList_AddCircleFilled(dl, cx + r * 0.42, cy - r * 0.38, r * 0.14, 0x1783FFFF)
-  else
-    avatar(dl, a, cx, cy, size)
-  end
-end
-end
-
 local function chevron(x2, y1, y2, col)
   local cx, cy = x2 - 11, (y1 + y2) / 2 + 1
   ImGui.DrawList_AddTriangleFilled(ImGui.GetWindowDrawList(ctx), cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5, col)
@@ -2322,22 +2162,57 @@ local function agent_state(a) -- status colour + short text for the menu
   return C.muted, st.state or ''
 end
 
+local function opt_items(o) -- ACP options may be grouped: {group, name, options = {...}}
+  local out = {}
+  for _, x in ipairs(type(o.options) == 'table' and o.options or {}) do
+    if type(x.options) == 'table' then
+      for _, y in ipairs(x.options) do out[#out + 1] = { value = sval(y.value) or '', name = sval(y.name), group = sval(x.name) } end
+    else
+      out[#out + 1] = { value = sval(x.value) or '', name = sval(x.name), group = sval(x.group) }
+    end
+  end
+  return out
+end
+
+-- "Opus 5.5 · medium": what the next message runs with (explicit pick, else the agent's current value)
+local function model_label()
+  local model, effort
+  for _, o in ipairs(S.cfg_opts) do
+    if type(o) == 'table' and o.type == 'select' then
+      if o.category == 'model' and not model then model = o
+      elseif (o.category == 'thought_level' or o.category == 'model_config') and not effort then effort = o end
+    end
+  end
+  local parts = {}
+  for _, o in ipairs({ model or false, effort or false }) do
+    if o then
+      local v = S.cfg_sel[sval(o.id) or o.category] or sval(o.currentValue) or ''
+      for _, it in ipairs(opt_items(o)) do if v ~= '' and it.value == v then parts[#parts + 1] = it.name or v end end
+    end
+  end
+  return table.concat(parts, ' · ')
+end
+
 -- the agent name field in the header: display only (settings live behind the gear button)
 local function agent_picker()
-  local cur
-  for _, a in ipairs(S.agents) do if a.slug == S.agent then cur = a end end
   -- Gamut's agent layer stays hidden: any Gamut agent reads as "Gamut"
   local name = S.agent == '' and 'No agent' or (is_acp() and (S.agent_name ~= '' and S.agent_name or S.agent) or 'Gamut')
-  ImGui.PushFont(ctx, F.bold, FONT_SIZE)
+  local ml = S.agent ~= '' and model_label() or ''
   local h = ImGui.GetFrameHeight(ctx) - 2
-  local w = ImGui.CalcTextSize(ctx, name) + 28 + 8
+  ImGui.PushFont(ctx, F.bold, FONT_SIZE)
+  local nw = ImGui.CalcTextSize(ctx, name)
+  ImGui.PopFont(ctx)
+  local mw = ml ~= '' and (ImGui.CalcTextSize(ctx, ml) + 10) or 0
+  local w = nw + mw + 20
   ImGui.Dummy(ctx, w, h)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
+  local ty = y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2
   ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, C.field, RND)
-  ImGui.DrawList_AddText(dl, x1 + 28, y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2, C.field_text, name)
+  ImGui.PushFont(ctx, F.bold, FONT_SIZE)
+  ImGui.DrawList_AddText(dl, x1 + 10, ty, C.field_text, name)
   ImGui.PopFont(ctx)
-  if cur then provider_icon(dl, cur, x1 + 14, y1 + h / 2, 16) else dot(C.muted, x1 + 14, y1 + h / 2) end
+  if ml ~= '' then ImGui.DrawList_AddText(dl, x1 + 10 + nw + 10, ty, C.value, ml) end
 end
 
 local function history_popup()
@@ -2409,19 +2284,7 @@ local function header()
   ImGui.Dummy(ctx, 0, 0)
 end
 
-local function opt_items(o) -- ACP options may be grouped: {group, name, options = {...}}
-  local out = {}
-  for _, x in ipairs(type(o.options) == 'table' and o.options or {}) do
-    if type(x.options) == 'table' then
-      for _, y in ipairs(x.options) do out[#out + 1] = { value = sval(y.value) or '', name = sval(y.name), group = sval(x.name) } end
-    else
-      out[#out + 1] = { value = sval(x.value) or '', name = sval(x.name), group = sval(x.group) }
-    end
-  end
-  return out
-end
 
--- one chip for model + effort (+ mode); the popup has a section for each
 -- Agent settings pops out as a real window in the style of REAPER's Routing window: small type, two columns of
 -- grey group boxes with labelled rows, white fields, light buttons, LED toggles
 local SMALL = 12
@@ -2557,10 +2420,9 @@ local function cfg_window()
         if it.value == cur then preview = ((ng > 1 and it.group and it.group ~= '') and (it.group .. ' · ') or '') .. (it.name or it.value) end
       end
       ImGui.SetNextItemWidth(ctx, w)
+      local bx, by = ImGui.GetCursorScreenPos(ctx) -- before BeginCombo: once open, the "last item" is in the popup
       local opened = ImGui.BeginCombo(ctx, '##cfg_' .. key, preview, ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
-      local x2, y1 = ImGui.GetItemRectMax(ctx)
-      local _, yy = ImGui.GetItemRectMin(ctx)
-      local cx, cy = x2 - 9, (yy + y1) / 2 -- macOS popup-button arrows
+      local cx, cy = bx + w - 9, by + fh / 2 -- macOS popup-button arrows
       ImGui.DrawList_AddTriangleFilled(dl, cx - 3, cy - 1.5, cx + 3, cy - 1.5, cx, cy - 5, C.win_text)
       ImGui.DrawList_AddTriangleFilled(dl, cx - 3, cy + 1.5, cx + 3, cy + 1.5, cx, cy + 5, C.win_text)
       if opened then
@@ -2611,22 +2473,17 @@ local function cfg_window()
     ImGui.BeginGroup(ctx)
     section('Provider', COL)
     ImGui.SetNextItemWidth(ctx, COL)
-    local opened = ImGui.BeginCombo(ctx, '##cfg_provider', '      ' .. (cur and cur.name or 'Choose a provider'),
+    local px, py = ImGui.GetCursorScreenPos(ctx)
+    local opened = ImGui.BeginCombo(ctx, '##cfg_provider', cur and cur.name or 'Choose a provider',
       ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
-    do
-      local x1, y1 = ImGui.GetItemRectMin(ctx)
-      local x2, y2 = ImGui.GetItemRectMax(ctx)
-      if cur then provider_icon(dl, cur, x1 + 12, (y1 + y2) / 2, 14) end
-      arrows(x2, y1, y2)
-    end
+    arrows(px + COL, py, py + fh)
     if opened then
       local pdl = ImGui.GetWindowDrawList(ctx)
       for _, r in ipairs(provs) do
         local col, state = agent_state(r.real)
-        if ImGui.Selectable(ctx, '       ' .. r.name .. '##prov_' .. r.slug, r == cur) then pick_provider(r) end
-        local sx1, sy1 = ImGui.GetItemRectMin(ctx)
+        if ImGui.Selectable(ctx, r.name .. '##prov_' .. r.slug, r == cur) then pick_provider(r) end
+        local _, sy1 = ImGui.GetItemRectMin(ctx)
         local sx2, sy2 = ImGui.GetItemRectMax(ctx)
-        provider_icon(pdl, r, sx1 + 9, (sy1 + sy2) / 2, 14)
         if state ~= '' then
           local tw = ImGui.CalcTextSize(ctx, state)
           ImGui.DrawList_AddCircleFilled(pdl, sx2 - tw - 10, (sy1 + sy2) / 2, 3, col)
@@ -2649,8 +2506,7 @@ local function cfg_window()
         for _, x_ in ipairs(S.sessions or {}) do if x_.id == S.sid then resume = x_.resume end end
         local btext = need and 'Connect' or (cur.acp and ('Open in ' .. cur.name) or 'Open in Gamut')
         local bw = ImGui.CalcTextSize(ctx, btext) + 16
-        provider_icon(dl, cur, x + 8, y + fh / 2, 14)
-        ImGui.SetCursorScreenPos(ctx, x + 20, y)
+        ImGui.SetCursorScreenPos(ctx, x, y)
         ImGui.AlignTextToFramePadding(ctx)
         ImGui.Text(ctx, cur.name)
         if state ~= '' then
@@ -2677,10 +2533,9 @@ local function cfg_window()
           row('Agent:', function(cw)
             ImGui.SetNextItemWidth(ctx, cw)
             local nm = S.agent_name ~= '' and S.agent_name or S.agent
+            local gx, gy = ImGui.GetCursorScreenPos(ctx)
             local o = ImGui.BeginCombo(ctx, '##cfg_gagent', nm, ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
-            local x2, y2 = ImGui.GetItemRectMax(ctx)
-            local _, y1 = ImGui.GetItemRectMin(ctx)
-            arrows(x2, y1, y2)
+            arrows(gx + cw, gy, gy + fh)
             if o then
               for _, g in ipairs(S.agents) do
                 if not g.acp then

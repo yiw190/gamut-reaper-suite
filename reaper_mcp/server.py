@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """reaper-mcp — stdio MCP server. Zero third-party deps.
 
-Talks to the Lua bridge (lua/bridge.lua, installed in REAPER as reaper_mcp_bridge.lua) over a JSON mailbox. Prefer a handful of grouped
+Talks to the Lua bridge (reaper_mcp/bridge.lua, installed in REAPER as reaper_mcp_bridge.lua) over a JSON mailbox. Prefer a handful of grouped
 tools plus batch / run_lua instead of dumping the whole ReaScript API.
 """
 
@@ -17,6 +17,9 @@ if sys.platform == "win32":
     import msvcrt
 else:
     import fcntl
+
+if not __package__:  # run by path (python3 .../reaper_mcp/server.py): make the package importable
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "reaper-mcp"
@@ -101,7 +104,7 @@ class Bridge:
             )
         raise BridgeError(
             "REAPER bridge not running or heartbeat stale. In REAPER: Actions > "
-            "reaper_mcp_bridge.lua > Run (install it with python/install_bridge.py)."
+            "reaper_mcp_bridge.lua > Run (install it with `reaper-mcp --install-bridge`)."
         )
 
     def _lock(self, timeout: float):

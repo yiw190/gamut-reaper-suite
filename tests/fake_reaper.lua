@@ -1,5 +1,5 @@
 --[[
-  Minimal fake ReaScript API so lua/bridge.lua can be driven headlessly.
+  Minimal fake ReaScript API so reaper_mcp/bridge.lua can be driven headlessly.
 
   Written in Lua, not driven from Python, because ReaScript relies on multiple
   return values and lupa does not unpack Python tuples into those.

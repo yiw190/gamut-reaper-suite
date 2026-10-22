@@ -65,7 +65,7 @@ if [ ! -f "$CFG/config.json" ]; then
     }
   ],
   "mcpServers": [
-    {"name": "reaper", "command": "/usr/bin/python3", "args": ["$REPO/python/server.py"]}
+    {"name": "reaper", "command": "/usr/bin/python3", "args": ["$REPO/reaper_mcp/server.py"]}
   ]
 }
 EOF

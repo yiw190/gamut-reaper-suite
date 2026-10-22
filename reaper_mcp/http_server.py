@@ -13,8 +13,7 @@ from pathlib import Path
 
 PORT = int(os.environ.get("REAPER_MCP_PORT", "8787"))
 BEARER = os.environ.get("REAPER_MCP_BEARER", "")
-ROOT = Path(__file__).resolve().parents[1]
-SERVER = ROOT / "python" / "server.py"
+SERVER = Path(__file__).resolve().parent / "server.py"
 
 
 MAX_BODY = 16 * 1024 * 1024

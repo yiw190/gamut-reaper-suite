@@ -8,7 +8,7 @@ Gamut, Codex or any other ACP agent.
 
 | Path | What |
 | --- | --- |
-| `reaper_mcp/`, `python/`, `lua/bridge.lua` | MCP server (`reaper-mcp`) + the Lua bridge that runs inside REAPER |
+| `reaper_mcp/` | MCP server (`server.py` stdio, `http_server.py` bearer HTTP) + `bridge.lua`, the Lua bridge that runs inside REAPER |
 | `gamut-chat/` | Gamut Chat — chat panel docked in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
 | `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
 | `gateway/` | Agent gateway: one local API for the panel in front of Gamut and ACP agents (Codex, …) |
@@ -17,7 +17,7 @@ Gamut, Codex or any other ACP agent.
 [![ci](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml)
 
 ```
-MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge.lua (inside REAPER)
+MCP client  --stdio JSON-RPC-->  reaper_mcp/server.py  --JSON mailbox-->  reaper_mcp/bridge.lua (inside REAPER)
 ```
 
 Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. Call `status` first; on a new project pass `detail=true` for arrangement facts (time signature, length in beats, markers, MIDI vs audio) — not chords. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
@@ -37,7 +37,7 @@ give an agent the REAPER MCP server in Gamut.
 ## Manual setup (any MCP client)
 
 ```bash
-python3 python/install_bridge.py
+python3 reaper_mcp/install_bridge.py
 ```
 
 Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.3.1 ready`.
@@ -49,7 +49,7 @@ MCP client config (any client that runs stdio servers):
   "mcpServers": {
     "reaper": {
       "command": "python3",
-      "args": ["/absolute/path/to/gamut-reaper-suite/python/server.py"]
+      "args": ["/absolute/path/to/gamut-reaper-suite/reaper_mcp/server.py"]
     }
   }
 }
@@ -127,15 +127,14 @@ else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/
 ## Tests
 
 ```
-python3 python/test_server.py                        # MCP server + fake bridge
-uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
+python3 tests/test_server.py                         # MCP server + fake bridge, versions in step
+uv run --with lupa python tests/test_bridge_lua.py   # bridge.lua against a fake ReaScript API
 uv run --with lupa python gamut-chat/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
 uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses
 ```
 
-CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12, plus a
-check that `lua/bridge.lua` and `reaper_mcp/bridge.lua` are identical.
+CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12.
 
 None of these need REAPER. The Lua-based ones need `lupa` (CI installs it).
 

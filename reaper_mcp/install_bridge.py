@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Copy lua/bridge.lua into REAPER's Scripts folder."""
+"""Copy reaper_mcp/bridge.lua into REAPER's Scripts folder."""
 
 from __future__ import annotations
 
@@ -10,15 +10,10 @@ from pathlib import Path
 
 
 def repo_bridge() -> Path:
-    here = Path(__file__).resolve()
-    candidates = [
-        here.parents[1] / "lua" / "bridge.lua",
-        here.parent / "bridge.lua",
-    ]
-    for p in candidates:
-        if p.is_file():
-            return p
-    raise SystemExit("bridge.lua not found")
+    p = Path(__file__).resolve().parent / "bridge.lua"
+    if not p.is_file():
+        raise SystemExit("bridge.lua not found")
+    return p
 
 
 def scripts_dir() -> Path:

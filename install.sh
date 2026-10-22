@@ -16,7 +16,7 @@ IMGUI_VERSION=0.10.0.5
 mkdir -p "$RES/Scripts/GamutChat" "$RES/UserPlugins" "$CFG" "$LA" "$HOME/Library/Logs"
 
 echo "1/6 REAPER bridge"
-REAPER_RESOURCE_PATH="$RES" /usr/bin/python3 "$REPO/python/install_bridge.py" > /dev/null
+REAPER_RESOURCE_PATH="$RES" /usr/bin/python3 "$REPO/reaper_mcp/install_bridge.py" > /dev/null
 
 echo "2/6 Gamut Chat panel"
 cp "$REPO/gamut-chat/GamutChat.lua" "$RES/Scripts/GamutChat/GamutChat.lua"
@@ -58,7 +58,7 @@ cat > "$LA/$LABEL.plist" << EOF
   <key>ProgramArguments</key>
   <array>
     <string>/usr/bin/python3</string>
-    <string>$REPO/python/http_server.py</string>
+    <string>$REPO/reaper_mcp/http_server.py</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>

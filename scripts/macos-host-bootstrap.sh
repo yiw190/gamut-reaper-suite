@@ -55,11 +55,11 @@ else
   git -C "$REPO" pull --ff-only || echo "WARNING: could not fast-forward $REPO; running the checked-out version" >&2
 fi
 
-if [ ! -f "$REPO/python/http_server.py" ]; then
-  echo "missing $REPO/python/http_server.py" >&2
+if [ ! -f "$REPO/reaper_mcp/http_server.py" ]; then
+  echo "missing $REPO/reaper_mcp/http_server.py" >&2
   exit 1
 fi
-chmod +x "$REPO/python/http_server.py"
+chmod +x "$REPO/reaper_mcp/http_server.py"
 
 umask 077
 cat > "$CFG/env" << ENVEOF
@@ -110,7 +110,7 @@ def plist(label, args, env, logfile):
 
 (launch / "com.yitian.reaper-mcp.plist").write_text(plist(
     "com.yitian.reaper-mcp",
-    ["/usr/bin/python3", str(repo / "python/http_server.py")],
+    ["/usr/bin/python3", str(repo / "reaper_mcp/http_server.py")],
     {"REAPER_MCP_BEARER": vals["REAPER_MCP_BEARER"], "REAPER_MCP_PORT": vals["REAPER_MCP_PORT"]},
     str(logdir / "reaper-mcp-http"),
 ))
@@ -137,8 +137,8 @@ curl -sS -i "http://127.0.0.1:${REAPER_MCP_PORT}/healthz" | head -20 || true
 REAPER_SCRIPTS="$HOME/Library/Application Support/REAPER/Scripts"
 if [ -d "/Applications/REAPER.app" ] || [ -d "$HOME/Applications/REAPER.app" ] || [ -d "$HOME/Library/Application Support/REAPER" ]; then
   mkdir -p "$REAPER_SCRIPTS"
-  if ! python3 "$REPO/python/install_bridge.py"; then
-    cp "$REPO/lua/bridge.lua" "$REAPER_SCRIPTS/reaper_mcp_bridge.lua"
+  if ! python3 "$REPO/reaper_mcp/install_bridge.py"; then
+    cp "$REPO/reaper_mcp/bridge.lua" "$REAPER_SCRIPTS/reaper_mcp_bridge.lua"
   fi
   echo "bridge ready"
 else

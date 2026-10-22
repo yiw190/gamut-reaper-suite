@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Headless tests for lua/bridge.lua, driven through the real mailbox.
+"""Headless tests for reaper_mcp/bridge.lua, driven through the real mailbox.
 
 Loads the bridge into a Lua interpreter with a fake ReaScript API
-(python/fake_reaper.lua), then sends requests exactly like server.py does.
+(tests/fake_reaper.lua), then sends requests exactly like server.py does.
 
 Needs lupa; skips cleanly when it is absent so a bare CI job still passes.
 
-    uv run --with lupa python python/test_bridge_lua.py
+    uv run --with lupa python tests/test_bridge_lua.py
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-BRIDGE = ROOT / "lua" / "bridge.lua"
+BRIDGE = ROOT / "reaper_mcp" / "bridge.lua"
 FAKE = Path(__file__).resolve().parent / "fake_reaper.lua"
 
 PPQ = 960.0
@@ -43,7 +43,7 @@ def main() -> None:
     try:
         import lupa
     except ImportError:
-        print("SKIP  install lupa: uv run --with lupa python python/test_bridge_lua.py")
+        print("SKIP  install lupa: uv run --with lupa python tests/test_bridge_lua.py")
         return
 
     ipc_dir = tempfile.mkdtemp(prefix="reaper_lua_")

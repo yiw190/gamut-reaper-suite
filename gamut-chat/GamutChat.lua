@@ -175,7 +175,7 @@ local S = {
   msgs = {}, live = {}, queued = {}, -- queued: user messages sent while a turn runs, shown after it
   active = false, waiting = false, err = nil,
   input = '', focus = true, scroll = true,
-  ctx_level = tonumber(reaper.GetExtState(EXT, 'ctx_level')) or 1, -- 0 off, 1 simple, 2 all details
+  ctx_level = math.min(tonumber(reaper.GetExtState(EXT, 'ctx_level')) or 1, 1), -- 0 off, 1 on (old 2 = detail folds into 1)
   sessions = {}, sess_at = 0,
   stream = { pid = nil, file = nil, off = 0, buf = '', check = 0 },
   cfg_opts = {}, cfg_sel = {}, perms = {}, auth = nil, acp_status = {},
@@ -283,7 +283,7 @@ end
 
 local function tool_label(name)
   if type(name) ~= 'string' then return 'tool' end
-  return (name:gsub('^mcp__reaper_mcp__', 'reaper · '):gsub('^mcp__', ''))
+  return (name:gsub('^mcp__[%w_-]-__', ''))
 end
 
 -- Gamut's agent deep link (SuperAgent src/main/agent-deep-link.ts) focuses the app on this exact session
@@ -415,14 +415,6 @@ local NOTE = { 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B' }
 local function note_name(p) return NOTE[p % 12 + 1] .. (p // 12 - 1) end
 local function trnum(tr) return math.floor(reaper.GetMediaTrackInfo_Value(tr, 'IP_TRACKNUMBER')) end
 
-local function db(v) return v > 0 and ('%.1f dB'):format(20 * math.log(v, 10)) or '-inf dB' end
-local function pan_str(p) return math.abs(p) < 0.005 and 'C' or ('%d%%%s'):format(math.floor(math.abs(p) * 100 + 0.5), p < 0 and 'L' or 'R') end
-local function qn_frac(qn) -- 0.25 qn -> 1/16
-  if not qn or qn <= 0 then return '?' end
-  local d = 4 / qn
-  if math.abs(d - math.floor(d + 0.5)) < 1e-6 then return '1/' .. math.floor(d + 0.5) end
-  return ('%.4g qn'):format(qn)
-end
 local function cc_kind(chanmsg, m2, m3)
   if chanmsg == 0xB0 then return ('CC%d = %d'):format(m2, m3)
   elseif chanmsg == 0xE0 then return ('pitch bend = %d'):format(((m3 << 7) | m2) - 8192)
@@ -432,7 +424,7 @@ local function cc_kind(chanmsg, m2, m3)
   return ('0x%X %d %d'):format(chanmsg, m2, m3)
 end
 
-local function midi_ctx(proj, full, all)
+local function midi_ctx(proj, full)
   local ed = reaper.MIDIEditor_GetActive()
   if not ed then return nil end
   local take = reaper.MIDIEditor_GetTake(ed)
@@ -444,7 +436,7 @@ local function midi_ctx(proj, full, all)
   local idx = reaper.MIDI_EnumSelNotes(take, -1)
   while idx ~= -1 do
     sel = sel + 1
-    if full and #list < (all and 128 or 32) then
+    if full and #list < 64 then
       local _, _, _, sp, ep, ch, pitch, vel = reaper.MIDI_GetNote(take, idx)
       local t0 = reaper.MIDI_GetProjTimeFromPPQPos(take, sp)
       local t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
@@ -460,7 +452,7 @@ local function midi_ctx(proj, full, all)
     local _, tk = reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false)
     r.take = tk
   end
-  if all then
+  if full then
     local _, _, nccs = reaper.MIDI_CountEvts(take)
     r.cc_total, r.cc_sel, r.cc_list = nccs, 0, {}
     local ci = reaper.MIDI_EnumSelCC(take, -1)
@@ -473,11 +465,6 @@ local function midi_ctx(proj, full, all)
       end
       ci = reaper.MIDI_EnumSelCC(take, ci)
     end
-    local grid, swing, notelen = reaper.MIDI_GetGrid(take)
-    local snap = reaper.MIDIEditor_GetSetting_int(ed, 'snap_enabled')
-    r.grid = ('grid %s%s, snap %s, note length %s'):format(qn_frac(grid),
-      (swing and swing ~= 0) and (', swing %d%%'):format(math.floor(swing * 100 + 0.5)) or '',
-      snap == 1 and 'on' or 'off', (notelen and notelen > 0) and qn_frac(notelen) or 'grid')
   end
   return r
 end
@@ -505,53 +492,6 @@ local function envelope_ctx(proj)
   end
   return { head = ('selected envelope: %s on %s — %d of %d points selected%s'):format(ename, owner, sel, n,
     sel > #list and (' (first ' .. #list .. ' listed)') or '') .. (sel > 0 and ':' or ''), list = list }
-end
-
-local function track_detail(t)
-  local _, tn = reaper.GetTrackName(t)
-  local fx = {}
-  for f = 0, reaper.TrackFX_GetCount(t) - 1 do
-    local _, fn = reaper.TrackFX_GetFXName(t, f)
-    fn = fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')
-    fx[#fx + 1] = fn .. (reaper.TrackFX_GetEnabled(t, f) and '' or ' (bypassed)')
-  end
-  local flags = {}
-  if reaper.GetMediaTrackInfo_Value(t, 'B_MUTE') == 1 then flags[#flags + 1] = 'muted' end
-  if reaper.GetMediaTrackInfo_Value(t, 'I_SOLO') > 0 then flags[#flags + 1] = 'solo' end
-  if reaper.GetMediaTrackInfo_Value(t, 'I_RECARM') == 1 then flags[#flags + 1] = 'armed' end
-  local ni = reaper.CountTrackMediaItems(t)
-  return ('  #%d %s: %s, pan %s, %d %s%s; FX: %s'):format(trnum(t), tn, db(reaper.GetMediaTrackInfo_Value(t, 'D_VOL')),
-    pan_str(reaper.GetMediaTrackInfo_Value(t, 'D_PAN')), ni, ni == 1 and 'item' or 'items',
-    #flags > 0 and (', ' .. table.concat(flags, ', ')) or '', #fx > 0 and table.concat(fx, ', ') or 'none')
-end
-
-local function item_detail(m)
-  local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
-  local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
-  local len = reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
-  local take = reaper.GetActiveTake(m)
-  local src, tk, extra = 'empty', '', {}
-  if take then
-    tk = select(2, reaper.GetSetMediaItemTakeInfo_String(take, 'P_NAME', '', false))
-    if reaper.TakeIsMIDI(take) then
-      local _, nn = reaper.MIDI_CountEvts(take)
-      src = ('MIDI, %d notes'):format(nn)
-    else
-      local s_ = reaper.GetMediaItemTake_Source(take)
-      local f = s_ and reaper.GetMediaSourceFileName(s_) or ''
-      src = f ~= '' and f:match('[^/]+$') or 'audio'
-    end
-    local rate = reaper.GetMediaItemTakeInfo_Value(take, 'D_PLAYRATE')
-    local pitch = reaper.GetMediaItemTakeInfo_Value(take, 'D_PITCH')
-    if math.abs(rate - 1) > 1e-6 then extra[#extra + 1] = ('rate %.3g'):format(rate) end
-    if math.abs(pitch) > 1e-6 then extra[#extra + 1] = ('pitch %+.2f st'):format(pitch) end
-    extra[#extra + 1] = 'take gain ' .. db(reaper.GetMediaItemTakeInfo_Value(take, 'D_VOL'))
-  end
-  extra[#extra + 1] = 'item gain ' .. db(reaper.GetMediaItemInfo_Value(m, 'D_VOL'))
-  local fi, fo = reaper.GetMediaItemInfo_Value(m, 'D_FADEINLEN'), reaper.GetMediaItemInfo_Value(m, 'D_FADEOUTLEN')
-  if fi > 0 or fo > 0 then extra[#extra + 1] = ('fades %.3gs/%.3gs'):format(fi, fo) end
-  if reaper.GetMediaItemInfo_Value(m, 'B_MUTE') == 1 then extra[#extra + 1] = 'muted' end
-  return ('  %s @ %s–%s, take "%s" (%s), %s'):format(tn, pos(p0), pos(p0 + len), tk, src, table.concat(extra, ', '))
 end
 
 local function marker_ctx(proj, cur)
@@ -621,15 +561,93 @@ local function sel_sigs(proj)
   return g
 end
 
+local function spos(t) return (pos(t):gsub('%.00$', '')) end
+
+local SEL_HELP = {
+  razor = 'Razor area: a rectangle, this time range on these tracks only.\nDraw one with Alt + right-drag in the arrange view.',
+  time = 'Time selection: this time range across ALL tracks.\nDrag on the ruler or on empty arrange space.',
+  tracks = 'Selected tracks: whole tracks, picked by clicking the track header.',
+  items = 'Selected items: individual clips on the timeline.',
+  notes = 'Selected MIDI notes in the open MIDI editor.',
+  env = 'Selected envelope (automation lane).',
+  fx = 'Focused FX window.',
+}
+
+-- one pill per selection kind for the row above the input; rebuilt when a selection changes
+local function sel_pills(proj)
+  local P = {}
+  local function add(k, label, detail) P[#P + 1] = { k = k, label = label, detail = detail } end
+  local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
+  local rz, rt = {}, {}
+  for i = 0, reaper.CountTracks(proj) - 1 do
+    local tr = reaper.GetTrack(proj, i)
+    local _, v = reaper.GetSetMediaTrackInfo_String(tr, 'P_RAZOREDITS', '', false)
+    if v and v ~= '' then
+      local _, tn = reaper.GetTrackName(tr)
+      rt[#rt + 1] = ('#%d %s'):format(i + 1, tn)
+      for sa, sb in v:gmatch('(%S+) (%S+) "[^"]*"') do
+        local a, b = tonumber(sa), tonumber(sb)
+        rz.t0, rz.t1 = math.min(rz.t0 or a, a), math.max(rz.t1 or b, b)
+      end
+    end
+  end
+  if #rt > 0 then
+    add('razor', ('Razor  %s–%s · %s'):format(spos(rz.t0), spos(rz.t1), #rt == 1 and rt[1]:gsub('^#%d+ ', '') or (#rt .. ' tracks')),
+      table.concat(rt, '\n'))
+  end
+  if e > s then add('time', ('Time  %s–%s'):format(spos(s), spos(e))) end
+  local nt = reaper.CountSelectedTracks(proj)
+  if nt > 0 then
+    local names = {}
+    for i = 0, math.min(nt, 12) - 1 do
+      local t = reaper.GetSelectedTrack(proj, i)
+      names[#names + 1] = ('#%d %s'):format(trnum(t), select(2, reaper.GetTrackName(t)))
+    end
+    add('tracks', nt == 1 and ('Track  ' .. names[1]:gsub('^#%d+ ', '')) or ('Tracks  ' .. nt), table.concat(names, '\n'))
+  end
+  local ni = reaper.CountSelectedMediaItems(proj)
+  if ni > 0 then
+    local m = reaper.GetSelectedMediaItem(proj, 0)
+    local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
+    local _, tn = reaper.GetTrackName(reaper.GetMediaItem_Track(m))
+    add('items', ni == 1 and ('Item  %s %s–%s'):format(tn, spos(p0), spos(p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')))
+      or ('Items  ' .. ni))
+  end
+  local ed = reaper.MIDIEditor_GetActive()
+  local take = ed and reaper.MIDIEditor_GetTake(ed)
+  if SEL.sig.notes and SEL.sig.notes ~= '' and take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
+    local n, idx = 0, reaper.MIDI_EnumSelNotes(take, -1)
+    while idx ~= -1 do n = n + 1; idx = reaper.MIDI_EnumSelNotes(take, idx) end
+    local _, tn = reaper.GetTrackName(reaper.GetMediaItemTake_Track(take))
+    add('notes', ('Notes  %d in %s'):format(n, tn))
+  end
+  local env = reaper.GetSelectedEnvelope(proj)
+  if env then add('env', 'Envelope  ' .. select(2, reaper.GetEnvelopeName(env))) end
+  local rv, tnum, _, fnum = reaper.GetFocusedFX2()
+  if rv and rv ~= 0 and rv & 2 == 0 then
+    local tr = tnum == 0 and reaper.GetMasterTrack(proj) or reaper.GetTrack(proj, tnum - 1)
+    if tr then
+      local _, fn = reaper.TrackFX_GetFXName(tr, fnum)
+      add('fx', 'FX  ' .. (fn:gsub('^%w+i?: ', ''):gsub(' %(.-%)$', '')))
+    end
+  end
+  return P
+end
+
 local function sel_tick(force)
   local now = reaper.time_precise()
   if not force and now - SEL.t < 0.25 then return end
   SEL.t = now
-  local g = sel_sigs(reaper.EnumProjects(-1))
+  local proj = reaper.EnumProjects(-1)
+  local g = sel_sigs(proj)
+  local changed = false
   for _, k in ipairs(SEL_KINDS) do
-    if SEL.sig[k] == nil then SEL.at[k] = false -- already like this when the panel opened
-    elseif SEL.sig[k] ~= g[k] then SEL.at[k] = now end
+    if SEL.sig[k] == nil then SEL.at[k] = false; changed = true -- already like this when the panel opened
+    elseif SEL.sig[k] ~= g[k] then SEL.at[k] = now; changed = true end
     SEL.sig[k] = g[k]
+  end
+  if changed or now - (SEL.pills_at or 0) > 2 then -- names can change without the selection changing
+    SEL.pills, SEL.pills_at = sel_pills(proj), now
   end
 end
 
@@ -774,8 +792,8 @@ local function fx_ctx(proj, full)
   return r
 end
 
--- full=false: cheap chip summary; full=true: the context block; all=true: + CC/envelope points, grids, track and item detail
-local function context(full, all)
+-- full=false: cheap chip summary; full=true: the context block
+local function context(full)
   local proj = reaper.EnumProjects(-1)
   local name = reaper.GetProjectName(proj):gsub('%.[Rr][Pp][Pp]$', '')
   if name == '' then name = '(unsaved)' end
@@ -791,10 +809,6 @@ local function context(full, all)
   }
   local chip = { name, ('%g BPM'):format(bpm), pos(cur) }
 
-  if all then
-    local _, div = reaper.GetSetProjectGrid(proj, false)
-    L[#L + 1] = ('arrange grid: %s, snap %s'):format(qn_frac((div or 0) * 4), reaper.GetToggleCommandState(1157) == 1 and 'on' or 'off')
-  end
 
   if full then
     sel_tick(true)
@@ -853,18 +867,11 @@ local function context(full, all)
     for _, x in ipairs(tr) do names[#names + 1] = x[1] end
     L[#L + 1] = 'selected tracks: ' .. table.concat(names, ', ') .. (full and set_ago('tracks') or '')
     chip[#chip + 1] = #tr == 1 and tr[1][2] or (#tr .. ' tracks')
-    if all then
-      for i = 0, math.min(#tr, 8) - 1 do L[#L + 1] = track_detail(reaper.GetSelectedTrack(proj, i)) end
-    end
   end
 
   local n = reaper.CountSelectedMediaItems(proj)
   if n > 0 then
-    if all then
-      L[#L + 1] = ('selected items (%d)%s:'):format(n, set_ago('items'))
-      for i = 0, math.min(n, 32) - 1 do L[#L + 1] = item_detail(reaper.GetSelectedMediaItem(proj, i)) end
-      if n > 32 then L[#L + 1] = ('  … +%d more'):format(n - 32) end
-    elseif full then
+    if full then
       local it = {}
       for i = 0, math.min(n, 8) - 1 do
         local m = reaper.GetSelectedMediaItem(proj, i)
@@ -879,7 +886,7 @@ local function context(full, all)
     chip[#chip + 1] = n .. (n == 1 and ' item' or ' items')
   end
 
-  local md = midi_ctx(proj, full, all)
+  local md = midi_ctx(proj, full)
   if md then
     if md.sel > 0 then
       chip[#chip + 1] = md.sel .. (md.sel == 1 and ' note' or ' notes')
@@ -892,9 +899,8 @@ local function context(full, all)
     elseif full then
       L[#L + 1] = ('MIDI editor open: %s, item @ %s, take "%s", %d notes, none selected'):format(md.track, md.item, md.take, md.total)
     end
-    if all then
-      L[#L + 1] = 'MIDI editor ' .. md.grid
-      if md.cc_sel > 0 then
+    if full and md.cc_sel > 0 then
+      do
         L[#L + 1] = ('MIDI CC: %d of %d events selected%s:'):format(md.cc_sel, md.cc_total,
           md.cc_sel > #md.cc_list and (' (first ' .. #md.cc_list .. ' listed)') or '')
         for _, x in ipairs(md.cc_list) do L[#L + 1] = x end
@@ -902,7 +908,7 @@ local function context(full, all)
     end
   end
 
-  if all then
+  if full then
     local ev = envelope_ctx(proj)
     if ev then
       L[#L + 1] = ev.head:gsub(':$', '') .. set_ago('env') .. (ev.head:find(':$') and ':' or '')
@@ -1020,7 +1026,7 @@ local function send()
   S.last_sent, S.last_sent_at = text, now
   local payload = text
   if S.ctx_level > 0 then
-    local ctx_text = context(true, S.ctx_level == 2)
+    local ctx_text = context(true)
     payload = CTX_OPEN .. '\n' .. CTX_NOTE .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
   end
   if #S.files == 0 then return deliver(payload, text, text) end
@@ -1385,6 +1391,7 @@ local function lum(c) return (((c >> 24) & 255) * 299 + ((c >> 16) & 255) * 587 
 local function alpha(c, a) return (c & 0xFFFFFF00) | a end
 
 local C, COLORS, theme_file, theme_at, pal_ver = {}, {}, nil, 0, 0
+local RND, RND_STRIP = 5, 8 -- corner radius: buttons/fields/lanes, and the header/composer strips
 local function build_palette()
   local bg = native('col_tracklistbg', 0x3B3B3BFF)
   local dark = lum(bg) < 128
@@ -1404,13 +1411,28 @@ local function build_palette()
   C.danger = dark and 0xF47067FF or 0xCF222EFF
   C.ok = dark and 0x3FB950FF or 0x1A7F37FF
   C.warn = dark and 0xD29922FF or 0x9A6700FF
-  C.dark_pill = dark and 0x0D1117FF or 0x24292FFF
   C.selection = alpha(C.accent, 0x55)
   C.body = alpha(C.text, 0xE6)
+  -- track-panel look, sampled from Reapertips / Default 7: grey strips on the track-list background, dark name
+  -- fields, bevelled M/S-style buttons, near-black envelope lanes, light-blue values
+  C.strip = dark and 0x757575FF or 0xE1E4E8FF
+  C.strip_text = dark and 0x1E1E1EFF or 0x1F2328FF
+  C.field = dark and 0x2E2E2EFF or 0xFFFFFFFF
+  C.field_text = dark and 0xEAEAEAFF or 0x1F2328FF
+  C.btn = dark and 0x4A4A4AFF or 0xF6F8FAFF
+  C.btn_hover = dark and 0x575757FF or 0xEAEEF2FF
+  C.btn_down = dark and 0x3A3A3AFF or 0xDDE1E5FF
+  C.btn_hi = dark and 0x666666FF or 0xFFFFFFFF
+  C.btn_lo = dark and 0x171717FF or 0xBFC5CCFF
+  C.btn_text = dark and 0xC8C8C8FF or 0x57606AFF
+  C.lane = dark and 0x212121FF or 0xF0F2F4FF
+  C.lane_text = dark and 0x9C9C9CFF or 0x6E7781FF
+  C.value = dark and 0x93BFF9FF or 0x0969DAFF
+  C.user = C.field
   COLORS = {
     { ImGui.Col_WindowBg, C.bg }, { ImGui.Col_ChildBg, 0x00000000 }, { ImGui.Col_PopupBg, C.panel },
     { ImGui.Col_Text, C.text }, { ImGui.Col_TextDisabled, C.muted }, { ImGui.Col_Border, C.border },
-    { ImGui.Col_FrameBg, C.input }, { ImGui.Col_FrameBgHovered, C.input }, { ImGui.Col_FrameBgActive, C.input },
+    { ImGui.Col_FrameBg, C.field }, { ImGui.Col_FrameBgHovered, C.field }, { ImGui.Col_FrameBgActive, C.field },
     { ImGui.Col_Button, C.panel }, { ImGui.Col_ButtonHovered, C.hover }, { ImGui.Col_ButtonActive, C.border },
     { ImGui.Col_Header, alpha(C.accent, 0x55) }, { ImGui.Col_HeaderHovered, alpha(C.accent, 0x33) },
     { ImGui.Col_HeaderActive, alpha(C.accent, 0x77) },
@@ -1437,7 +1459,7 @@ build_palette()
 load_theme_fonts()
 
 local VARS = {
-  { ImGui.StyleVar_FrameRounding, 6 }, { ImGui.StyleVar_ChildRounding, 6 }, { ImGui.StyleVar_PopupRounding, 6 },
+  { ImGui.StyleVar_FrameRounding, RND }, { ImGui.StyleVar_ChildRounding, RND }, { ImGui.StyleVar_PopupRounding, RND_STRIP },
   { ImGui.StyleVar_WindowPadding, 10, 10 }, { ImGui.StyleVar_FramePadding, 8, 5 },
   { ImGui.StyleVar_ItemSpacing, 8, 6 }, { ImGui.StyleVar_WindowBorderSize, 0 },
 }
@@ -1827,26 +1849,14 @@ local function bubble(holder, text)
   local L = holder._bubble
   if not L or L.w ~= w or L.text ~= text or L.pal ~= pal_ver then
     local pad, sub = 8, {}
-    local y = layout_inline(sub, { { text = text } }, pad, pad, w - 2 * pad, FONT_SIZE, C.text)
-    local ops = { { 'r', 0, 0, w, y + pad, C.user, 8 } }
+    local y = layout_inline(sub, { { text = text } }, pad, pad, w - 2 * pad, FONT_SIZE, C.field_text)
+    local ops = { { 'r', 0, 0, w, y + pad, C.user, RND_STRIP } }
     for _, o in ipairs(sub) do ops[#ops + 1] = o end
     L = { w = w, text = text, pal = pal_ver, ops = ops, h = y + pad }
     holder._bubble = L
   end
   draw_ops(L, w)
   if ImGui.IsItemClicked(ctx, 1) then ImGui.SetClipboardText(ctx, text) end
-end
-
-local function tools_line(m)
-  if not m.tools or #m.tools == 0 then return end
-  if not m._tools then
-    local names = {}
-    for _, n in ipairs(m.tools) do names[#names + 1] = tool_label(n) end
-    m._tools = '→ ' .. table.concat(names, ' · ')
-  end
-  ImGui.PushTextWrapPos(ctx, 0)
-  ImGui.TextDisabled(ctx, m._tools)
-  ImGui.PopTextWrapPos(ctx)
 end
 
 ---------------------------------------------------------------- UI
@@ -1889,56 +1899,88 @@ local function push_btn(bg, hovered, active, text) -- pop with ImGui.PopStyleCol
   ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, active)
   ImGui.PushStyleColor(ctx, ImGui.Col_Text, text)
 end
-local function flat_push(col)
-  push_btn(0, C.hover, C.hover, col or C.muted)
-  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 6, 3)
+-- tool calls draw like an envelope lane under the reply; a run of calls collapses into one lane with counts
+local function tool_lane(labels, id)
+  local order, cnt = {}, {}
+  for _, l in ipairs(labels) do
+    if not cnt[l] then cnt[l] = 0; order[#order + 1] = l end
+    cnt[l] = cnt[l] + 1
+  end
+  local parts = {}
+  for _, l in ipairs(order) do parts[#parts + 1] = cnt[l] > 1 and (l .. ' ×' .. cnt[l]) or l end
+  local count = #labels == 1 and '1 call' or (#labels .. ' calls')
+  local w = ImGui.GetContentRegionAvail(ctx)
+  local h = ImGui.GetTextLineHeight(ctx) + 6
+  local x1, y1 = ImGui.GetCursorScreenPos(ctx)
+  ImGui.InvisibleButton(ctx, '##lane_' .. id, w, h)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, C.lane, RND)
+  local cw = ImGui.CalcTextSize(ctx, count)
+  local ty = y1 + 3
+  ImGui.DrawList_AddText(dl, x1 + 8, ty, C.lane_text, truncate(table.concat(parts, ' · '), w - cw - 28))
+  ImGui.DrawList_AddText(dl, x1 + w - cw - 8, ty, C.value, count)
+  if ImGui.IsItemHovered(ctx) and #labels > 1 then
+    local seq = {}
+    for i = 1, math.min(#labels, 60) do seq[#seq + 1] = labels[i] end
+    show_tip(table.concat(seq, ' → ') .. (#labels > 60 and (' … +' .. (#labels - 60)) or ''))
+  end
 end
-local function flat_pop()
-  ImGui.PopStyleVar(ctx)
-  ImGui.PopStyleColor(ctx, 4)
-end
+
 local function chevron(x2, y1, y2, col)
   local cx, cy = x2 - 11, (y1 + y2) / 2 + 1
   ImGui.DrawList_AddTriangleFilled(ImGui.GetWindowDrawList(ctx), cx - 3.5, cy - 2, cx + 3.5, cy - 2, cx, cy + 2.5, col)
 end
 local function dot(col, x, y) ImGui.DrawList_AddCircleFilled(ImGui.GetWindowDrawList(ctx), x, y, 3.5, col) end
 
--- frameless muted button; chevron=false for toggles
+-- bevelled button like the track panel's M/S: black bottom edge, light top edge, dark face
+local function bevel(dl, x1, y1, x2, y2, face)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x2, y2, C.btn_lo, RND)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x2, y2 - 1, C.btn_hi, RND)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1 + 1, x2, y2 - 1, face, RND)
+end
+local function face_col()
+  return ImGui.IsItemActive(ctx) and C.btn_down or (ImGui.IsItemHovered(ctx) and C.btn_hover or C.btn)
+end
+
+-- DAW button; col = C.accent marks a toggle that is on (blue label), chevron=false for toggles/plain buttons
 local function chip(id, label, col, with_chevron)
-  flat_push(col)
+  local chev = with_chevron ~= false
   ImGui.PushFont(ctx, font_for(label), FONT_SIZE)
-  local clicked = ImGui.Button(ctx, label .. (with_chevron == false and '' or '     ') .. '##chip_' .. id)
+  local tw = ImGui.CalcTextSize(ctx, label)
+  local h = ImGui.GetFrameHeight(ctx) - 2
+  local w = tw + 18 + (chev and 14 or 0)
+  local clicked = ImGui.InvisibleButton(ctx, '##chip_' .. id, w, h)
+  local x1, y1 = ImGui.GetItemRectMin(ctx)
+  local dl = ImGui.GetWindowDrawList(ctx)
+  bevel(dl, x1, y1, x1 + w, y1 + h, face_col())
+  local tc = col == C.accent and C.value or (col == C.text and C.field_text or C.btn_text)
+  ImGui.DrawList_AddText(dl, x1 + 9, y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2, tc, label)
   ImGui.PopFont(ctx)
-  flat_pop()
-  if with_chevron ~= false then
-    local _, y1 = ImGui.GetItemRectMin(ctx)
-    local x2, y2 = ImGui.GetItemRectMax(ctx)
-    chevron(x2, y1, y2, col or C.muted)
-  end
+  if chev then chevron(x1 + w, y1, y1 + h, C.btn_text) end
   return clicked
 end
 
+local function draw_icon(dl, kind, cx, cy, col)
+  if kind == 'clock' then
+    ImGui.DrawList_AddCircle(dl, cx, cy, 6, col, 0, 1.5)
+    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx, cy - 3, col, 1.5)
+    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx + 2.5, cy + 2, col, 1.5)
+  elseif kind == 'plus' then
+    ImGui.DrawList_AddLine(dl, cx - 5, cy, cx + 5, cy, col, 1.6)
+    ImGui.DrawList_AddLine(dl, cx, cy - 5, cx, cy + 5, col, 1.6)
+  else
+    ImGui.DrawList_AddRectFilled(dl, cx - 4, cy - 4, cx + 4, cy + 4, col, 1.5)
+  end
+end
+
 local function icon_button(id, kind, col, tip)
-  local sz = ImGui.GetFrameHeight(ctx)
+  local sz = ImGui.GetFrameHeight(ctx) - 2
   local clicked = ImGui.InvisibleButton(ctx, '##icon_' .. id, sz, sz)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
-  if ImGui.IsItemHovered(ctx) then
-    ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + sz, y1 + sz, C.hover, 6)
-    if tip then show_tip(tip) end
-  end
-  local cx, cy = x1 + sz / 2, y1 + sz / 2
-  col = col or C.muted
-  if kind == 'clock' then
-    ImGui.DrawList_AddCircle(dl, cx, cy, 6.5, col, 0, 1.5)
-    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx, cy - 3.5, col, 1.5)
-    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx + 3, cy + 2, col, 1.5)
-  elseif kind == 'plus' then
-    ImGui.DrawList_AddLine(dl, cx - 5.5, cy, cx + 5.5, cy, col, 1.6)
-    ImGui.DrawList_AddLine(dl, cx, cy - 5.5, cx, cy + 5.5, col, 1.6)
-  else
-    ImGui.DrawList_AddRectFilled(dl, cx - 4.5, cy - 4.5, cx + 4.5, cy + 4.5, col, 2)
-  end
+  bevel(dl, x1, y1, x1 + sz, y1 + sz, face_col())
+  if tip and ImGui.IsItemHovered(ctx) then show_tip(tip) end
+  draw_icon(dl, kind, x1 + sz / 2, y1 + sz / 2, col or C.btn_text)
   return clicked
 end
 
@@ -1958,15 +2000,19 @@ local function agent_picker()
   local cur
   for _, a in ipairs(S.agents) do if a.slug == S.agent then cur = a end end
   local name = S.agent == '' and 'Choose an agent' or (S.agent_name ~= '' and S.agent_name or S.agent)
-  flat_push(C.text)
-  ImGui.PushFont(ctx, font_for(name), FONT_SIZE)
-  local clicked = ImGui.Button(ctx, '    ' .. name .. '     ##agentpick')
-  ImGui.PopFont(ctx)
-  flat_pop()
+  -- the track-name field: dark, light bold text, status dot where the track icon sits
+  ImGui.PushFont(ctx, F.bold, FONT_SIZE)
+  local h = ImGui.GetFrameHeight(ctx) - 2
+  local w = ImGui.CalcTextSize(ctx, name) + 22 + 20
+  local clicked = ImGui.InvisibleButton(ctx, '##agentpick', w, h)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
-  local x2, y2 = ImGui.GetItemRectMax(ctx)
+  local x2, y2 = x1 + w, y1 + h
+  local dl = ImGui.GetWindowDrawList(ctx)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x2, y2, ImGui.IsItemHovered(ctx) and C.btn_down or C.field, RND)
+  ImGui.DrawList_AddText(dl, x1 + 22, y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2, C.field_text, name)
+  ImGui.PopFont(ctx)
   dot(cur and agent_dot(cur) or C.muted, x1 + 11, (y1 + y2) / 2)
-  chevron(x2, y1, y2, C.muted)
+  chevron(x2, y1, y2, C.lane_text)
   if clicked then
     ImGui.OpenPopup(ctx, 'agentpop')
     load_agents()
@@ -2039,32 +2085,46 @@ local function history_popup()
 end
 
 local function header()
+  -- a track-panel strip: grey band, dark name field on the left, button column on the right
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local hx, hy = ImGui.GetCursorScreenPos(ctx)
+  local hw = ImGui.GetContentRegionAvail(ctx)
+  local fh = ImGui.GetFrameHeight(ctx) - 2
+  local hh = fh + 10
+  ImGui.DrawList_AddRectFilled(dl, hx - 4, hy - 4, hx + hw + 4, hy + hh - 4, C.strip, RND_STRIP)
+  ImGui.SetCursorScreenPos(ctx, hx + 1, hy + 1)
   agent_picker()
-  if S.agent == '' then return end
-  local sz = ImGui.GetFrameHeight(ctx)
-  local n = S.active and 3 or 2
-  local right = n * sz + (n - 1) * 2
-  ImGui.SameLine(ctx)
-  local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
-  local room = ImGui.GetContentRegionAvail(ctx) - right - 8
-  if room > 40 then
-    ImGui.AlignTextToFramePadding(ctx)
-    ImGui.TextDisabled(ctx, truncate(title, room))
-    if ImGui.IsItemHovered(ctx) then show_tip(title) end
-    ImGui.SameLine(ctx)
+  if S.agent ~= '' then
+    local n = S.active and 3 or 2
+    local right = n * fh + (n - 1) * 3
+    ImGui.SameLine(ctx, 0, 8)
+    local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
+    local room = ImGui.GetContentRegionAvail(ctx) - right - 16
+    if room > 40 then
+      local tx, ty = ImGui.GetCursorScreenPos(ctx)
+      local t = truncate(title, room)
+      ImGui.InvisibleButton(ctx, '##title', ImGui.CalcTextSize(ctx, t), fh)
+      ImGui.DrawList_AddText(dl, tx, ty + (fh - ImGui.GetTextLineHeight(ctx)) / 2, C.strip_text, t)
+      if ImGui.IsItemHovered(ctx) then show_tip(title) end
+      ImGui.SameLine(ctx)
+    end
+    local bx = hx + hw - right - 1
+    ImGui.DrawList_AddRectFilled(dl, bx - 4, hy - 4 + 1, hx + hw + 4 - 1, hy + hh - 4 - 1, C.field, RND_STRIP - 1)
+    ImGui.SetCursorScreenPos(ctx, bx, hy + 1)
+    if S.active then
+      if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
+      ImGui.SameLine(ctx, 0, 3)
+    end
+    if icon_button('hist', 'clock', nil, 'Recent chats') then
+      load_sessions()
+      ImGui.OpenPopup(ctx, 'histpop')
+    end
+    ImGui.SameLine(ctx, 0, 3)
+    if icon_button('new', 'plus', nil, 'New chat') then new_chat() end
+    history_popup()
   end
-  ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + math.max(0, ImGui.GetContentRegionAvail(ctx) - right))
-  if S.active then
-    if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
-    ImGui.SameLine(ctx, 0, 2)
-  end
-  if icon_button('hist', 'clock', nil, 'Recent chats') then
-    load_sessions()
-    ImGui.OpenPopup(ctx, 'histpop')
-  end
-  ImGui.SameLine(ctx, 0, 2)
-  if icon_button('new', 'plus', nil, 'New chat') then new_chat() end
-  history_popup()
+  ImGui.SetCursorScreenPos(ctx, hx, hy + hh + 2)
+  ImGui.Dummy(ctx, 0, 0)
 end
 
 local function opt_items(o) -- ACP options may be grouped: {group, name, options = {...}}
@@ -2172,34 +2232,79 @@ local function model_chip()
   end
 end
 
--- three levels, click cycles: ◇ off -> ◆ simple -> ◆ all details (dark filled pill)
-local function context_chip()
-  local lv = S.ctx_level
-  local clicked
-  if lv == 2 then
-    local bg = C.dark_pill
-    push_btn(bg, alpha(bg, 0xE0), alpha(bg, 0xC0), 0xFFFFFFFF)
-    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FramePadding, 8, 3)
-    ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 10)
-    ImGui.PushFont(ctx, F.ui, FONT_SIZE)
-    clicked = ImGui.Button(ctx, 'Detail context##chip_ctx')
+-- row above the input: what is selected in REAPER right now, one pill per kind, newest first;
+-- the newest is outlined in accent, ones older than 2 min (or from before the panel opened) are greyed
+local SEL_STALE = 120
+local function sel_row_visible() return S.ctx_level > 0 and SEL.pills and #SEL.pills > 0 end
+local function sel_row()
+  if not sel_row_visible() then return end
+  local P = {}
+  for _, p in ipairs(SEL.pills) do P[#P + 1] = p end
+  table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
+  local now = reaper.time_precise()
+  local dl = ImGui.GetWindowDrawList(ctx)
+  local h = ImGui.GetFrameHeight(ctx) - 2
+  local avail = ImGui.GetContentRegionAvail(ctx)
+  local used = 0
+  for n, p in ipairs(P) do
+    local t = SEL.at[p.k]
+    local d = t and (now - t) or nil
+    local short = not d and '—' or d < 60 and ('%ds'):format(math.floor(d)) or d < 3600 and ('%dm'):format(math.floor(d / 60))
+      or ('%dh'):format(math.floor(d / 3600))
+    local kind, value = p.label:match('^(%S+)  (.*)$')
+    kind, value = kind or p.label, value or ''
+    ImGui.PushFont(ctx, font_for(p.label), FONT_SIZE)
+    local kw = ImGui.CalcTextSize(ctx, kind)
+    local vw = ImGui.CalcTextSize(ctx, value)
+    local aw = ImGui.CalcTextSize(ctx, short)
+    local w = 8 + kw + 6 + vw + 6 + aw + 8
+    if n > 1 then
+      if used + 4 + w > avail then
+        ImGui.SameLine(ctx, 0, 4)
+        ImGui.AlignTextToFramePadding(ctx)
+        ImGui.TextColored(ctx, C.strip_text, ('+%d'):format(#P - n + 1))
+        if ImGui.IsItemHovered(ctx) then
+          local rest = {}
+          for m = n, #P do rest[#rest + 1] = P[m].label end
+          show_tip(table.concat(rest, '\n'))
+        end
+        ImGui.PopFont(ctx)
+        break
+      end
+      ImGui.SameLine(ctx, 0, 4)
+      used = used + 4
+    end
+    used = used + w
+    ImGui.InvisibleButton(ctx, '##selpill_' .. p.k, w, h)
+    local x1, y1 = ImGui.GetItemRectMin(ctx)
+    local hovered = ImGui.IsItemHovered(ctx)
+    local stale = not d or d > SEL_STALE
+    local newest = n == 1 and #P > 1 and not stale
+    ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, hovered and C.field or C.lane, RND)
+    if newest then ImGui.DrawList_AddRect(dl, x1, y1, x1 + w, y1 + h, C.value, RND, 0, 1) end
+    local ty = y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2
+    ImGui.DrawList_AddText(dl, x1 + 8, ty, C.lane_text, kind)
+    ImGui.DrawList_AddText(dl, x1 + 8 + kw + 6, ty, stale and C.lane_text or C.field_text, value)
+    ImGui.DrawList_AddText(dl, x1 + 8 + kw + 6 + vw + 6, ty, stale and C.lane_text or C.value, short)
     ImGui.PopFont(ctx)
-    ImGui.PopStyleVar(ctx, 2)
-    ImGui.PopStyleColor(ctx, 4)
-  else
-    clicked = chip('ctx', lv == 1 and 'Context' or 'No context', lv == 1 and C.accent or C.muted, false)
+    if hovered then
+      show_tip(SEL_HELP[p.k] .. (p.detail and ('\n\n' .. p.detail) or '') ..
+        '\n\n' .. (d and ('Set ' .. age(p.k) .. '.') or 'Already set when the panel opened.') ..
+        (stale and '\nOld selections stay in REAPER until you change them; the agent is told which one is newest.' or ''))
+    end
   end
-  if clicked then
-    S.ctx_level = (lv + 1) % 3
+end
+
+-- on/off toggle: the REAPER context block (see context()) goes with every message while on
+local function context_chip()
+  local on = S.ctx_level > 0
+  if chip('ctx', on and 'Context' or 'No context', on and C.accent or C.muted, false) then
+    S.ctx_level = on and 0 or 1
     reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
   end
   if ImGui.IsItemHovered(ctx) then
-    local tips = {
-      [0] = 'No REAPER context is sent.\n\nClick: Context',
-      [1] = 'Sent with every message:\n' .. chip_text():gsub(' · ', '\n') .. '\n\nClick: Detail context',
-      [2] = 'Detail context adds CC and envelope points, grids, track mix and FX chains, item sources and gains, and up to 128 notes.\n\nClick: No context',
-    }
-    show_tip(tips[lv])
+    show_tip(on and ('Sent with every message:\n' .. chip_text():gsub(' · ', '\n') .. '\n\nClick: No context')
+      or 'No REAPER context is sent.\n\nClick: Context')
   end
 end
 
@@ -2529,7 +2634,6 @@ local function frame()
   end
   if visible then
     header()
-    ImGui.Separator(ctx)
 
     if S.agent == '' then
       ImGui.Dummy(ctx, 0, 40)
@@ -2544,11 +2648,25 @@ local function frame()
         ImGui.SetClipboardText(ctx, selected_text(S.sel))
       end
       local composer_h = 98 + cards_height(cards) + (#S.files > 0 and 30 or 0)
+        + (sel_row_visible() and ImGui.GetFrameHeightWithSpacing(ctx) or 0)
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
-        local function draw_msg(m)
+        local lane, lane_id = {}, ''
+        local function flush()
+          if #lane > 0 then tool_lane(lane, lane_id); lane = {}; ImGui.Spacing(ctx) end
+        end
+        local function add_tools(m, id)
+          if not m._tl then
+            m._tl = {}
+            for _, n in ipairs(m.tools) do m._tl[#m._tl + 1] = tool_label(n) end
+          end
+          if #lane == 0 then lane_id = id end
+          for _, l in ipairs(m._tl) do lane[#lane + 1] = l end
+        end
+        local function draw_msg(m, id)
           if m.role == 'user' then
+            flush()
             if m._had == nil then
               m._body, m._had = split_context(m.text)
               local at = m._body:find('[Attached files:]', 1, true)
@@ -2569,16 +2687,21 @@ local function frame()
             end
             ImGui.Spacing(ctx)
           else
-            if m.text ~= '' then md(m, m.text) end
-            tools_line(m)
-            ImGui.Spacing(ctx)
+            if m.text ~= '' then flush(); md(m, m.text) end
+            if m.tools and #m.tools > 0 then add_tools(m, id) elseif m.text ~= '' then ImGui.Spacing(ctx) end
           end
         end
-        for _, m in ipairs(S.msgs) do draw_msg(m) end
-        for _, b in ipairs(S.live) do
-          if b.kind == 'text' then md(b, b.text) else ImGui.TextDisabled(ctx, '→ ' .. b.text) end
+        for i, m in ipairs(S.msgs) do draw_msg(m, i) end
+        for i, b in ipairs(S.live) do
+          if b.kind == 'text' then flush(); md(b, b.text)
+          else
+            if #lane == 0 then lane_id = 'live' .. i end
+            lane[#lane + 1] = b.text
+          end
         end
-        for _, m in ipairs(S.queued) do draw_msg(m) end
+        flush()
+        for i, m in ipairs(S.queued) do draw_msg(m, 'q' .. i) end
+        flush()
         if S.active and not S.waiting then
           local s = spin[(math.floor(reaper.time_precise() * 6) % #spin) + 1]
           ImGui.TextColored(ctx, C.accent, 'Working ' .. s)
@@ -2587,6 +2710,12 @@ local function frame()
         ImGui.EndChild(ctx)
       end
       accept_file_drop() -- files dropped on the conversation attach too
+      do -- the composer is a track-panel strip as well
+        local _, cy = ImGui.GetCursorScreenPos(ctx)
+        local wx, wy = ImGui.GetWindowPos(ctx)
+        local ww, wh = ImGui.GetWindowSize(ctx)
+        ImGui.DrawList_AddRectFilled(ImGui.GetWindowDrawList(ctx), wx + 6, cy - 3, wx + ww - 6, wy + wh - 6, C.strip, RND_STRIP)
+      end
 
       for _, c in ipairs(cards) do card(c) end
       for n, f in ipairs(S.files) do -- attachments waiting to be sent; click to remove
@@ -2594,6 +2723,7 @@ local function frame()
         if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
         if ImGui.IsItemHovered(ctx) then show_tip(f.path .. '\nClick to remove') end
       end
+      sel_row()
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
       local ime = ime_scan()
@@ -2625,7 +2755,7 @@ local function frame()
       if ime == 'restore' and not focused then S.input = before; S.focus = true; focused = true end -- Esc deactivated it
       S.comp_active = focused
       ImGui.DrawList_AddRect(ImGui.GetWindowDrawList(ctx), x1, y1, x2, y2,
-        focused and C.accent or C.border, 6, 0, focused and 2 or 1)
+        focused and C.value or C.btn_lo, RND, 0, 1)
       if entered then send() end
       if chip('attach', '+ File', C.muted, false) then
         local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
@@ -2645,7 +2775,7 @@ local function frame()
       local gap = ImGui.GetContentRegionAvail(ctx) - hw
       if gap > 0 then ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + gap) end
       ImGui.AlignTextToFramePadding(ctx)
-      if S.ime and #S.ime > 0 then ImGui.TextColored(ctx, C.accent, hint) else ImGui.TextDisabled(ctx, hint) end
+      ImGui.TextColored(ctx, (S.ime and #S.ime > 0) and C.field or C.strip_text, hint)
       ImGui.PopFont(ctx)
       if ImGui.IsItemHovered(ctx) then
         show_tip('Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')

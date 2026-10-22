@@ -184,7 +184,22 @@ def check(name, cond):
         raise SystemExit(1)
 
 
+def unit():
+    sys.path.insert(0, str(HERE))
+    import agent_gateway as ag
+    check("title drops the context block",
+          ag.chat_title("[REAPER context — x]\nproject: a\n[/REAPER context]\n\nmake it brighter") == "make it brighter")
+    check("title drops a pasted, escaped context block",
+          ag.chat_title("\\[REAPER context — x\\] p \\[/REAPER context\\]\n\nyo") == "yo")
+    a = ag.AcpAgent.__new__(ag.AcpAgent)
+    a.spec, a.cwd = {"slug": "kimi", "command": ["/nonexistent/kimi", "acp"], "resume": ["no-such-cli-xyz", "{id}"]}, "/tmp"
+    check("no resume line without the CLI", a.resume_cmd("abc") is None)
+    a.spec["resume"] = ["sh", "-c", "echo {id}"]
+    check("resume line runs in the agent's cwd", a.resume_cmd("abc").startswith("cd /tmp && ") and "echo abc" in a.resume_cmd("abc"))
+
+
 def main():
+    unit()
     gsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeGamut)
     threading.Thread(target=gsrv.serve_forever, daemon=True).start()
     gport = gsrv.server_address[1]

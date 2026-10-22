@@ -42,6 +42,7 @@ import queue
 import re
 import secrets
 import shlex
+import shutil
 import socket
 import subprocess
 import sys
@@ -198,6 +199,20 @@ def prompt_blocks(text, caps):
 
 # ---------------------------------------------------------------- sessions
 
+CTX_BLOCK = re.compile(r"^\\?\[REAPER context.*?\\?\[/REAPER context\\?\]\s*", re.S)
+
+
+def chat_title(text):
+    """First line of a message without the panel's REAPER context block (older chats were titled with it)."""
+    text = CTX_BLOCK.sub("", (text or "").strip())
+    line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "")
+    return line[:60] or "New chat"
+
+
+# how to reopen an ACP chat in the agent's own terminal UI ({id} = the ACP session id); spec "resume" overrides
+RESUME = {"claude": ["claude", "--resume", "{id}"], "kimi": ["kimi", "--session", "{id}"]}
+
+
 class Session:
     def __init__(self, agent, sid=None, title="", created=None):
         self.agent = agent
@@ -228,8 +243,12 @@ class Session:
                 q.dead = True
 
     def public(self):
-        return {"id": self.id, "name": self.title or "New chat", "isActive": self.active,
-                "lastActivityAt": self.updated, "createdAt": self.created}
+        out = {"id": self.id, "name": self.title or "New chat", "isActive": self.active,
+               "lastActivityAt": self.updated, "createdAt": self.created}
+        resume = self.agent.resume_cmd(self.acp_id)
+        if resume:
+            out["resume"] = resume
+        return out
 
     def assistant(self):
         if not self.msgs or self.msgs[-1]["type"] != "assistant":
@@ -340,6 +359,19 @@ class AcpAgent:
         self.warm = None
         self.load_persisted()
 
+    def resume_cmd(self, acp_id):
+        """Shell line that reopens this chat in the agent's CLI, or None when there is no such CLI here."""
+        argv = self.spec.get("resume") or RESUME.get(self.spec["slug"])
+        if not acp_id or not argv:
+            return None
+        dirs = [(self.spec.get("env") or {}).get("PATH", ""), os.path.dirname(expand(self.spec["command"][0])),
+                expand("~/.local/bin"), os.environ.get("PATH", "")]
+        exe = shutil.which(expand(argv[0]), path=os.pathsep.join(d for d in dirs if d))
+        if not exe:
+            return None
+        args = [exe] + [a.replace("{id}", acp_id) for a in argv[1:]]
+        return "cd %s && %s" % (shlex.quote(self.cwd), " ".join(shlex.quote(a) for a in args))
+
     def load_persisted(self):
         d = STATE / self.slug
         if not d.is_dir():
@@ -350,6 +382,9 @@ class AcpAgent:
                 s = Session(self, p.stem, j.get("title", ""), j.get("created"))
                 s.updated = j.get("updated", s.created)
                 s.msgs = j.get("msgs") if isinstance(j.get("msgs"), list) else []
+                if (s.title or "").lstrip("\\").startswith("[REAPER context"):  # stored cut at 60 chars
+                    first = next((m for m in s.msgs if m.get("type") == "user"), None)
+                    s.title = chat_title(((first or {}).get("content") or {}).get("text", ""))
                 s.acp_id = j.get("acp_id")
             except Exception as e:
                 log(self.slug, "skipping", p.name, e)
@@ -541,8 +576,7 @@ class AcpAgent:
         if s is None:
             s = Session(self)
             self.open_session(s)
-        title = (title or message).strip()
-        s.title = title.splitlines()[0][:60] if title else "New chat"
+        s.title = chat_title(title or message)
         self.sessions[s.id] = s
         self.send(s, message, config)
         return s

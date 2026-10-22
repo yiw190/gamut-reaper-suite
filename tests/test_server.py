@@ -13,8 +13,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-SERVER = os.path.join(HERE, "server.py")
-BRIDGE = os.path.join(ROOT, "lua", "bridge.lua")
+SERVER = os.path.join(ROOT, "reaper_mcp", "server.py")
+BRIDGE = os.path.join(ROOT, "reaper_mcp", "bridge.lua")
 
 sys.path.insert(0, ROOT)
 
@@ -197,6 +197,10 @@ def main():
         check("MIDI undo uses OnStateChange_Item",
               "Undo_OnStateChange_Item" in src)
         check("APPDATA mailbox", "reaper-mcp" in src and "APPDATA" in src)
+        from reaper_mcp import __version__
+        check("bridge VERSION matches the package", 'local VERSION = "%s"' % __version__ in src)
+        pyproject = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
+        check("pyproject version matches the package", 'version = "%s"' % __version__ in pyproject)
         check("batch inherits the render timeout", check_batch_timeout())
         check("lua json encoder handles mixed utf-8",
               "utf8_len" in src and "is_cont" in src)

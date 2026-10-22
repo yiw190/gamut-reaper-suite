@@ -47,7 +47,7 @@ for p in files(".lua"):
     err = compile_lua(src, str(p.relative_to(ROOT))) or use_before_declare(src)
     print(("  ok   " if not err else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if not err else "  " + err))
     bad += bool(err)
-for p in files(".sh"):
+for p in files(".sh") + sorted((ROOT / "packaging/macos/scripts").glob("*")):
     r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
     print(("  ok   " if r.returncode == 0 else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if r.returncode == 0 else "  " + r.stderr.strip()))
     bad += r.returncode != 0

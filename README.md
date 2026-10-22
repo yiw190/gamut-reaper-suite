@@ -8,7 +8,7 @@ Gamut, Codex or any other ACP agent.
 
 | Path | What |
 | --- | --- |
-| `reaper_mcp/`, `python/`, `lua/bridge.lua` | MCP server (`reaper-mcp`) + the Lua bridge that runs inside REAPER |
+| `reaper_mcp/` | MCP server (`server.py` stdio, `http_server.py` bearer HTTP) + `bridge.lua`, the Lua bridge that runs inside REAPER |
 | `gamut-chat/` | Gamut Chat — chat panel docked in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
 | `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
 | `gateway/` | Agent gateway: one local API for the panel in front of Gamut and ACP agents (Codex, …) |
@@ -17,30 +17,53 @@ Gamut, Codex or any other ACP agent.
 [![ci](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml)
 
 ```
-MCP client  --stdio JSON-RPC-->  python/server.py  --JSON mailbox-->  lua/bridge.lua (inside REAPER)
+MCP client  --stdio JSON-RPC-->  reaper_mcp/server.py  --JSON mailbox-->  reaper_mcp/bridge.lua (inside REAPER)
 ```
 
 Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. Call `status` first; on a new project pass `detail=true` for arrangement facts (time signature, length in beats, markers, MIDI vs audio) — not chords. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
 
-## Install on a Mac with Gamut
+## Install (macOS)
+
+You need REAPER. Download `GamutReaperSuite-<version>.pkg` from
+[Releases](https://github.com/yiw190/gamut-reaper-suite/releases), open it, then restart REAPER. The package brings its
+own Python, so it doesn't need the Xcode command line tools. To upgrade, install a newer package.
+
+The package isn't signed yet. If macOS says it can't verify the developer, open **System Settings → Privacy & Security**
+and click **Open Anyway**.
+
+What it sets up for the logged-in user (`gamut-reaper-suite setup` runs the same steps; safe to re-run):
+
+| Piece | Where |
+| --- | --- |
+| Lua bridge, Gamut Chat panel | `<REAPER resource path>/Scripts/reaper_mcp_bridge.lua`, `Scripts/GamutChat/` |
+| ReaImGui (if missing, pinned + sha256-checked) | `<REAPER resource path>/UserPlugins/` |
+| Startup hook: starts both with REAPER | a marked block in `Scripts/__startup.lua`; your own lines stay |
+| MCP over HTTP on `127.0.0.1:8787` (bearer in `~/.config/reaper-mcp/token`, 0600) | LaunchAgent `com.gamut-reaper-suite.reaper-mcp` |
+| Agent gateway on `127.0.0.1:47892` | LaunchAgent `com.gamut-reaper-suite.agent-gateway` |
+| MCP registration | Gamut (as **REAPER**), plus Claude Desktop, Claude Code and Cursor when they're installed |
+
+```bash
+gamut-reaper-suite doctor                         # what's installed, what's running, what's wrong
+gamut-reaper-suite connect gamut|claude-desktop|claude-code|cursor [--remove]
+gamut-reaper-suite agents add codex claude kimi   # ACP agents for the panel (Node goes in ~/.local/node)
+gamut-reaper-suite watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
+gamut-reaper-suite uninstall [--purge]            # --purge also deletes tokens and gateway config
+```
+
+From a clone instead (the LaunchAgents then run from the clone, so keep it; re-run after `git pull`):
 
 ```bash
 git clone https://github.com/yiw190/gamut-reaper-suite.git ~/gamut-reaper-suite
-sh ~/gamut-reaper-suite/install.sh        # WITH_AGENTS=1 also installs the agent gateway (Codex, Claude Code, Kimi)
+sh ~/gamut-reaper-suite/install.sh                # WITH_AGENTS=1 also adds Codex, Claude Code and Kimi
 ```
 
-It installs the bridge, the Gamut Chat panel, ReaImGui and the REAPER startup hook, runs the MCP on
-`127.0.0.1:8787` as a LaunchAgent (bearer token in `~/.config/reaper-mcp/token`) and registers it in Gamut as
-**REAPER**. Keep the clone: the LaunchAgent runs from it. Re-run after `git pull` to upgrade. Then restart REAPER and
-give an agent the REAPER MCP server in Gamut.
-
-## Manual setup (any MCP client)
+## Manual setup (any MCP client, any OS)
 
 ```bash
-python3 python/install_bridge.py
+python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.3.1 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.4.0 ready`.
 
 MCP client config (any client that runs stdio servers):
 
@@ -49,7 +72,7 @@ MCP client config (any client that runs stdio servers):
   "mcpServers": {
     "reaper": {
       "command": "python3",
-      "args": ["/absolute/path/to/gamut-reaper-suite/python/server.py"]
+      "args": ["/absolute/path/to/gamut-reaper-suite/reaper_mcp/server.py"]
     }
   }
 }
@@ -71,7 +94,7 @@ Mailbox: `~/Library/Application Support/reaper-mcp/ipc` on macOS, `%APPDATA%/rea
 Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and the Gamut desktop app running on the same Mac — the
 panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamut's own UI uses.
 
-1. Copy `gamut-chat/GamutChat.lua` to `<REAPER resource path>/Scripts/GamutChat/`, then **Actions → Load ReaScript** and run it.
+The installer puts it in place. By hand: 1. Copy `gamut-chat/GamutChat.lua` to `<REAPER resource path>/Scripts/GamutChat/`, then **Actions → Load ReaScript** and run it.
 2. Optional: run `gamut-chat/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
    binds **Cmd+L** to toggle it, and relaunches REAPER.
 
@@ -90,7 +113,7 @@ while a composition is open and shows the pending pinyin under the input.
 
 ## Start with REAPER
 
-Copy `reaper/__startup.lua` to `<REAPER resource path>/Scripts/__startup.lua` (or merge it into yours). It starts the
+The installer merges `reaper/__startup.lua` into `<REAPER resource path>/Scripts/__startup.lua` as a marked block. It starts the
 MCP bridge and opens the chat panel on every launch, registering either script if REAPER doesn't know it yet.
 
 ## Agent gateway: Codex, Claude Code, Kimi, … in the same panel
@@ -110,8 +133,8 @@ with mode 0600 on first start; the panel reads it). Docker and Lima forward `hos
 `host.lima.internal` to the Mac's loopback, so without the token any container on the Mac could start a host agent.
 
 ```bash
-sh gateway/install_macos.sh          # LaunchAgent + Node (~/.local/node) + Codex/Claude/Kimi; WITH_CODEX=0 to skip
-python3 gateway/test_gateway.py      # fake Gamut + fake ACP agent, no network
+gamut-reaper-suite agents add codex claude kimi   # Node (~/.local/node) + the ACP adapters, restarts the gateway
+python3 gateway/test_gateway.py                   # fake Gamut + fake ACP agent, no network
 ```
 
 Agents are listed in `~/.config/agent-gateway/config.json` (`acp: [{slug, name, command, env, cwd}]`,
@@ -127,15 +150,15 @@ else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/
 ## Tests
 
 ```
-python3 python/test_server.py                        # MCP server + fake bridge
-uv run --with lupa python python/test_bridge_lua.py  # bridge.lua against a fake ReaScript API
+python3 tests/test_server.py                         # MCP server + fake bridge, versions in step
+uv run --with lupa python tests/test_bridge_lua.py   # bridge.lua against a fake ReaScript API
 uv run --with lupa python gamut-chat/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
+python3 tests/test_suite.py                          # setup / doctor / connect / uninstall on a fake HOME
 uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses
 ```
 
-CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12, plus a
-check that `lua/bridge.lua` and `reaper_mcp/bridge.lua` are identical.
+CI runs all of these on every push: the Python suites on 3.9 (the macOS host's `/usr/bin/python3`) and 3.12.
 
 None of these need REAPER. The Lua-based ones need `lupa` (CI installs it).
 

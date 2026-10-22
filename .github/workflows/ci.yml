@@ -18,9 +18,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: MCP server
-        run: python python/test_server.py
+        run: python tests/test_server.py
       - name: agent gateway
         run: python gateway/test_gateway.py
+      - name: installer (fake HOME, no launchd)
+        run: python tests/test_suite.py
 
   lua:
     name: bridge + Lua/shell syntax
@@ -32,10 +34,8 @@ jobs:
           python-version: "3.12"
       - run: pip install lupa
       - name: bridge.lua against a fake ReaScript API
-        run: python python/test_bridge_lua.py
+        run: python tests/test_bridge_lua.py
       - name: chat panel against fake reaper/ImGui
         run: python gamut-chat/test_panel.py
-      - name: bridge copies in sync
-        run: cmp lua/bridge.lua reaper_mcp/bridge.lua
       - name: every .lua compiles (Lua 5.4), every .sh parses
         run: python scripts/check_syntax.py

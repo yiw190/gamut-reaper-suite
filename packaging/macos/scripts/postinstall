@@ -1,0 +1,31 @@
+#!/bin/sh
+# Runs as root after the payload lands. Picks the bundled Python for this Mac, links the CLI, then runs
+# `gamut-reaper-suite setup` as the logged-in user (their REAPER folder, LaunchAgents and MCP clients).
+APP="/Library/Application Support/GamutReaperSuite"
+LOG=/var/log/gamut-reaper-suite-install.log
+exec >> "$LOG" 2>&1
+echo "=== postinstall $(date) ==="
+
+if [ "$(sysctl -n hw.optional.arm64 2>/dev/null)" = 1 ]; then ARCH=arm64; OTHER=x86_64; else ARCH=x86_64; OTHER=arm64; fi
+ln -sfn "python-$ARCH" "$APP/python"
+rm -rf "$APP/python-$OTHER"
+mkdir -p /usr/local/bin
+ln -sf "$APP/bin/gamut-reaper-suite" /usr/local/bin/gamut-reaper-suite
+
+USER_NAME=$(stat -f%Su /dev/console)
+case "$USER_NAME" in
+  ""|root|loginwindow|_mbsetupuser)
+    echo "no user logged in at the console; each user runs: gamut-reaper-suite setup"
+    exit 0 ;;
+esac
+USER_ID=$(id -u "$USER_NAME")
+USER_HOME=$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{print $2}')
+mkdir -p "$USER_HOME/Library/Logs" && chown "$USER_NAME" "$USER_HOME/Library/Logs"
+echo "setup for $USER_NAME ($USER_ID)"
+ULOG="$USER_HOME/Library/Logs/gamut-reaper-suite-install.log"
+launchctl asuser "$USER_ID" sudo -u "$USER_NAME" -H "$APP/bin/gamut-reaper-suite" setup > "$ULOG" 2>&1
+rc=$?
+chown "$USER_NAME" "$ULOG"
+cat "$ULOG"
+echo "setup exit $rc"
+exit $rc

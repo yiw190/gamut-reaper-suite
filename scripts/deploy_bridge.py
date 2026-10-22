@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push lua/bridge.lua to a running REAPER bridge and restart it in place.
+"""Push reaper_mcp/bridge.lua to a running REAPER bridge and restart it in place.
 
 The bridge is a deferred ReaScript, so replacing the file is not enough: the
 running instance has to be swapped too. This stages a copy, then performs a
@@ -27,16 +27,16 @@ import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "lua" / "bridge.lua"
+SOURCE = ROOT / "reaper_mcp" / "bridge.lua"
 
 LIVE = "~/Library/Application Support/REAPER/Scripts/reaper_mcp_bridge.lua"
 REPO = "~/reaper-mcp"
 # local source -> where it has to land on the host
 FILES = [
-    ("lua/bridge.lua", [LIVE + ".new", f"{REPO}/lua/bridge.lua", f"{REPO}/reaper_mcp/bridge.lua"]),
+    ("reaper_mcp/bridge.lua", [LIVE + ".new", f"{REPO}/reaper_mcp/bridge.lua"]),
     ("reaper_mcp/server.py", [f"{REPO}/reaper_mcp/server.py"]),
 ]
-LAUNCH_LABEL = "com.yitian.reaper-mcp"
+LAUNCH_LABEL = "com.gamut-reaper-suite.reaper-mcp"
 
 # Defer ticks (~30 per second) the old bridge keeps answering while Python reads the swap response.
 HANDOFF_TICKS = 30

@@ -5,6 +5,21 @@
   <license file="LICENSE.txt"/>
   <conclusion file="conclusion.html" mime-type="text/html"/>
   <options customize="never" require-scripts="true" hostArchitectures="arm64,x86_64"/>
+  <!-- onboarding order: REAPER first, then Hibiki; `hibiki setup` refuses the same way -->
+  <installation-check script="reaper_installed()"/>
+  <script><![CDATA[
+function reaper_installed() {
+  var dirs = ['/Applications'];
+  if (system.env.HOME) dirs.push(system.env.HOME + '/Applications');
+  for (var i = 0; i < dirs.length; i++) {
+    if (system.files.fileExistsAtPath(dirs[i] + '/REAPER.app') || system.files.fileExistsAtPath(dirs[i] + '/REAPER64.app')) return true;
+  }
+  my.result.type = 'Fatal';
+  my.result.title = 'Install REAPER first';
+  my.result.message = 'Hibiki runs inside REAPER, and REAPER is not on this Mac yet. Download it from reaper.fm, drag it to Applications, open it once, then open this installer again.';
+  return false;
+}
+]]></script>
   <domains enable_anywhere="false" enable_currentUserHome="false" enable_localSystem="true"/>
   <volume-check>
     <allowed-os-versions><os-version min="11.0"/></allowed-os-versions>

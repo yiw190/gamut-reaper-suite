@@ -98,6 +98,19 @@ class Paths:
         return self.la / (label + ".plist")
 
 
+REAPER_DOWNLOAD = "https://www.reaper.fm/download.php"
+
+
+def reaper_app(p: Paths) -> Path | None:
+    """REAPER.app (REAPER64.app in older releases) in /Applications or ~/Applications."""
+    system = Path(os.environ.get("HIBIKI_SYSTEM_APPLICATIONS", "/Applications"))  # tests point it elsewhere
+    for base in (system, p.home / "Applications"):
+        for name in ("REAPER.app", "REAPER64.app"):
+            if (base / name).exists():
+                return base / name
+    return None
+
+
 def say(msg: str) -> None:
     print(msg, flush=True)
 
@@ -513,6 +526,9 @@ def cmd_setup(a) -> int:
     if sys.platform != "darwin" and not os.environ.get("HIBIKI_NO_LAUNCHCTL"):
         raise SystemExit("setup is macOS only; elsewhere use `reaper-mcp install-bridge` and a stdio MCP config")
     p = Paths(a.resource_path)
+    if not reaper_app(p):  # onboarding order: REAPER first, then Hibiki (the .pkg checks the same before installing)
+        raise SystemExit("REAPER isn't installed. Download it from %s, drag it to Applications, then run "
+                         "`hibiki setup` again." % REAPER_DOWNLOAD)
     say("hibiki %s from %s (python %s)" % (__version__, ROOT, sys.executable))
     say("REAPER")
     install_bridge(p)
@@ -549,9 +565,8 @@ def cmd_doctor(a) -> int:
         rows.append({"level": level, "check": name, "detail": detail})
 
     row("ok", "suite", "%s at %s, python %s" % (__version__, ROOT, sys.executable))
-    apps = [Path("/Applications/REAPER.app"), p.home / "Applications/REAPER.app"]
-    app = next((x for x in apps if x.exists()), None)
-    row("ok" if app else "warn", "REAPER.app", str(app) if app else "not in /Applications or ~/Applications")
+    app = reaper_app(p)
+    row("ok" if app else "FAIL", "REAPER.app", str(app) if app else "not installed - get it from " + REAPER_DOWNLOAD)
     row("ok" if p.resource.is_dir() else "FAIL", "resource path", str(p.resource))
     bv = bridge_version(p.scripts / "reaper_mcp_bridge.lua")
     row("ok" if bv == __version__ else "FAIL", "bridge script",

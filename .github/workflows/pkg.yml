@@ -19,8 +19,14 @@ jobs:
       - name: tag matches the version
         if: startsWith(github.ref, 'refs/tags/v')
         run: test -f "dist/Hibiki-${GITHUB_REF_NAME#v}.pkg"
+      - name: the installer refuses a Mac without REAPER
+        run: |
+          ! ls -d /Applications/REAPER*.app ~/Applications/REAPER*.app 2>/dev/null
+          ! sudo installer -pkg dist/Hibiki-*.pkg -target /
+          ! ls ~/Library/LaunchAgents/com.hibiki.* 2>/dev/null
       - name: install
         run: |
+          sudo mkdir -p /Applications/REAPER.app  # stand-in: the runner has no REAPER
           sudo installer -pkg dist/Hibiki-*.pkg -target / || { sudo cat /var/log/hibiki-install.log; exit 1; }
           sudo cat /var/log/hibiki-install.log
       - name: doctor

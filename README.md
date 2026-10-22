@@ -25,9 +25,13 @@ Fourteen grouped tools. Multi-step edits go through `batch`; anything else throu
 
 ## Install (macOS)
 
-You need REAPER. Download `Hibiki-<version>.pkg` from
-[Releases](https://github.com/yiw190/hibiki/releases), open it, then restart REAPER. The package brings its
-own Python, so it doesn't need the Xcode command line tools. To upgrade, install a newer package.
+1. **REAPER first.** Download it from [reaper.fm](https://www.reaper.fm/download.php), drag it to Applications and
+   open it once. The package (and `hibiki setup`) refuses to install on a Mac without REAPER.
+2. **Hibiki.** Download `Hibiki-<version>.pkg` from [Releases](https://github.com/yiw190/hibiki/releases) and open it.
+   The package brings its own Python, so it doesn't need the Xcode command line tools. To upgrade, install a newer
+   package.
+3. **Restart REAPER.** The Hibiki panel opens docked on the right; click the agent name at its top to pick a provider
+   and model.
 
 The package isn't signed yet. If macOS says it can't verify the developer, open **System Settings → Privacy & Security**
 and click **Open Anyway**.

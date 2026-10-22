@@ -57,6 +57,7 @@ class FakeGamut(BaseHTTPRequestHandler):
 
 def run(home, *args, gamut=""):
     env = dict(os.environ, HOME=str(home), HIBIKI_NO_LAUNCHCTL="1", GAMUT_URL=gamut or "http://127.0.0.1:9",
+               HIBIKI_SYSTEM_APPLICATIONS=str(home / "no-system-apps"),  # this Mac's own REAPER must not count
                PATH="/usr/bin:/bin")
     env.pop("REAPER_RESOURCE_PATH", None)
     r = subprocess.run([sys.executable, "-m", "reaper_mcp", *args], cwd=str(ROOT), env=env,
@@ -81,7 +82,7 @@ def main():
     scripts = res / "Scripts"
     la = home / "Library/LaunchAgents"
     for d in (scripts, res / "UserPlugins", la, home / ".config/reaper-mcp", home / ".config/agent-gateway",
-              home / "Library/Application Support/Claude", home / ".cursor"):
+              home / "Library/Application Support/Claude", home / ".cursor", home / "Applications/REAPER.app"):
         d.mkdir(parents=True)
     # a Mac set up by hand before the suite: hook copied verbatim, bearer in env, old LaunchAgents, user's own hook
     (scripts / "__startup.lua").write_text("-- my own thing\nreaper.ShowConsoleMsg('hi')\n\n" + STARTUP)
@@ -152,8 +153,15 @@ def main():
     check("uninstall: Gamut registration removed", FakeGamut.servers == [], str(FakeGamut.servers))
     check("uninstall keeps the token without --purge", tok.exists())
 
+    # onboarding order: no REAPER yet -> setup refuses and touches nothing
+    bare = Path(tempfile.mkdtemp(prefix="grs_noreaper_"))
+    rc, out = run(bare, "setup", "--no-connect")
+    check("no REAPER: setup refuses with the download link",
+          rc != 0 and "reaper.fm" in out and not (bare / "Library").exists(), out)
+
     fresh = Path(tempfile.mkdtemp(prefix="grs_fresh_"))
     (fresh / "Library/Application Support/REAPER/UserPlugins").mkdir(parents=True)
+    (fresh / "Applications/REAPER64.app").mkdir(parents=True)
     (fresh / "Library/Application Support/REAPER/UserPlugins/reaper_imgui-x86_64.dylib").write_bytes(b"x")
     rc, out = run(fresh, "setup", "--no-connect")
     t = (fresh / ".config/reaper-mcp/token").read_text().strip()
@@ -166,7 +174,7 @@ def main():
     old = Path(tempfile.mkdtemp(prefix="grs_renamed_"))
     ores = old / "Library/Application Support/REAPER"
     ola = old / "Library/LaunchAgents"
-    for d in (ores / "Scripts/GamutChat", ores / "UserPlugins", ola):
+    for d in (ores / "Scripts/GamutChat", ores / "UserPlugins", ola, old / "Applications/REAPER.app"):
         d.mkdir(parents=True)
     (ores / "UserPlugins/reaper_imgui-arm64.dylib").write_bytes(b"x")
     (ores / "Scripts/GamutChat/GamutChat.lua").write_text("-- old panel")

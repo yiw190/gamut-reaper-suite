@@ -1,5 +1,5 @@
 #!/bin/bash
-# Keep REAPER and its MCP bridge up on this Mac. launchd runs it every 30 s (com.yitian.reaper-watchdog).
+# Keep REAPER and its MCP bridge up on this Mac. launchd runs it every 30 s (`gamut-reaper-suite watchdog on`).
 #   - REAPER gone after a crash (fresh .ips report) or not started since boot/login -> open it.
 #     A plain user quit is respected.
 #   - REAPER running but the bridge heartbeat is stale for STALE_KILL s while nobody has touched the

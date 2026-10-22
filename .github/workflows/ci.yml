@@ -21,6 +21,8 @@ jobs:
         run: python tests/test_server.py
       - name: agent gateway
         run: python gateway/test_gateway.py
+      - name: installer (fake HOME, no launchd)
+        run: python tests/test_suite.py
 
   lua:
     name: bridge + Lua/shell syntax

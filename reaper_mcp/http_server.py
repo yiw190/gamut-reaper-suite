@@ -12,7 +12,19 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 PORT = int(os.environ.get("REAPER_MCP_PORT", "8787"))
-BEARER = os.environ.get("REAPER_MCP_BEARER", "")
+TOKEN_FILE = Path(os.environ.get("REAPER_MCP_TOKEN_FILE", "~/.config/reaper-mcp/token")).expanduser()
+
+
+def _bearer() -> str:
+    if os.environ.get("REAPER_MCP_BEARER"):
+        return os.environ["REAPER_MCP_BEARER"]
+    try:
+        return TOKEN_FILE.read_text().strip()
+    except OSError:
+        return ""
+
+
+BEARER = _bearer()
 SERVER = Path(__file__).resolve().parent / "server.py"
 
 
@@ -135,7 +147,7 @@ class Handler(BaseHTTPRequestHandler):
 
 def main() -> None:
     if not BEARER:
-        raise SystemExit("REAPER_MCP_BEARER is not set")
+        raise SystemExit("no bearer: set REAPER_MCP_BEARER or write %s" % TOKEN_FILE)
     if not SERVER.is_file():
         raise SystemExit(f"missing {SERVER}")
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)

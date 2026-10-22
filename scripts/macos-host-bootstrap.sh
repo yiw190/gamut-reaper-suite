@@ -1,4 +1,7 @@
 #!/bin/bash
+# Remote host: make REAPER on this Mac reachable from an agent elsewhere through a Cloudflare named tunnel.
+# Installs the suite from a clone (~/reaper-mcp) with the given bearer, then cloudflared as a LaunchAgent.
+# Needs REAPER_MCP_BEARER and CLOUDFLARE_TUNNEL_TOKEN (env or ~/.config/reaper-mcp/env). See docs/remote-host.md.
 set -euo pipefail
 mkdir -p "$HOME/Library/Logs"
 exec > >(tee -a "$HOME/Library/Logs/reaper-mcp-bootstrap.log") 2>&1
@@ -8,9 +11,9 @@ echo "host=$(hostname) arch=$(uname -m) user=$(whoami)"
 BIN="$HOME/.local/bin"
 CFG="$HOME/.config/reaper-mcp"
 LAUNCH="$HOME/Library/LaunchAgents"
-LOGDIR="$HOME/Library/Logs"
-REPO="$HOME/reaper-mcp"
-mkdir -p "$BIN" "$CFG" "$LAUNCH" "$LOGDIR"
+REPO="${REAPER_MCP_REPO:-$HOME/reaper-mcp}"
+LABEL=com.gamut-reaper-suite.cloudflared
+mkdir -p "$BIN" "$CFG" "$LAUNCH"
 export PATH="$BIN:$PATH"
 
 if [ -f "$CFG/env" ]; then
@@ -19,31 +22,17 @@ if [ -f "$CFG/env" ]; then
   . "$CFG/env"
   set +a
 fi
-
 : "${REAPER_MCP_BEARER:?set REAPER_MCP_BEARER}"
 : "${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}"
 REAPER_MCP_PORT="${REAPER_MCP_PORT:-8787}"
-REAPER_MCP_HOSTNAME="${REAPER_MCP_HOSTNAME:-reaper.yitian.wang}"
-
 
 if [ ! -x "$BIN/cloudflared" ]; then
   echo "installing cloudflared"
   tmp=$(mktemp -d)
-  ARCH=$(uname -m)
-  if [ "$ARCH" = "arm64" ]; then
-    raw="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64"
-    tgz="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-arm64.tgz"
-  else
-    raw="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64"
-    tgz="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-amd64.tgz"
-  fi
-  if curl -fL "$tgz" -o "$tmp/cf.tgz"; then
-    tar -xzf "$tmp/cf.tgz" -C "$tmp"
-    found=$(find "$tmp" -type f \( -name 'cloudflared' -o -name 'cloudflared-darwin-*' \) | head -1)
-    cp "$found" "$BIN/cloudflared"
-  else
-    curl -fL "$raw" -o "$BIN/cloudflared"
-  fi
+  ARCH=$(uname -m); [ "$ARCH" = arm64 ] || ARCH=amd64
+  curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$ARCH.tgz" -o "$tmp/cf.tgz"
+  tar -xzf "$tmp/cf.tgz" -C "$tmp"
+  cp "$(find "$tmp" -type f -name 'cloudflared*' | head -1)" "$BIN/cloudflared"
   chmod +x "$BIN/cloudflared"
   rm -rf "$tmp"
 fi
@@ -55,97 +44,37 @@ else
   git -C "$REPO" pull --ff-only || echo "WARNING: could not fast-forward $REPO; running the checked-out version" >&2
 fi
 
-if [ ! -f "$REPO/reaper_mcp/http_server.py" ]; then
-  echo "missing $REPO/reaper_mcp/http_server.py" >&2
-  exit 1
-fi
-chmod +x "$REPO/reaper_mcp/http_server.py"
-
 umask 077
 cat > "$CFG/env" << ENVEOF
 REAPER_MCP_BEARER=$REAPER_MCP_BEARER
 REAPER_MCP_PORT=$REAPER_MCP_PORT
-REAPER_MCP_HOSTNAME=$REAPER_MCP_HOSTNAME
 CLOUDFLARE_TUNNEL_TOKEN=$CLOUDFLARE_TUNNEL_TOKEN
 ENVEOF
-chmod 600 "$CFG/env"
+printf '%s\n' "$REAPER_MCP_BEARER" > "$CFG/token"
+umask 022
 
-python3 - << 'PY'
-from pathlib import Path
-from xml.sax.saxutils import escape
-home = Path.home()
-repo = home / "reaper-mcp"
-launch = home / "Library/LaunchAgents"
-logdir = home / "Library/Logs"
-cfg = home / ".config/reaper-mcp/env"
-vals = {}
-for line in cfg.read_text().splitlines():
-    if "=" in line and not line.startswith("#"):
-        k, v = line.split("=", 1)
-        vals[k] = v
-
-def plist(label, args, env, logfile):
-    env_xml = "\n".join(f"    <key>{escape(k)}</key><string>{escape(v)}</string>" for k, v in env.items())
-    args_xml = "\n".join(f"    <string>{escape(a)}</string>" for a in args)
-    env_block = ""
-    if env:
-        env_block = "  <key>EnvironmentVariables</key>\n  <dict>\n" + env_xml + "\n  </dict>\n"
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{label}</string>
-  <key>ProgramArguments</key>
-  <array>
-{args_xml}
-  </array>
-  <key>WorkingDirectory</key><string>{repo}</string>
-{env_block}  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>{logfile}.log</string>
-  <key>StandardErrorPath</key><string>{logfile}.err</string>
-</dict>
-</plist>
-"""
-
-(launch / "com.yitian.reaper-mcp.plist").write_text(plist(
-    "com.yitian.reaper-mcp",
-    ["/usr/bin/python3", str(repo / "reaper_mcp/http_server.py")],
-    {"REAPER_MCP_BEARER": vals["REAPER_MCP_BEARER"], "REAPER_MCP_PORT": vals["REAPER_MCP_PORT"]},
-    str(logdir / "reaper-mcp-http"),
-))
-(launch / "com.yitian.cloudflared-reaper.plist").write_text(plist(
-    "com.yitian.cloudflared-reaper",
-    [str(home / ".local/bin/cloudflared"), "tunnel", "run"],
-    {"TUNNEL_TOKEN": vals["CLOUDFLARE_TUNNEL_TOKEN"]},  # env, not argv: argv is visible to every user via ps
-    str(logdir / "cloudflared-reaper"),
-))
-print("wrote launch agents")
-PY
+cd "$REPO"
+REAPER_MCP_PORT="$REAPER_MCP_PORT" /usr/bin/python3 -m reaper_mcp setup
+/usr/bin/python3 -m reaper_mcp watchdog on
 
 uid=$(id -u)
-launchctl bootout "gui/$uid/com.yitian.reaper-mcp" 2>/dev/null || true
-launchctl bootout "gui/$uid/com.yitian.cloudflared-reaper" 2>/dev/null || true
-launchctl bootstrap "gui/$uid" "$LAUNCH/com.yitian.reaper-mcp.plist"
-launchctl bootstrap "gui/$uid" "$LAUNCH/com.yitian.cloudflared-reaper.plist"
-launchctl kickstart -k "gui/$uid/com.yitian.reaper-mcp"
-launchctl kickstart -k "gui/$uid/com.yitian.cloudflared-reaper"
-sleep 3
-echo "--- healthz ---"
-curl -sS -i "http://127.0.0.1:${REAPER_MCP_PORT}/healthz" | head -20 || true
-
-REAPER_SCRIPTS="$HOME/Library/Application Support/REAPER/Scripts"
-if [ -d "/Applications/REAPER.app" ] || [ -d "$HOME/Applications/REAPER.app" ] || [ -d "$HOME/Library/Application Support/REAPER" ]; then
-  mkdir -p "$REAPER_SCRIPTS"
-  if ! python3 "$REPO/reaper_mcp/install_bridge.py"; then
-    cp "$REPO/reaper_mcp/bridge.lua" "$REAPER_SCRIPTS/reaper_mcp_bridge.lua"
-  fi
-  echo "bridge ready"
-else
-  echo "REAPER app not found"
-  ls /Applications 2>/dev/null | head -50 || true
-fi
-
-bash "$REPO/scripts/install-watchdog.sh"
-
+for old in com.yitian.cloudflared-reaper "$LABEL"; do
+  launchctl bootout "gui/$uid/$old" 2> /dev/null || true
+  rm -f "$LAUNCH/$old.plist"
+done
+# the tunnel token goes in the environment, not argv: argv is visible to every user via ps
+export CLOUDFLARE_TUNNEL_TOKEN
+LABEL="$LABEL" BIN="$BIN" /usr/bin/python3 -c '
+import os, plistlib
+from pathlib import Path
+label = os.environ["LABEL"]
+log = str(Path.home() / "Library/Logs/cloudflared.log")
+path = Path.home() / "Library/LaunchAgents" / (label + ".plist")
+fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "wb") as f:
+    plistlib.dump({"Label": label, "ProgramArguments": [os.environ["BIN"] + "/cloudflared", "tunnel", "run"],
+                   "EnvironmentVariables": {"TUNNEL_TOKEN": os.environ["CLOUDFLARE_TUNNEL_TOKEN"]},
+                   "RunAtLoad": True, "KeepAlive": True, "StandardOutPath": log, "StandardErrorPath": log}, f)
+'
+launchctl bootstrap "gui/$uid" "$LAUNCH/$LABEL.plist"
 echo "=== bootstrap done $(date) ==="

@@ -15,6 +15,7 @@ Repository = "https://github.com/yiw190/gamut-reaper-suite"
 
 [project.scripts]
 reaper-mcp = "reaper_mcp.cli:main"
+gamut-reaper-suite = "reaper_mcp.cli:main"
 
 [build-system]
 requires = ["hatchling"]

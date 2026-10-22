@@ -36,7 +36,7 @@ FILES = [
     ("reaper_mcp/bridge.lua", [LIVE + ".new", f"{REPO}/reaper_mcp/bridge.lua"]),
     ("reaper_mcp/server.py", [f"{REPO}/reaper_mcp/server.py"]),
 ]
-LAUNCH_LABEL = "com.yitian.reaper-mcp"
+LAUNCH_LABEL = "com.gamut-reaper-suite.reaper-mcp"
 
 # Defer ticks (~30 per second) the old bridge keeps answering while Python reads the swap response.
 HANDOFF_TICKS = 30

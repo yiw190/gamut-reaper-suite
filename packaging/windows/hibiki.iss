@@ -30,7 +30,7 @@ SetupLogging=yes
 [Messages]
 WelcomeLabel2=Hibiki puts AI agents inside REAPER: an MCP server that drives REAPER, the Hibiki panel docked in REAPER, and a gateway for Gamut, Codex, Claude Code and Kimi.%n%nStep 1 - REAPER. It must already be installed (reaper.fm). This installer won't continue without it.%n%nStep 2 - Hibiki. Installs for this Windows user only, no administrator rights needed. Everything listens on 127.0.0.1 only.
 FinishedHeadingLabel=Step 3 - restart REAPER
-FinishedLabel=Quit REAPER and open it again. From now on the bridge starts with it and the Hibiki panel opens docked on the right. Click the agent name at the top of the panel to pick a provider and model.%n%nCheck everything in a new terminal with: hibiki doctor
+FinishedLabel=Quit REAPER and open it again. From now on the bridge starts with it and the Hibiki panel opens docked on the right. Click the agent name at the top of the panel to pick a provider and model.%n%nStep 4 - connect an agent. Gamut (desktop app): download it from updates.gamutagents.com/download/win, add your Anthropic API key and enable the REAPER MCP for your agent (needs Docker Desktop or Podman). Or a CLI agent: run  hibiki agents add claude kimi  in a terminal, then click Connect in the panel.%n%nCheck everything in a new terminal with: hibiki doctor
 
 [Files]
 Source: "{#Stage}\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs ignoreversion

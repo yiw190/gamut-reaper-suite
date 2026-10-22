@@ -32,6 +32,7 @@ Fourteen grouped tools. Multi-step edits go through `batch`; anything else throu
    package.
 3. **Restart REAPER.** The Hibiki panel opens docked on the right; click the agent name at its top to pick a provider
    and model.
+4. **Connect an agent** — Gamut or a CLI agent: see [Connect an agent](#connect-an-agent-step-4).
 
 The package isn't signed yet. If macOS says it can't verify the developer, open **System Settings → Privacy & Security**
 and click **Open Anyway**.
@@ -72,6 +73,7 @@ Release candidate: tested in CI on Windows Server, not yet on a desktop REAPER. 
    it. It installs for your Windows user only (`%LOCALAPPDATA%\Programs\Hibiki`, no administrator rights), brings its
    own Python and adds `hibiki` to your PATH. To upgrade, run a newer installer; to remove, use **Settings → Apps**.
 3. **Restart REAPER.** Same as on macOS: the panel opens docked on the right.
+4. **Connect an agent** — see [Connect an agent](#connect-an-agent-step-4).
 
 The installer isn't signed yet: if SmartScreen stops it, click **More info → Run anyway**.
 
@@ -79,6 +81,34 @@ Differences from macOS: the REAPER resource path is `%APPDATA%\REAPER`; instead 
 supervisor (`hibiki run`, windowless) keeps the MCP and the gateway running, started at logon from
 `HKCU\...\CurrentVersion\Run`; logs are in `%LOCALAPPDATA%\Hibiki\logs`; **Open in Claude Code / Kimi** opens a
 `cmd` window; the watchdog is macOS only. From a clone: `py -m reaper_mcp setup` (Python 3.9+).
+
+## Connect an agent (step 4)
+
+The panel talks to an agent; Hibiki doesn't ship one. Pick either route — or both, they show up side by side in the
+panel's **Agent settings → Provider**.
+
+**Route A — Gamut** (desktop app, agents with skills, dashboards, connected accounts):
+
+1. Prerequisites: a container runtime ([Docker Desktop](https://docs.docker.com/desktop/), [OrbStack](https://orbstack.dev/download)
+   or [Podman](https://podman.io/get-started)) and an [Anthropic API key](https://platform.claude.com/settings/keys).
+   No sign-up: Gamut runs locally.
+2. Download Gamut — [macOS (Apple Silicon)](https://updates.gamutagents.com/download/mac) ·
+   [Windows](https://updates.gamutagents.com/download/win) · [all releases](https://github.com/SkillfulAgents/SuperAgent/releases/latest)
+   ([source](https://github.com/SkillfulAgents/SuperAgent), [gamut.so](https://www.gamut.so)).
+3. Open it, add the API key, create an agent.
+4. If Gamut wasn't running when you installed Hibiki, register the MCP now: `hibiki connect gamut` (it appears in Gamut
+   as **REAPER**).
+5. In Gamut, enable the **REAPER** MCP for the agent you want to use from REAPER (remote MCPs are assigned per agent).
+6. Restart the Hibiki panel: the provider list shows **Gamut**; pick the agent under **Agent details**.
+
+**Route B — a coding-agent CLI** (Claude Code, Kimi, Codex; uses that product's own login / subscription):
+
+```bash
+hibiki agents add claude kimi      # or: codex. Installs Node into ~/.local/node, no admin rights
+```
+
+Then in the panel pick the provider and click **Connect**: a browser or terminal login opens once. The REAPER MCP is
+wired into these agents automatically.
 
 ## Manual setup (any MCP client, any OS)
 

@@ -240,7 +240,9 @@ def main():
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 
-        check("token file is private", os.stat(g.token_file).st_mode & 0o777 == 0o600)
+        # Windows has no mode bits (NTFS ACLs; the file sits in the user's profile)
+        check("token file is private", g.token_file.exists() if os.name == "nt"
+              else os.stat(g.token_file).st_mode & 0o777 == 0o600)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Authorization": ""})
         check("missing token refused", code == 403)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Host": "host.docker.internal:47892",

@@ -2,10 +2,8 @@
 
 <img src="icons/hibiki.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
-**Hibiki (響, "resonance")** puts AI agents inside [REAPER](https://reaper.fm): an MCP server that drives REAPER, the
-Hibiki panel docked in REAPER for chatting with an agent about what you have selected, and a local gateway so the
-panel can talk to [Gamut](https://github.com/SkillfulAgents/SuperAgent) agents, Codex, Claude Code, Kimi or any other
-ACP agent.
+**Hibiki is the agent inside your music editor.** Talk to it about what you're working on, let it edit, arrange
+and mix alongside you, and bring the AI agents you already use. It runs in [REAPER](https://reaper.fm) today.
 
 | Path | What |
 | --- | --- |

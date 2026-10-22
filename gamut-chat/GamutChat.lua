@@ -1257,6 +1257,7 @@ local function switch_session(id, name)
 end
 
 local function choose_agent(slug, name)
+  if slug:sub(1, 4) ~= 'acp-' then reaper.SetExtState(EXT, 'gamut_agent', slug, true) end
   if slug == S.agent then return end
   reset_view()
   S.agent, S.agent_name = slug, name
@@ -2266,7 +2267,9 @@ end
 local function agent_picker()
   local cur
   for _, a in ipairs(S.agents) do if a.slug == S.agent then cur = a end end
-  local name = S.agent == '' and 'Choose an agent' or (S.agent_name ~= '' and S.agent_name or S.agent)
+  -- Gamut's agent layer stays hidden: any Gamut agent reads as "Gamut"; its chats are the choice that shows
+  local name = S.agent == '' and 'Choose an agent'
+    or (is_acp() and (S.agent_name ~= '' and S.agent_name or S.agent) or 'Gamut')
   ImGui.PushFont(ctx, F.bold, FONT_SIZE)
   local h = ImGui.GetFrameHeight(ctx) - 2
   local w = ImGui.CalcTextSize(ctx, name) + 28 + 20
@@ -2579,14 +2582,27 @@ local function cfg_window()
 
     -- left column: Agent list, Context
     ImGui.BeginGroup(ctx)
-    section('Agent', COL)
+    section('Provider', COL)
     box('agents', COL, function(w, x0)
       if #S.agents == 0 then ImGui.TextDisabled(ctx, S.agents_err or 'loading agents…'); return end
-      local function group_label(t)
-        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-        ImGui.TextDisabled(ctx, t)
+      -- Gamut's agent layer stays hidden: one "Gamut" row stands for the current (or last used) Gamut agent
+      local want = (S.agent ~= '' and not is_acp()) and S.agent or reaper.GetExtState(EXT, 'gamut_agent')
+      local gamut, chats
+      for _, a in ipairs(S.agents) do
+        if not a.acp then
+          if a.slug == want or not gamut then gamut = a end
+        end
       end
-      local function row(a)
+      local rows = {}
+      if gamut then
+        rows[1] = { slug = gamut.slug, name = 'Gamut', acp = false, real = gamut, status = gamut.status,
+          desc = 'Agents and chats in the Gamut app', sel = S.agent ~= '' and not is_acp() }
+      end
+      for _, a in ipairs(S.agents) do
+        if a.acp then rows[#rows + 1] = { slug = a.slug, name = a.name, acp = true, real = a, desc = a.desc, sel = a.slug == S.agent } end
+      end
+      for _, r in ipairs(rows) do
+        local a = r.real
         local st = a.acp and S.acp_status[a.slug]
         local need = st and not st.connected and st.state == 'auth_required'
         local col, state = agent_state(a)
@@ -2594,33 +2610,32 @@ local function cfg_window()
         ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
         local x, y = ImGui.GetCursorScreenPos(ctx)
         local bw = need and 56 or 0
-        local hit = ImGui.InvisibleButton(ctx, '##agrow_' .. a.slug, w - bw, rh)
+        local hit = ImGui.InvisibleButton(ctx, '##agrow_' .. r.slug, w - bw, rh)
         local hov = ImGui.IsItemHovered(ctx)
-        local sel = a.slug == S.agent
-        if sel then
+        if r.sel then
           ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + rh, C.win_sel, 3)
           ImGui.DrawList_AddRect(dl, x, y, x + w, y + rh, C.marker, 3)
         elseif hov then
           ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + rh, C.win_field, 3)
         end
-        provider_icon(dl, a, x + 14, y + rh / 2, 20)
-        ImGui.PushFont(ctx, F.bold, SMALL)
-        local right = need and '' or state
+        provider_icon(dl, r, x + 15, y + rh / 2, 20)
         ImGui.PushFont(ctx, F.reg, SMALL - 2)
+        local right = need and '' or state
         local rw = right ~= '' and (ImGui.CalcTextSize(ctx, right) + 12) or 0
         ImGui.PopFont(ctx)
-        ImGui.DrawList_AddText(dl, x + 30, y + 2, C.win_text, truncate(a.name, w - 36 - math.max(rw, bw)))
+        ImGui.PushFont(ctx, F.bold, SMALL)
+        ImGui.DrawList_AddText(dl, x + 32, y + 2, C.win_text, truncate(r.name, w - 38 - math.max(rw, bw)))
         ImGui.PopFont(ctx)
         ImGui.PushFont(ctx, F.reg, SMALL - 2)
-        local desc = a.desc ~= '' and a.desc:gsub('%s+', ' ') or (a.acp and 'Local agent on this Mac' or 'Gamut agent')
-        ImGui.DrawList_AddText(dl, x + 30, y + 16, shade(C.win_text, 0x50), truncate(desc, w - 36))
+        local desc = (r.desc or '') ~= '' and r.desc:gsub('%s+', ' ') or 'Local agent on this Mac'
+        ImGui.DrawList_AddText(dl, x + 32, y + 16, shade(C.win_text, 0x50), truncate(desc, w - 38))
         if right ~= '' then
           ImGui.DrawList_AddCircleFilled(dl, x + w - rw + 3, y + 9, 3, col)
           ImGui.DrawList_AddText(dl, x + w - rw + 9, y + 3, shade(C.win_text, 0x30), right)
         end
         ImGui.PopFont(ctx)
-        if hit and not sel then choose_agent(a.slug, a.name) end
-        if hov and a.desc ~= '' then show_tip(a.desc) end
+        if hit and not r.sel then choose_agent(a.slug, a.name); load_sessions() end
+        if hov and r.acp and (r.desc or '') ~= '' then show_tip(r.desc) end
         if need then
           ImGui.SameLine(ctx, 0, 4)
           ImGui.SetCursorScreenPos(ctx, x + w - bw + 4, y + (rh - fh) / 2)
@@ -2630,20 +2645,6 @@ local function cfg_window()
           end
           ImGui.SetCursorScreenPos(ctx, x, y + rh)
           ImGui.Dummy(ctx, 0, 0)
-        end
-      end
-      local first = true
-      for _, acp in ipairs({ false, true }) do
-        local shown = false
-        for _, a in ipairs(S.agents) do
-          if (a.acp == true) == acp then
-            if not shown then
-              if not first then ImGui.Dummy(ctx, 0, 2) end
-              group_label(acp and 'On this Mac' or 'Gamut')
-              shown, first = true, false
-            end
-            row(a)
-          end
         end
       end
     end)
@@ -2679,19 +2680,69 @@ local function cfg_window()
     -- right column: Model, Session
     ImGui.SameLine(ctx, 0, GAP)
     ImGui.BeginGroup(ctx)
-    section('Model', COL)
+    section('Agent details', COL)
     box('model', COL, function(w, x0)
+      if S.agent ~= '' and not is_acp() then -- the hidden Gamut layer: which Gamut agent answers
+        label('Agent:', x0)
+        ImGui.SetNextItemWidth(ctx, w - LW)
+        local cur = S.agent_name ~= '' and S.agent_name or S.agent
+        local opened = ImGui.BeginCombo(ctx, '##cfg_gagent', cur, ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
+        local x2, y2 = ImGui.GetItemRectMax(ctx)
+        local _, y1 = ImGui.GetItemRectMin(ctx)
+        local cx, cy = x2 - 9, (y1 + y2) / 2
+        ImGui.DrawList_AddTriangleFilled(dl, cx - 3, cy - 1.5, cx + 3, cy - 1.5, cx, cy - 5, C.win_text)
+        ImGui.DrawList_AddTriangleFilled(dl, cx - 3, cy + 1.5, cx + 3, cy + 1.5, cx, cy + 5, C.win_text)
+        if opened then
+          for _, a in ipairs(S.agents) do
+            if not a.acp then
+              local on = a.slug == S.agent
+              if ImGui.Selectable(ctx, a.name .. '##ga_' .. a.slug, on) and not on then choose_agent(a.slug, a.name); load_sessions() end
+              if a.desc ~= '' and ImGui.IsItemHovered(ctx) then show_tip(a.desc) end
+              if on then ImGui.SetItemDefaultFocus(ctx) end
+            end
+          end
+          ImGui.EndCombo(ctx)
+        end
+      end
       if not (model or effort or mode) then ImGui.TextDisabled(ctx, 'loading options…'); return end
       if model then label('Model:', x0); combo(model, 'model', w - LW) end
       if effort then label('Effort:', x0); combo(effort, 'effort', w - LW) end
       if mode then label('Mode:', x0); combo(mode, 'mode', w - LW) end
     end)
-    section('Session', COL)
+    section('Chats', COL)
+    if reaper.time_precise() - (S.sess_at or 0) > 5 and S.agent ~= '' then load_sessions() end
     box('session', COL, function(w, x0)
-      local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
-      kv('Title:', truncate(title, w - LW), x0, w)
-      kv('Messages:', tostring(#S.msgs) .. (S.active and '  (working)' or ''), x0, w)
-      kv('Session:', S.sid ~= '' and S.sid:sub(1, 8) or '—', x0, w, C.marker)
+      local rh = fh
+      local n = 0
+      if S.sid == '' then
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        local x, y = ImGui.GetCursorScreenPos(ctx)
+        ImGui.Dummy(ctx, w, rh)
+        ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + rh, C.win_sel, 3)
+        ImGui.DrawList_AddRect(dl, x, y, x + w, y + rh, C.marker, 3)
+        ImGui.DrawList_AddText(dl, x + 6, y + (rh - ImGui.GetTextLineHeight(ctx)) / 2, C.win_text, 'New chat')
+      end
+      for _, x_ in ipairs(S.sessions or {}) do
+        n = n + 1
+        if n > 8 then break end
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        local x, y = ImGui.GetCursorScreenPos(ctx)
+        local hit = ImGui.InvisibleButton(ctx, '##sess_' .. x_.id, w, rh)
+        local sel = x_.id == S.sid
+        if sel then
+          ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + rh, C.win_sel, 3)
+          ImGui.DrawList_AddRect(dl, x, y, x + w, y + rh, C.marker, 3)
+        elseif ImGui.IsItemHovered(ctx) then
+          ImGui.DrawList_AddRectFilled(dl, x, y, x + w, y + rh, C.win_field, 3)
+        end
+        local ty = y + (rh - ImGui.GetTextLineHeight(ctx)) / 2
+        local aw = ImGui.CalcTextSize(ctx, x_.age or '')
+        if x_.active then ImGui.DrawList_AddCircleFilled(dl, x + 7, y + rh / 2, 3, C.ok) end
+        ImGui.DrawList_AddText(dl, x + 14, ty, C.win_text, truncate(x_.name, w - aw - 26))
+        ImGui.DrawList_AddText(dl, x + w - aw - 6, ty, shade(C.win_text, 0x50), x_.age or '')
+        if hit and not sel then switch_session(x_.id, x_.name) end
+      end
+      if n == 0 and S.sid ~= '' then ImGui.TextDisabled(ctx, 'loading chats…') end
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)) + 2)
       local bw = (w - 5) / 2
       if light_btn('new', 'New chat', bw, false) then new_chat() end

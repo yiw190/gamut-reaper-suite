@@ -296,6 +296,50 @@ def test_script_card_shows_script():
           tree and tree[0].args[3] == p.lua.globals().ImGui.TreeNodeFlags_DefaultOpen, tree)
 
 
+def test_one_click_install():
+    p = Panel()
+    p.boot([{"slug": "g1", "name": "Music", "backend": "gamut"}])
+    p.requests()
+    onb = p.m.ONB
+    onb.install("kimi")
+    (req,) = p.requests()
+    check("install: POST /api/hibiki/install to the gateway", req.method == "POST" and req.url == GATEWAY + "/api/hibiki/install"
+          and req.body == {"agent": "kimi"}, req)
+    p.reply(req, 202, {"state": "installing"})
+    (lst,) = p.requests()
+    p.reply(lst, 200, [{"key": "kimi", "slug": "acp-kimi", "name": "Kimi", "description": "d", "installed": False,
+                        "state": "installing", "error": ""}])
+    check("install: progress tracked", onb.installing == "kimi")
+    onb.load_installable()
+    (lst,) = p.requests()
+    p.reply(lst, 200, [{"key": "kimi", "slug": "acp-kimi", "name": "Kimi", "description": "d", "installed": True,
+                        "state": "done", "error": ""}])
+    (agents,) = p.requests()
+    check("install done: agent list reloaded", agents.url == GATEWAY + "/api/agents")
+    p.reply(agents, 200, [{"slug": "g1", "name": "Music", "backend": "gamut"}, {"slug": "acp-kimi", "name": "Kimi", "backend": "acp"}])
+    onb.tick()
+    check("install done: Kimi selected and settings opened for the login", p.S.agent == "acp-kimi" and p.S.cfgwin is True)
+
+
+def test_enable_reaper_in_gamut():
+    p = Panel({"agent": "g1", "agent_name": "Music"})
+    p.boot([{"slug": "g1", "name": "Music", "backend": "gamut"}])
+    p.requests()
+    onb = p.m.ONB
+    check("reaper: unknown at first", onb.reaper_enabled("g1") is None)
+    (req,) = [r for r in p.requests() if "gamut-reaper" in r.url]
+    check("reaper: asks the gateway", req.method == "GET" and req.url.endswith("/api/hibiki/gamut-reaper?agent=g1"))
+    p.reply(req, 200, {"registered": True, "enabled": False})
+    check("reaper: disabled read back", onb.reaper_enabled("g1") is False)
+    onb.enable_reaper("g1")
+    (post,) = [r for r in p.requests() if r.method == "POST"]
+    check("reaper: enable posts the agent", post.url.endswith("/api/hibiki/gamut-reaper") and post.body == {"agent": "g1"})
+    p.reply(post, 200, {"status": "enabled"})
+    (again,) = p.requests()
+    p.reply(again, 200, {"registered": True, "enabled": True})
+    check("reaper: enabled afterwards", onb.reaper_enabled("g1") is True)
+
+
 def test_windows_commands():
     """Windows only: background work goes through cmd.exe / PowerShell lines that cmd can parse."""
     if not OS_NAME.startswith("Win"):

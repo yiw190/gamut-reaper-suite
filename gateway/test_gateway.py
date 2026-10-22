@@ -18,6 +18,8 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 GAMUT_BODIES = []
+GAMUT_MCPS = [{"id": "r1", "name": "REAPER", "url": "http://localhost:8787/mcp"}]
+GAMUT_ASSIGNED = {}
 
 
 class FakeGamut(BaseHTTPRequestHandler):
@@ -45,6 +47,10 @@ class FakeGamut(BaseHTTPRequestHandler):
             return self.j({"defaultLlmProviderId": "c1", "defaultModel": "one", "defaultEffort": "high"})
         if self.path == "/api/settings":
             return self.j({"models": {"agentModel": "m1", "agentEffort": "low"}})
+        if self.path == "/api/remote-mcps":
+            return self.j({"servers": GAMUT_MCPS})
+        if self.path == "/api/agents/g1/remote-mcps":
+            return self.j({"mcps": [m for m in GAMUT_MCPS if m["id"] in GAMUT_ASSIGNED.get("g1", [])]})
         if self.path.endswith("/stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
@@ -66,6 +72,9 @@ class FakeGamut(BaseHTTPRequestHandler):
         if self.path.endswith("/upload-file"):
             ok = (self.headers.get("Content-Type") or "").startswith("multipart/form-data") and b"PNGDATA" in raw
             return self.j({"success": ok, "path": "/workspace/uploads/shot.png"} if ok else {"error": "bad"}, 200 if ok else 400)
+        if self.path == "/api/agents/g1/remote-mcps":
+            GAMUT_ASSIGNED.setdefault("g1", []).extend(json.loads(raw)["mcpIds"])
+            return self.j({"success": True})
         GAMUT_BODIES.append((self.path, json.loads(raw or b"{}")))
         self.j({"id": "gs1"}, 201)
 
@@ -216,8 +225,46 @@ def unit():
           line == 'cd /d "C:\\Users\\x\\My Songs" && set "PATH=C:\\n;%PATH%" && set "K=v w" && "C:\\n\\kimi.cmd" "--session" "s_1"' or print(line))
 
 
+def unit_install():
+    sys.path.insert(0, str(HERE))
+    import agent_gateway as ag
+    tmp = Path(tempfile.mkdtemp())
+    ag.CONFIG, ag.STATE = tmp / "config.json", tmp / "sessions"
+    ag.CONFIG.write_text(json.dumps({"acp": [{"slug": "one", "command": ["x"]}], "mcpServers": []}))
+    g = ag.Gateway.__new__(ag.Gateway)
+    g.acp = {}
+    g.reload()
+    first = g.acp["acp-one"]
+
+    def fake_install(key):  # what agents_add does to the config
+        cfg = json.loads(ag.CONFIG.read_text())
+        cfg["acp"].append({"slug": key, "command": ["y"]})
+        ag.CONFIG.write_text(json.dumps(cfg))
+
+    inst = ag.Installs(run=fake_install)
+    check("install starts", inst.start("kimi", g.reload))
+    for _ in range(100):
+        if inst.state["kimi"]["state"] != "installing":
+            break
+        time.sleep(0.02)
+    check("install: new agent loaded in place, running ones kept",
+          inst.state["kimi"]["state"] == "done" and "acp-kimi" in g.acp and g.acp["acp-one"] is first)
+
+    def boom(key):
+        raise SystemExit("Node download failed its sha256 check")
+    inst2 = ag.Installs(run=boom)
+    inst2.start("codex", g.reload)
+    for _ in range(100):
+        if inst2.state["codex"]["state"] != "installing":
+            break
+        time.sleep(0.02)
+    check("install: a failure is reported, not raised", inst2.state["codex"] == {"state": "error",
+          "error": "Node download failed its sha256 check"})
+
+
 def main():
     unit()
+    unit_install()
     gsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeGamut)
     threading.Thread(target=gsrv.serve_forever, daemon=True).start()
     gport = gsrv.server_address[1]
@@ -241,6 +288,18 @@ def main():
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 
         # Windows has no mode bits (NTFS ACLs; the file sits in the user's profile)
+        inst = g.get("/api/hibiki/installable")
+        check("hibiki: installable lists codex, claude, kimi (none installed here)",
+              [x["key"] for x in inst] == ["codex", "claude", "kimi"] and not any(x["installed"] for x in inst))
+        st = g.get("/api/hibiki/gamut-reaper?agent=g1")
+        check("hibiki: REAPER registered in Gamut, not yet enabled for g1", st == {"registered": True, "enabled": False})
+        code, r = g.post("/api/hibiki/gamut-reaper", {"agent": "g1"})
+        check("hibiki: enable assigns the MCP to the agent", code == 200 and r["status"] == "enabled"
+              and GAMUT_ASSIGNED.get("g1") == ["r1"])
+        check("hibiki: then reads as enabled", g.get("/api/hibiki/gamut-reaper?agent=g1")["enabled"] is True)
+        code, r = g.post("/api/hibiki/install", {"agent": "nope"})
+        check("hibiki: unknown install refused", code == 400)
+
         check("token file is private", g.token_file.exists() if os.name == "nt"
               else os.stat(g.token_file).st_mode & 0o777 == 0o600)
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Authorization": ""})

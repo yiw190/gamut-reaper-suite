@@ -22,6 +22,7 @@ import tarfile
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -584,6 +585,63 @@ def connect_gamut(p: Paths, remove: bool = False) -> str:
         return "Gamut isn't running at %s; run `hibiki connect gamut` once it is" % gamut_url()
 
 
+# Gamut assigns remote MCPs per agent: registering REAPER isn't enough, each agent that should drive REAPER needs it
+def gamut_reaper_id() -> str:
+    """Gamut's id for this MCP (matched by URL), or ''."""
+    servers = gamut_call("GET", "/api/remote-mcps").get("servers", [])
+    return next((s.get("id", "") for s in servers if s.get("url") == mcp_url()), "")
+
+
+def gamut_agents() -> list:
+    agents = gamut_call("GET", "/api/agents")
+    agents = agents.get("agents", []) if isinstance(agents, dict) else agents
+    return [{"slug": a["slug"], "name": a.get("name") or a["slug"]} for a in agents if isinstance(a, dict) and a.get("slug")]
+
+
+def gamut_reaper_enabled(slug: str) -> bool:
+    mcps = gamut_call("GET", "/api/agents/%s/remote-mcps" % urllib.parse.quote(slug)).get("mcps", [])
+    return any(m.get("url") == mcp_url() for m in mcps)
+
+
+def gamut_enable(p: Paths, slug: str) -> str:
+    """Register the MCP in Gamut if needed, then assign it to one agent. Returns a one-line status."""
+    mcp_id = gamut_reaper_id()
+    if not mcp_id:
+        connect_gamut(p)
+        mcp_id = gamut_reaper_id()
+    if not mcp_id:
+        return "Gamut didn't take the REAPER MCP registration"
+    if gamut_reaper_enabled(slug):
+        return "already enabled"
+    gamut_call("POST", "/api/agents/%s/remote-mcps" % urllib.parse.quote(slug), {"mcpIds": [mcp_id]})
+    return "enabled"
+
+
+def pick_gamut_agents(p: Paths, a) -> None:
+    """`connect gamut`: enable REAPER for --agent / --all-agents, or ask on a terminal."""
+    try:
+        agents = gamut_agents()
+    except (OSError, ValueError):
+        return
+    chosen = agents if a.all_agents else [x for x in agents if x["slug"] in (a.agent or [])
+                                         or x["name"] in (a.agent or [])]
+    if not chosen and not a.agent and sys.stdin and sys.stdin.isatty() and agents:
+        say("Gamut assigns MCPs per agent. Enable REAPER for:")
+        for i, x in enumerate(agents, 1):
+            say("  %d. %s%s" % (i, x["name"], "  (already)" if gamut_reaper_enabled(x["slug"]) else ""))
+        ans = input("numbers, comma-separated; 'a' = all; Enter = none: ").strip().lower()
+        if ans == "a":
+            chosen = agents
+        else:
+            idx = [int(t) for t in re.findall(r"\d+", ans)]
+            chosen = [agents[i - 1] for i in idx if 0 < i <= len(agents)]
+    for x in chosen:
+        say("  %s: %s" % (x["name"], gamut_enable(p, x["slug"])))
+    if not chosen:
+        say("  REAPER isn't enabled for any agent yet: `hibiki connect gamut --agent <name>`, "
+            "or the Hibiki panel's Agent settings")
+
+
 def json_client(path: Path, key: str, remove: bool) -> str:
     cfg = load_json(path) if path.exists() else {}
     servers = cfg.setdefault(key, {})
@@ -673,7 +731,7 @@ def ensure_node(p: Paths) -> Path:
     return bin_dir
 
 
-def agents_add(p: Paths, slugs: list) -> None:
+def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
     unknown = [s for s in slugs if s not in ACP_AGENTS]
     if unknown:
         raise SystemExit("unknown agent(s) %s; choose from %s" % (", ".join(unknown), ", ".join(ACP_AGENTS)))
@@ -701,7 +759,9 @@ def agents_add(p: Paths, slugs: list) -> None:
             entry["loginVariants"] = a["loginVariants"]
         cfg["acp"] = [x for x in cfg.get("acp", []) if x.get("slug") != slug] + [entry]
     write_json(p.gw_cfg, cfg)
-    if WINDOWS:
+    if not restart:  # the gateway itself installing (panel button): it loads the new agents in place
+        pass
+    elif WINDOWS:
         if win_supervisor_pid(p):
             win_services_start(p)  # restarts the gateway with the new agents
     elif loaded(GW_LABEL):
@@ -828,6 +888,8 @@ def cmd_connect(a) -> int:
         if a.client == "all" and not present(p):
             continue
         say("%s: %s" % (name, fn(p, remove=a.remove)))
+        if name == "gamut" and not a.remove:
+            pick_gamut_agents(p, a)
     return 0
 
 
@@ -891,6 +953,8 @@ def parser() -> argparse.ArgumentParser:
     c = sub.add_parser("connect", help="register the MCP in a client")
     c.add_argument("client", choices=["all", *CLIENTS])
     c.add_argument("--remove", action="store_true")
+    c.add_argument("--agent", action="append", metavar="NAME|SLUG", help="gamut: enable REAPER for this agent")
+    c.add_argument("--all-agents", action="store_true", help="gamut: enable REAPER for every agent")
     c.set_defaults(fn=cmd_connect)
     w = sub.add_parser("watchdog", help="relaunch REAPER after crashes (for an unattended Mac)")
     w.add_argument("state", choices=["on", "off"])

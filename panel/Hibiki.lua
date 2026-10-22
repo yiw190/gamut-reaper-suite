@@ -1100,15 +1100,18 @@ local function context(full)
   return table.concat(L, '\n'), table.concat(chip, ' · ')
 end
 
-local chip_cache, chip_at = '', 0
-local function chip_text()
-  local now = reaper.time_precise()
-  if now - chip_at > 0.25 then
-    chip_at = now
-    local _, c = context(false)
-    chip_cache = c
+local chip_text
+do
+  local chip_cache, chip_at = '', 0
+  function chip_text()
+    local now = reaper.time_precise()
+    if now - chip_at > 0.25 then
+      chip_at = now
+      local _, c = context(false)
+      chip_cache = c
+    end
+    return chip_cache
   end
-  return chip_cache
 end
 
 local CTX_OPEN = '[REAPER context — auto-attached by the Hibiki panel in REAPER; #N = REAPER track number, MCP index = N-1]'
@@ -1442,6 +1445,80 @@ local function choose_agent(slug, name)
   S.focus = true
 end
 
+---------------------------------------------------------------- onboarding: install a CLI agent, enable REAPER in Gamut
+-- one table (the main chunk is near Lua's 200-local limit); all of it goes through the gateway's /api/hibiki routes
+local ONB = { installable = nil, inst_at = 0, reaper = {}, busy = {} }
+do
+  local GW_ = HOSTS[1]
+  ONB.gamut_url = WIN and 'https://updates.gamutagents.com/download/win' or 'https://updates.gamutagents.com/download/mac'
+  function ONB.open_url(url)
+    if WIN then win_bg('start "" ' .. q(url)) else sh('/usr/bin/open ' .. q(url) .. ' >/dev/null 2>&1 &') end
+  end
+  -- installable = nil (not asked yet), false (gateway not answering) or the list
+  function ONB.load_installable()
+    ONB.inst_at = reaper.time_precise()
+    http_url('GET', GW_ .. '/api/hibiki/installable', nil, function(code, body)
+      local list = code == 200 and decode(body)
+      if type(list) ~= 'table' then ONB.installable = false; return end
+      local was = ONB.installing
+      ONB.installing = nil
+      for _, x in ipairs(list) do if x.state == 'installing' then ONB.installing = x.key end end
+      ONB.installable = list
+      for _, x in ipairs(list) do -- just finished: show it, select it, open its settings for the login
+        if was and x.key == was and x.installed then ONB.just = { slug = x.slug, name = x.name }; load_agents() end
+      end
+    end)
+  end
+  function ONB.install(key)
+    ONB.installing, ONB.err = key, nil
+    http_url('POST', GW_ .. '/api/hibiki/install', '{"agent":' .. jstr(key) .. '}', function(code, body)
+      if code ~= 202 then
+        local r = decode(body)
+        ONB.installing, ONB.err = nil, (type(r) == 'table' and sval(r.error)) or ('install failed (' .. code .. ')')
+      end
+      ONB.load_installable()
+    end)
+  end
+  function ONB.tick()
+    local now = reaper.time_precise()
+    if ONB.installable == nil or now - ONB.inst_at > (ONB.installing and 2 or 30) then ONB.load_installable() end
+    if ONB.just then
+      for _, a in ipairs(S.agents) do
+        if a.slug == ONB.just.slug then
+          choose_agent(a.slug, a.name)
+          S.cfgwin, ONB.just = true, nil
+          load_acp_status(a.slug, true)
+          break
+        end
+      end
+    end
+  end
+  function ONB.load_reaper(slug)
+    ONB.reaper[slug] = ONB.reaper[slug] or {}
+    ONB.reaper[slug].at = reaper.time_precise()
+    http_url('GET', GW_ .. '/api/hibiki/gamut-reaper?agent=' .. slug, nil, function(code, body)
+      local r = code == 200 and decode(body)
+      if type(r) == 'table' then ONB.reaper[slug] = { enabled = r.enabled == true, registered = r.registered == true,
+        at = reaper.time_precise() } end
+    end)
+  end
+  -- Gamut agents only: true / false once known, nil while unknown (or no gateway)
+  function ONB.reaper_enabled(slug)
+    local r = ONB.reaper[slug]
+    if not r or reaper.time_precise() - (r.at or 0) > 15 then ONB.load_reaper(slug) end
+    return r and r.enabled
+  end
+  function ONB.enable_reaper(slug)
+    ONB.busy[slug] = true
+    http_url('POST', GW_ .. '/api/hibiki/gamut-reaper', '{"agent":' .. jstr(slug) .. '}', function(code, body)
+      ONB.busy[slug] = nil
+      local r = decode(body)
+      if code ~= 200 then ONB.err = (type(r) == 'table' and sval(r.error)) or ('Gamut refused (' .. code .. ')') end
+      ONB.load_reaper(slug)
+    end)
+  end
+end
+
 ---------------------------------------------------------------- UI setup
 local ctx = ImGui.CreateContext('Hibiki') -- the panel's name (docker tab)
 local function font_file(path, index)
@@ -1464,6 +1541,8 @@ for _, f in pairs(F) do ImGui.Attach(ctx, f) end
 -- Latin text follows the REAPER theme's UI font. The .ReaperTheme stores fonts as LOGFONT hex (face name from byte
 -- 28); the face used most is the theme's UI font. It usually has no CJK glyphs and ReaImGui has no glyph fallback,
 -- so Chinese (and symbols like ◆ →) stay on PingFang: see font_for() and the per-token pick in layout_inline.
+local load_theme_fonts -- helpers scoped: the main chunk is near Lua's 200-local limit
+do
 local FONT_DIRS = { (os.getenv('HOME') or '') .. '/Library/Fonts', '/Library/Fonts', '/System/Library/Fonts',
   '/System/Library/Fonts/Supplemental' }
 local function theme_face(theme)
@@ -1509,7 +1588,7 @@ local function face_files(face)
   end
   return reg, bold
 end
-local function load_theme_fonts()
+function load_theme_fonts()
   for _, f in ipairs({ F.ui, F.ui_bold }) do
     if f and f ~= F.reg and f ~= F.bold then ImGui.Detach(ctx, f) end
   end
@@ -1527,6 +1606,7 @@ local function load_theme_fonts()
   if F.ui_bold ~= F.bold then ImGui.Attach(ctx, F.ui_bold) end
   S.theme_font = face and (face .. (reg and '' or ' (not installed)')) or 'none'
   reaper.SetExtState(EXT, 'theme_font', S.theme_font .. ' | ' .. tostring(reg) .. ' | ' .. tostring(bold), false)
+end
 end
 -- plain Latin (ASCII + Latin-1, e.g. "·") in the theme font; anything from U+2000 up (CJK, ◆, →) in PingFang
 local function font_for(str) return str:find('[\226-\244]') and F.reg or F.ui end
@@ -2265,17 +2345,6 @@ local function icon_button(id, kind, col, tip)
   return clicked
 end
 
-local function agent_dot(a)
-  if not a.acp then return C.ok end
-  local st = S.acp_status[a.slug]
-  if not st then return C.muted end
-  if st.connected then return C.ok end
-  if st.state == 'starting' or st.state == 'authenticating' then return C.warn end
-  return C.muted
-end
-
-local NO_CLOSE = ImGui.SelectableFlags_NoAutoClosePopups or ImGui.SelectableFlags_DontClosePopups or 0
-
 -- one picker for every backend: Gamut agents and local ACP agents, each with a status dot and Connect
 local function agent_state(a) -- status colour + short text for the menu
   if not a.acp then
@@ -2416,8 +2485,8 @@ end
 
 -- Agent settings pops out as a real window in the style of REAPER's Routing window: small type, two columns of
 -- grey group boxes with labelled rows, white fields, light buttons, LED toggles
-local SMALL = 12
 local function cfg_window()
+  local SMALL = 12
   -- other scripts (the agent via MCP) can pop the window open: SetExtState('Hibiki', 'open', 'settings')
   if reaper.GetExtState(EXT, 'open') == 'settings' then reaper.DeleteExtState(EXT, 'open', false); S.cfgwin = true end
   if not S.cfgwin then return end
@@ -2589,7 +2658,15 @@ local function cfg_window()
     if gamut then provs[1] = { name = 'Gamut', acp = false, slug = gamut.slug, real = gamut } end
     for _, a in ipairs(S.agents) do if a.acp then provs[#provs + 1] = { name = a.name, acp = true, slug = a.slug, real = a } end end
     for _, r in ipairs(provs) do if (r.acp and r.slug == S.agent) or (not r.acp and S.agent ~= '' and not is_acp()) then cur = r end end
+    ONB.tick()
+    -- CLI agents the gateway can install; picking one shows its Install box instead of a provider
+    local extra = {}
+    for _, x in ipairs(ONB.installable or {}) do if not x.installed then extra[#extra + 1] = x end end
+    local pending
+    for _, x in ipairs(extra) do if x.key == S.pending_install then pending = x end end
+    if pending then cur = nil end
     local function pick_provider(r)
+      S.pending_install = nil
       if r ~= cur then choose_agent(r.real.slug, r.real.name); load_sessions() end
     end
     local function arrows(x2, y1, y2)
@@ -2603,8 +2680,8 @@ local function cfg_window()
     section('Provider', COL)
     ImGui.SetNextItemWidth(ctx, COL)
     local px, py = ImGui.GetCursorScreenPos(ctx)
-    local opened = ImGui.BeginCombo(ctx, '##cfg_provider', cur and cur.name or 'Choose a provider',
-      ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
+    local opened = ImGui.BeginCombo(ctx, '##cfg_provider', pending and (pending.name .. ' (not installed)')
+      or (cur and cur.name) or 'Choose a provider', ImGui.ComboFlags_HeightLarge | ImGui.ComboFlags_NoArrowButton)
     arrows(px + COL, py, py + fh)
     if opened then
       local pdl = ImGui.GetWindowDrawList(ctx)
@@ -2620,10 +2697,41 @@ local function cfg_window()
         end
         if r.acp and r.real.desc ~= '' and ImGui.IsItemHovered(ctx) then show_tip(r.real.desc) end
       end
+      if #extra > 0 then ImGui.Separator(ctx) end
+      for _, x in ipairs(extra) do
+        if ImGui.Selectable(ctx, x.name .. '##inst_' .. x.key, x == pending) then S.pending_install = x.key end
+        local _, sy1 = ImGui.GetItemRectMin(ctx)
+        local sx2 = ImGui.GetItemRectMax(ctx)
+        local t = ONB.installing == x.key and 'installing…' or 'install'
+        ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), sx2 - ImGui.CalcTextSize(ctx, t) - 2, sy1, C.marker, t)
+      end
+      if ImGui.Selectable(ctx, 'Gamut (desktop app)##getgamut', false) and not provs[1] then ONB.open_url(ONB.gamut_url) end
+      if ImGui.IsItemHovered(ctx) then show_tip('Opens the Gamut download. It needs Docker Desktop, OrbStack or Podman '
+        .. 'and an Anthropic API key; no sign-up.') end
       ImGui.EndCombo(ctx)
     end
     ImGui.Dummy(ctx, 0, 2)
-    if cur then
+    if pending then
+      box('install', COL, function(w, x0)
+        local busy = ONB.installing == pending.key
+        ImGui.AlignTextToFramePadding(ctx)
+        ImGui.Text(ctx, pending.name)
+        local bt = busy and 'Installing…' or 'Install'
+        local bw = ImGui.CalcTextSize(ctx, bt) + 16
+        ImGui.SameLine(ctx)
+        ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+        if light_btn('install', bt, bw, false, busy or ONB.installing ~= nil) then ONB.install(pending.key) end
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.TextDisabled(ctx, pending.description)
+        ImGui.TextDisabled(ctx, busy and 'Downloading Node and the CLI into ~/.local/node (no admin rights). '
+          .. 'Takes a minute or two; you log in once it is done.'
+          or 'Installs Node and the CLI into ~/.local/node, no admin rights. You log in with its own account.')
+        local err = (pending.error ~= '' and pending.error) or ONB.err
+        if err then ImGui.TextColored(ctx, C.razor, err) end
+        ImGui.PopTextWrapPos(ctx)
+      end)
+    elseif cur then
       box('provider', COL, function(w, x0)
         local a = cur.real
         local st = a.acp and S.acp_status[a.slug]
@@ -2675,6 +2783,26 @@ local function cfg_window()
                 end
               end
               ImGui.EndCombo(ctx)
+            end
+          end)
+        end
+        if not cur.acp and via_gateway() then -- Gamut gives MCP servers to agents one by one
+          row('REAPER:', function(cw)
+            local en = ONB.reaper_enabled(S.agent)
+            if en then
+              local x1, y1 = ImGui.GetCursorScreenPos(ctx)
+              ImGui.DrawList_AddCircleFilled(dl, x1 + 4, y1 + fh / 2, 3, C.ok)
+              ImGui.SetCursorScreenPos(ctx, x1 + 12, y1)
+              ImGui.AlignTextToFramePadding(ctx)
+              ImGui.Text(ctx, 'enabled for this agent')
+            elseif en == false then
+              local busy = ONB.busy[S.agent]
+              if light_btn('enreaper', busy and 'Enabling…' or 'Enable for this agent', cw, false, busy) then
+                ONB.enable_reaper(S.agent)
+              end
+            else
+              ImGui.AlignTextToFramePadding(ctx)
+              ImGui.TextDisabled(ctx, 'checking…')
             end
           end)
         end
@@ -2822,6 +2950,9 @@ local function card_list()
   if S.auth and is_acp() then L[#L + 1] = { kind = 'auth', key = 'auth' } end
   for _, q in ipairs(S.greqs) do L[#L + 1] = { kind = 'greq', key = 'g' .. q.id, q = q } end
   if S.waiting and #S.greqs == 0 then L[#L + 1] = { kind = 'wait', key = 'wait' } end
+  if S.agent ~= '' and not is_acp() and via_gateway() and ONB.reaper_enabled(S.agent) == false then
+    L[#L + 1] = { kind = 'reaper', key = 'reaper' }
+  end
   return L
 end
 local function cards_height(L)
@@ -3027,6 +3158,12 @@ local function card(c)
       if S.auth.err then wrapped(S.auth.err, C.danger) end
     elseif c.kind == 'greq' then
       greq_card(c.q, who)
+    elseif c.kind == 'reaper' then
+      wrapped(who .. " can't use REAPER yet: Gamut gives MCP servers to agents one by one")
+      if primary((ONB.busy[S.agent] and 'Enabling…' or 'Enable REAPER for ' .. who) .. '##enreaper') and not ONB.busy[S.agent] then
+        ONB.enable_reaper(S.agent)
+      end
+      if ONB.err then wrapped(ONB.err, C.danger) end
     else
       ImGui.Text(ctx, truncate(who .. ' is asking you something', w))
       if primary('Answer in Gamut') then open_in_gamut() end
@@ -3044,8 +3181,9 @@ local DOCK_FLAG = 'docked_v4' -- bumped when the context name changes: ReaImGui 
 -- Port of Gamut's follow engine (SuperAgent use-message-list-scroll.ts): following pins the live edge as content
 -- grows; an upward wheel escapes at once; coming back within ATTACH_PX re-engages. Motion is a time-based
 -- exponential chase so it is frame-rate independent at REAPER's ~33 fps defer.
-local ATTACH_PX, SNAP_GAP_PX, CHASE_RATE = 70, 120, 30
+local ATTACH_PX = 70
 local function scroll_engine()
+  local SNAP_GAP_PX, CHASE_RATE = 120, 30
   local now = reaper.time_precise()
   local dt = math.min(0.064, now - (S.sc_t or now))
   S.sc_t = now
@@ -3089,11 +3227,13 @@ local function perf_tick(t0)
   end
 end
 
+local ime_scan
+do
 local IME_NAV = { 'Key_LeftArrow', 'Key_RightArrow', 'Key_UpArrow', 'Key_DownArrow', 'Key_Home', 'Key_End',
   'Key_PageUp', 'Key_PageDown', 'Key_Delete' }
 local function pressed(name) return ImGui.IsKeyPressed(ctx, ImGui[name]) end
 -- returns 'enter' (IME commit, don't send), 'restore' (undo ImGui's edit) or nil; tracks S.ime = typed pinyin
-local function ime_scan()
+function ime_scan()
   if not S.comp_active then S.ime = ''; return nil end
   local chars = 0
   while ImGui.GetInputQueueCharacter(ctx, chars) do chars = chars + 1 end
@@ -3115,6 +3255,7 @@ local function ime_scan()
     if #S.ime > 0 and ImGui.IsKeyPressed(ctx, ImGui.Key_Apostrophe, false) then S.ime = S.ime .. "'" end
   end
   return act
+end
 end
 
 local safe_frame
@@ -3149,9 +3290,45 @@ local function frame()
     header()
 
     if S.agent == '' then
-      ImGui.Dummy(ctx, 0, 40)
+      -- onboarding: no agent chosen yet
+      ONB.tick()
+      ImGui.Dummy(ctx, 0, 24)
       ImGui.PushTextWrapPos(ctx, 0)
-      ImGui.TextDisabled(ctx, 'Pick an agent at the top left to start.')
+      ImGui.PushFont(ctx, F.bold, FONT_SIZE + 2)
+      ImGui.Text(ctx, 'Connect an agent')
+      ImGui.PopFont(ctx)
+      ImGui.TextDisabled(ctx, 'Hibiki is the panel; the agent that does the work is yours to pick.')
+      ImGui.Dummy(ctx, 0, 6)
+      if #S.agents > 0 then
+        ImGui.Text(ctx, #S.agents == 1 and 'One agent is ready.' or (#S.agents .. ' agents are ready.'))
+        if chip('onb_open', 'Choose one', C.accent, false) then S.cfgwin = true end
+        ImGui.Dummy(ctx, 0, 6)
+      end
+      if ONB.installable then
+        local any = false
+        for _, x in ipairs(ONB.installable) do
+          if not x.installed then
+            if any then ImGui.SameLine(ctx, 0, 4) end
+            any = true
+            local busy = ONB.installing == x.key
+            if chip('onb_' .. x.key, busy and ('Installing ' .. x.name .. '…') or ('Install ' .. x.name), C.accent, false)
+                and not ONB.installing then
+              ONB.install(x.key)
+            end
+            if ImGui.IsItemHovered(ctx) then show_tip(x.description .. '\nNode and the CLI go into ~/.local/node, no admin '
+              .. 'rights; you log in with its own account once it is installed.') end
+          end
+        end
+        if any then ImGui.TextDisabled(ctx, 'A coding-agent CLI with its own login. One click, about a minute.') end
+        if ONB.err then ImGui.TextColored(ctx, C.danger, ONB.err) end
+        ImGui.Dummy(ctx, 0, 6)
+      elseif ONB.installable == false then
+        ImGui.TextColored(ctx, C.warn, "Hibiki's gateway isn't answering. Run  hibiki doctor  in a terminal.")
+        ImGui.Dummy(ctx, 0, 6)
+      end
+      if chip('onb_gamut', 'Download Gamut', C.text, false) then ONB.open_url(ONB.gamut_url) end
+      ImGui.TextDisabled(ctx, 'Gamut: the desktop app with agents, skills and dashboards. Needs Docker Desktop, OrbStack '
+        .. 'or Podman and an Anthropic API key; no sign-up. Once it runs, its agents appear here.')
       ImGui.PopTextWrapPos(ctx)
     else
       local cards = card_list()
@@ -3326,6 +3503,7 @@ S.boot = true
 load_agents()
 if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
-    greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL }
+    greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
+    ONB = ONB }
 end
 reaper.defer(safe_frame)

@@ -19,6 +19,7 @@ STARTUP = (ROOT / "reaper" / "__startup.lua").read_text()
 
 class FakeGamut(BaseHTTPRequestHandler):
     servers: list = []
+    assigned: dict = {}  # agent slug -> [mcp ids]
 
     def log_message(self, *a):
         pass
@@ -34,10 +35,20 @@ class FakeGamut(BaseHTTPRequestHandler):
         return json.loads(self.rfile.read(int(self.headers.get("Content-Length") or 0)) or b"{}")
 
     def do_GET(self):
+        if self.path == "/api/agents":
+            return self._reply([{"slug": "ag1", "name": "Music"}, {"slug": "ag2", "name": "Other"}])
+        if self.path.endswith("/remote-mcps") and self.path.startswith("/api/agents/"):
+            slug = self.path.split("/")[3]
+            ids = FakeGamut.assigned.get(slug, [])
+            return self._reply({"mcps": [s for s in self.servers if s["id"] in ids]})
         self._reply({"servers": self.servers})
 
     def do_POST(self):
         b = self._body()
+        if self.path.startswith("/api/agents/"):
+            slug = self.path.split("/")[3]
+            FakeGamut.assigned.setdefault(slug, []).extend(i for i in b["mcpIds"] if i not in FakeGamut.assigned.get(slug, []))
+            return self._reply({"success": True})
         self.servers.append(dict(b, id="s%d" % len(self.servers)))
         self._reply({})
 
@@ -150,6 +161,14 @@ def main():
     rows = {r["check"]: r for r in json.loads(out[out.index("["):])} if "[" in out else {}
     check("doctor flags an outdated bridge", rc == 1 and rows.get("bridge script", {}).get("level") == "FAIL", out)
     check("doctor sees the Gamut registration", rows.get("Gamut", {}).get("level") == "ok", out)
+
+    rc, out = run(home, "connect", "gamut", "--agent", "Music", gamut=gamut)
+    check("connect gamut --agent: REAPER assigned to that agent only",
+          rc == 0 and FakeGamut.assigned.get("ag1") == [FakeGamut.servers[0]["id"]] and "ag2" not in FakeGamut.assigned
+          and "Music: enabled" in out, out)
+    rc, out = run(home, "connect", "gamut", "--all-agents", gamut=gamut)
+    check("connect gamut --all-agents: idempotent for the first, enables the rest",
+          "Music: already enabled" in out and "Other: enabled" in out and FakeGamut.assigned["ag1"] == [FakeGamut.servers[0]["id"]], out)
 
     rc, out = run(home, "connect", "cursor", "--remove")
     check("connect --remove", rc == 0 and "reaper" not in json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"], out)

@@ -885,19 +885,67 @@ def gamut_body(body):
     return body
 
 
+# ---------------------------------------------------------------- Hibiki: installs and Gamut's REAPER MCP
+
+def suite():
+    """reaper_mcp.suite from the same tree (clone or installed app): one implementation for the CLI and the panel."""
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from reaper_mcp import suite as s
+    return s
+
+
+class Installs:
+    """`hibiki agents add <key>` run in the background for the panel's Install button; one at a time."""
+
+    def __init__(self, run=None):
+        self.state = {}  # key -> {"state": "installing" | "done" | "error", "error": str}
+        self.lock = threading.Lock()
+        self.run = run or (lambda key: suite().agents_add(suite().Paths(), [key], restart=False))
+
+    def start(self, key, on_done):
+        with self.lock:
+            if any(v["state"] == "installing" for v in self.state.values()):
+                return False
+            self.state[key] = {"state": "installing", "error": ""}
+
+        def work():
+            try:
+                self.run(key)
+                on_done()
+                self.state[key] = {"state": "done", "error": ""}
+            except BaseException as e:  # agents_add raises SystemExit on a failed download check
+                log("install", key, "failed:", repr(e))
+                self.state[key] = {"state": "error", "error": str(e) or repr(e)}
+
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+
 # ---------------------------------------------------------------- HTTP
+
+def mcp_specs(cfg):
+    return [{"name": m["name"], "command": expand(m["command"]), "args": [expand(a) for a in m.get("args", [])],
+             "env": [{"name": k, "value": expand(v)} for k, v in (m.get("env") or {}).items()]}
+            for m in cfg.get("mcpServers", [])]
+
 
 class Gateway:
     def __init__(self):
         self.token = load_token()
-        cfg = load_config()
-        mcp = [{"name": m["name"], "command": expand(m["command"]), "args": [expand(a) for a in m.get("args", [])],
-                "env": [{"name": k, "value": expand(v)} for k, v in (m.get("env") or {}).items()]}
-               for m in cfg.get("mcpServers", [])]
         self.acp = {}
+        self.installs = Installs()
+        self.reload()
+
+    def reload(self):
+        """Pick up ACP agents added to the config (by an install) without restarting; running ones stay as they are."""
+        cfg = load_config()
+        mcp = mcp_specs(cfg)
         for spec in cfg.get("acp", []):
-            a = AcpAgent(spec, mcp)
-            self.acp[a.slug] = a
+            if ACP_PREFIX + spec["slug"] not in self.acp:
+                a = AcpAgent(spec, mcp)
+                self.acp[a.slug] = a
 
 
 GW = None
@@ -975,6 +1023,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"ok": True})
             if method == "GET" and parts == ["api", "agents"]:
                 return self.agents()
+            if parts[:2] == ["api", "hibiki"]:
+                return self.hibiki(method, parts[2:])
             if len(parts) >= 3 and parts[:2] == ["api", "agents"]:
                 slug, rest = parts[2], parts[3:]
                 if slug in GW.acp:
@@ -1010,6 +1060,31 @@ class Handler(BaseHTTPRequestHandler):
             out.append({"slug": a.slug, "name": a.name, "description": a.spec.get("description", ""),
                         "backend": "acp"})
         self.reply(200, out)
+
+    def hibiki(self, method, rest):
+        if rest == ["installable"] and method == "GET":
+            out = []
+            for key, a in suite().ACP_AGENTS.items():
+                st = GW.installs.state.get(key, {})
+                out.append({"key": key, "slug": ACP_PREFIX + key, "name": a["name"], "description": a["description"],
+                            "installed": ACP_PREFIX + key in GW.acp, "state": st.get("state", ""), "error": st.get("error", "")})
+            return self.reply(200, out)
+        if rest == ["install"] and method == "POST":
+            key = self.json.get("agent")
+            if key not in suite().ACP_AGENTS:
+                return self.reply(400, {"error": "unknown agent"})
+            if not GW.installs.start(key, GW.reload):
+                return self.reply(409, {"error": "another install is running"})
+            return self.reply(202, {"state": "installing"})
+        if rest == ["gamut-reaper"]:
+            s = suite()
+            if method == "GET":
+                slug = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("agent", [""])[0]
+                return self.reply(200, {"registered": bool(s.gamut_reaper_id()),
+                                        "enabled": bool(slug) and s.gamut_reaper_enabled(slug)})
+            if method == "POST" and self.json.get("agent"):
+                return self.reply(200, {"status": s.gamut_enable(s.Paths(), self.json["agent"])})
+        return self.reply(404, {"error": "unknown hibiki route"})
 
     def acp_route(self, method, a, rest):
         b = self.json

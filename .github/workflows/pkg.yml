@@ -54,6 +54,7 @@ jobs:
   windows:
     name: build + install the .exe on Windows
     runs-on: windows-latest
+    timeout-minutes: 25
     defaults:
       run:
         shell: pwsh
@@ -78,7 +79,8 @@ jobs:
         run: |
           if (Test-Path "$env:ProgramFiles\REAPER (x64)\reaper.exe") { throw "the runner already has REAPER" }
           $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
-          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          $p.WaitForExit()  # not -Wait: PowerShell 7 waits for the whole tree, and the supervisor never exits
           if ($p.ExitCode -eq 0) { throw "installed without REAPER" }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki") { throw "files left behind" }
       - name: install, doctor, MCP over HTTP with the bundled Python
@@ -86,7 +88,8 @@ jobs:
           New-Item -ItemType Directory -Force "$env:ProgramFiles\REAPER (x64)" | Out-Null
           Set-Content "$env:ProgramFiles\REAPER (x64)\reaper.exe" "stand-in: the runner has no REAPER"
           $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
-          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$PWD\inno.log" -Wait -PassThru
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$PWD\inno.log" -PassThru
+          $p.WaitForExit()
           Get-Content "$env:LOCALAPPDATA\Hibiki\logs\install.log"
           if ($p.ExitCode -ne 0) { Get-Content inno.log; throw "install failed: $($p.ExitCode)" }
           $hibiki = "$env:LOCALAPPDATA\Programs\Hibiki\bin\hibiki.cmd"
@@ -112,13 +115,14 @@ jobs:
       - name: re-install over itself (upgrade path)
         run: |
           $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
-          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -PassThru
+          $p.WaitForExit()
           if ($p.ExitCode -ne 0) { throw "upgrade failed: $($p.ExitCode)" }
           & "$env:LOCALAPPDATA\Programs\Hibiki\bin\hibiki.cmd" doctor
           if ($LASTEXITCODE -ne 0) { throw "doctor failed after upgrade" }
       - name: uninstall
         run: |
-          Start-Process "$env:LOCALAPPDATA\Programs\Hibiki\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+          (Start-Process "$env:LOCALAPPDATA\Programs\Hibiki\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -PassThru).WaitForExit()
           foreach ($i in 1..30) { if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki")) { break }; Start-Sleep 1 }
           if (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki") { throw "app folder left behind" }
           if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).Hibiki) { throw "autostart left behind" }

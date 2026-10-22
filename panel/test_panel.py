@@ -22,6 +22,7 @@ GAMUT = "http://127.0.0.1:47891"
 
 FAKES = r"""
 EXT_STATE, CMDS, UI = {}, {}, {}
+OS_NAME = OS_NAME or 'macOS-arm64'
 NOW = 1000.0
 HIBIKI_TEST = {
   sh = function(cmd)
@@ -38,6 +39,7 @@ reaper = setmetatable({
   time_precise = function() return NOW end,
   get_action_context = function() return false, '', 0, 0 end,
   GetResourcePath = function() return '/nonexistent' end,
+  GetOS = function() return OS_NAME end,
   GetLastColorThemeFile = function() return '' end,
   EnumProjects = function() return 0, '' end,
   GetProjectName = function() return 'Song.RPP' end,
@@ -74,6 +76,7 @@ package.preload.imgui = function() return function() return ImGui end end
 """
 
 failures: list[str] = []
+OS_NAME = "macOS-arm64"  # main() runs every test once per OS
 
 
 def check(label, cond, extra=""):
@@ -82,18 +85,22 @@ def check(label, cond, extra=""):
         failures.append(label)
 
 
+# one quoted shell argument: '...' on macOS, "..." in the Windows cmd.exe lines
+QA = r"""['"]([^'"]+)['"]"""
+
+
 class Request:
     def __init__(self, cmd):
         self.cmd = cmd
-        self.stream = "curl -s -N" in cmd
-        self.url = re.findall(r"'(https?://[^']+)'", cmd)[0]
+        self.stream = re.search(r"curl(\.exe['\"])? -s -N", cmd) is not None
+        self.url = re.findall(r"""['"](https?://[^'"]+)['"]""", cmd)[0]
         m = re.search(r"-X (\w+)", cmd)
         self.method = m.group(1) if m else ("GET" if self.stream else "POST")
-        m = re.search(r"-o '([^']+)\.out'", cmd)
-        self.base = m.group(1) if m else None
-        m = re.search(r"--data-binary @'([^']+)'", cmd)
+        m = re.search(r"-o " + QA, cmd)
+        self.base = m.group(1)[:-4] if m else None
+        m = re.search(r"--data-binary @" + QA, cmd)
         self.body = json.loads(Path(m.group(1)).read_text()) if m else None
-        m = re.search(r"-H @'([^']+)'", cmd)
+        m = re.search(r"-H @" + QA, cmd)
         self.auth = Path(m.group(1)).read_text() if m else None
 
     def __repr__(self):
@@ -107,13 +114,14 @@ class Panel:
         import lupa
 
         self.tmp = Path(tempfile.mkdtemp())
-        os.environ["TMPDIR"] = str(self.tmp)
-        os.environ["HOME"] = str(self.tmp)
+        for k in ("TMPDIR", "TEMP", "HOME", "USERPROFILE"):
+            os.environ[k] = str(self.tmp)
         (self.tmp / "hibiki").mkdir()
         if token is not None:
             (self.tmp / ".config/agent-gateway").mkdir(parents=True)
             (self.tmp / ".config/agent-gateway/token").write_text(token + "\n")
         self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        self.lua.globals().OS_NAME = OS_NAME
         self.lua.execute(FAKES)
         state = self.lua.globals().EXT_STATE
         for k, v in {"ctx_level": "0", **(ext or {})}.items():
@@ -129,7 +137,7 @@ class Panel:
         while self.seen < len(cmds):
             self.seen += 1
             cmd = cmds[self.seen]
-            if "/usr/bin/curl" in cmd:
+            if "/usr/bin/curl" in cmd or "curl.exe" in cmd:
                 out.append(Request(cmd))
         return out
 
@@ -288,19 +296,44 @@ def test_script_card_shows_script():
           tree and tree[0].args[3] == p.lua.globals().ImGui.TreeNodeFlags_DefaultOpen, tree)
 
 
+def test_windows_commands():
+    """Windows only: background work goes through cmd.exe / PowerShell lines that cmd can parse."""
+    if not OS_NAME.startswith("Win"):
+        return
+    p = Panel(SESSION, token="tok")
+    p.boot()
+    cmds = [c for c in p.lua_list(p.lua.globals().CMDS)]
+    curl = [c for c in cmds if "curl.exe" in c]
+    check("win: every curl runs inside cmd.exe /D /S /C with balanced quotes",
+          curl and all(re.match(r'^"[^"]+cmd\.exe" /D /S /C ".*"$', c) and c.count('"') % 2 == 0 for c in curl), curl[:2])
+    check("win: requests finish with move .code -> .done, no POSIX tools",
+          any("& move /Y" in c and ".done" in c for c in curl) and not any("/usr/bin" in c or "mv " in c for c in cmds))
+    check("win: the stream marks its end with type NUL > .dead",
+          any(" -s -N -A HibikiPanel" in c and "& type NUL >" in c for c in curl))
+    kill = [c for c in cmds if "powershell.exe" in c]
+    import base64
+    script = base64.b64decode(kill[-1].split("-EncodedCommand ")[1]).decode("utf-16-le") if kill else ""
+    check("win: the stream kill is an encoded PowerShell script that spares the new stream",
+          "Stop-Process" in script and "-notlike '*stream-" in script and "HibikiPanel" in script, script)
+    check("win: no write-out % on the cmd line (format read from a file)", not any("%{" in c for c in curl))
+
+
 def main():
+    global OS_NAME
     try:
         import lupa  # noqa: F401
     except ImportError:
         raise SystemExit("needs lupa: uv run --with lupa python panel/test_panel.py")
-    for name, fn in list(globals().items()):
-        if name.startswith("test_"):
-            print(name)
-            try:
-                fn()
-            except Exception as e:  # noqa: BLE001 - report and keep going
-                print("  FAIL %s raised %r" % (name, e))
-                failures.append(name)
+    for OS_NAME in ("macOS-arm64", "Win64"):
+        print("== " + OS_NAME)
+        for name, fn in list(globals().items()):
+            if name.startswith("test_"):
+                print(name)
+                try:
+                    fn()
+                except Exception as e:  # noqa: BLE001 - report and keep going
+                    print("  FAIL %s raised %r" % (name, e))
+                    failures.append(OS_NAME + ":" + name)
     if failures:
         print("FAILED", failures)
         sys.exit(1)

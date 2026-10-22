@@ -91,11 +91,45 @@ def load_config():
     return {"acp": [], "mcpServers": []}
 
 
+WINDOWS = os.name == "nt"
+
+
+def cmd_quote(s):
+    """One cmd.exe argument. Inside double quotes cmd takes & | < > ^ literally; Windows paths can't hold a quote."""
+    return '"%s"' % str(s).replace('"', '')
+
+
+def shell_line(argv, env=None, cwd=None, path_prefix=None):
+    """A command line for a visible terminal: POSIX sh on macOS/Linux, cmd.exe on Windows."""
+    if WINDOWS:
+        parts = ["cd /d %s" % cmd_quote(cwd)] if cwd else []
+        if path_prefix:
+            parts.append('set "PATH=%s;%%PATH%%"' % path_prefix)
+        parts += ['set "%s=%s"' % (k, v) for k, v in (env or {}).items()]
+        parts.append(" ".join(cmd_quote(a) for a in argv))
+        return " && ".join(parts)
+    out = "cd %s && " % shlex.quote(cwd) if cwd else ""
+    out += "".join("export %s=%s; " % (k, shlex.quote(str(v))) for k, v in (env or {}).items())
+    if path_prefix:
+        out += "PATH=%s:\"$PATH\" exec " % shlex.quote(path_prefix)
+    return out + " ".join(shlex.quote(a) for a in argv)
+
+
 def open_terminal(command):
-    """Run a shell command in a visible terminal (Terminal.app; AGENT_GATEWAY_TERMINAL overrides the launcher)."""
+    """Run a shell command in a visible terminal (Terminal.app / a cmd.exe console; AGENT_GATEWAY_TERMINAL overrides
+    the launcher)."""
     custom = os.environ.get("AGENT_GATEWAY_TERMINAL")
     if custom:
-        subprocess.Popen(shlex.split(custom) + [command], stdin=subprocess.DEVNULL)
+        if WINDOWS:  # a string goes to CreateProcess as is; a list would get its quotes \-escaped, which cmd ignores
+            subprocess.Popen(custom + " " + command, stdin=subprocess.DEVNULL)
+        else:
+            subprocess.Popen(shlex.split(custom) + [command], stdin=subprocess.DEVNULL)
+        return
+    if WINDOWS:
+        script = STATE.parent / "terminal.cmd"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("@echo off\r\n" + command + "\r\n")
+        subprocess.Popen(["cmd.exe", "/d", "/k", str(script)], creationflags=subprocess.CREATE_NEW_CONSOLE)
         return
     esc = command.replace("\\", "\\\\").replace('"', '\\"')
     subprocess.Popen(["osascript", "-e", 'tell application "Terminal"', "-e", "activate",
@@ -372,8 +406,7 @@ class AcpAgent:
         args = [exe] + [a.replace("{id}", acp_id) for a in argv[1:]]
         # Terminal's PATH lacks the agent's runtime (kimi is `#!/usr/bin/env node`, node lives in ~/.local/node/bin)
         env_path = (self.spec.get("env") or {}).get("PATH")
-        prefix = "PATH=%s:\"$PATH\" " % shlex.quote(expand(env_path)) if env_path else ""
-        return "cd %s && %sexec %s" % (shlex.quote(self.cwd), prefix, " ".join(shlex.quote(a) for a in args))
+        return shell_line(args, cwd=self.cwd, path_prefix=expand(env_path) if env_path else None)
 
     def load_persisted(self):
         d = STATE / self.slug
@@ -755,10 +788,9 @@ class AcpAgent:
 
     def terminal_login(self, argv, env):
         """Open the agent's login command in a terminal, then retry a session until the login lands."""
-        exports = "".join("export %s=%s; " % (k, shlex.quote(str(expand(v)))) for k, v in env.items())
         self.state, self.error = "authenticating", None
         try:
-            open_terminal(exports + " ".join(shlex.quote(a) for a in argv))
+            open_terminal(shell_line(argv, env={k: expand(v) for k, v in env.items()}))
         except OSError as e:
             self.state, self.error = "auth_required", "cannot open a terminal: %s" % e
             return

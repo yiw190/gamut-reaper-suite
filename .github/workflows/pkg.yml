@@ -1,4 +1,4 @@
-name: pkg
+name: packages
 on:
   pull_request:
   push:
@@ -13,7 +13,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: ~/.cache/hibiki
-          key: python-${{ hashFiles('packaging/macos/python.lock') }}
+          key: python-${{ hashFiles('packaging/python.lock') }}
       - name: build
         run: packaging/macos/build_pkg.sh dist
       - name: tag matches the version
@@ -51,8 +51,88 @@ jobs:
           name: pkg
           path: dist/*
 
+  windows:
+    name: build + install the .exe on Windows
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/hibiki
+          key: python-win-${{ hashFiles('packaging/python.lock') }}
+      - name: Inno Setup
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+      - name: build
+        run: python packaging/windows/build_exe.py dist
+      - name: tag matches the version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: if (-not (Test-Path "dist/Hibiki-$("$env:GITHUB_REF_NAME".Substring(1))-setup.exe")) { throw "version mismatch" }
+      - name: the installer refuses a PC without REAPER
+        run: |
+          if (Test-Path "$env:ProgramFiles\REAPER (x64)\reaper.exe") { throw "the runner already has REAPER" }
+          $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -eq 0) { throw "installed without REAPER" }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki") { throw "files left behind" }
+      - name: install, doctor, MCP over HTTP with the bundled Python
+        run: |
+          New-Item -ItemType Directory -Force "$env:ProgramFiles\REAPER (x64)" | Out-Null
+          Set-Content "$env:ProgramFiles\REAPER (x64)\reaper.exe" "stand-in: the runner has no REAPER"
+          $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART',"/LOG=$PWD\inno.log" -Wait -PassThru
+          Get-Content "$env:LOCALAPPDATA\Hibiki\logs\install.log"
+          if ($p.ExitCode -ne 0) { Get-Content inno.log; throw "install failed: $($p.ExitCode)" }
+          $hibiki = "$env:LOCALAPPDATA\Programs\Hibiki\bin\hibiki.cmd"
+          & $hibiki doctor
+          if ($LASTEXITCODE -ne 0) { Get-Content "$env:LOCALAPPDATA\Hibiki\logs\*.log"; throw "doctor failed" }
+          $t = (Get-Content "$env:USERPROFILE\.config\reaper-mcp\token").Trim()
+          $r = Invoke-RestMethod -Uri http://127.0.0.1:8787/mcp -Method Post -Headers @{Authorization = "Bearer $t"} `
+            -ContentType 'application/json' -Body '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
+          $n = @($r.result.tools).Count
+          Write-Host "tools: $n"
+          if ($n -ne 14) { throw "expected 14 tools, got $n" }
+          Invoke-RestMethod http://127.0.0.1:47892/health
+          $cl = (Get-CimInstance Win32_Process -Filter "Name='python.exe'").CommandLine -join "`n"
+          if ($cl -notmatch 'Programs\\Hibiki\\python') { throw "services aren't on the bundled Python: $cl" }
+          if (-not (Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).Hibiki) { throw "no autostart" }
+      - name: supervisor restarts a service that dies
+        run: |
+          $owner = (Get-NetTCPConnection -LocalPort 8787 -State Listen).OwningProcess
+          Stop-Process -Id $owner -Force
+          $ok = $false
+          foreach ($i in 1..20) { Start-Sleep 1; try { Invoke-RestMethod http://127.0.0.1:8787/healthz | Out-Null; $ok = $true; break } catch {} }
+          if (-not $ok) { Get-Content "$env:LOCALAPPDATA\Hibiki\logs\reaper-mcp.log"; throw "MCP did not come back" }
+      - name: re-install over itself (upgrade path)
+        run: |
+          $exe = (Get-ChildItem dist\Hibiki-*-setup.exe).FullName
+          $p = Start-Process $exe -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "upgrade failed: $($p.ExitCode)" }
+          & "$env:LOCALAPPDATA\Programs\Hibiki\bin\hibiki.cmd" doctor
+          if ($LASTEXITCODE -ne 0) { throw "doctor failed after upgrade" }
+      - name: uninstall
+        run: |
+          Start-Process "$env:LOCALAPPDATA\Programs\Hibiki\unins000.exe" -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES' -Wait
+          foreach ($i in 1..30) { if (-not (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki")) { break }; Start-Sleep 1 }
+          if (Test-Path "$env:LOCALAPPDATA\Programs\Hibiki") { throw "app folder left behind" }
+          if ((Get-ItemProperty HKCU:\Software\Microsoft\Windows\CurrentVersion\Run).Hibiki) { throw "autostart left behind" }
+          $up = $true
+          try { Invoke-RestMethod http://127.0.0.1:8787/healthz | Out-Null } catch { $up = $false }
+          if ($up) { throw "MCP still running" }
+          if ((Get-ItemProperty HKCU:\Environment).Path -match 'Programs\\Hibiki') { throw "PATH entry left behind" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: exe
+          path: dist/Hibiki-*
+
   release:
-    needs: build
+    needs: [build, windows]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     permissions:
@@ -63,10 +143,15 @@ jobs:
         with:
           name: pkg
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: exe
+          path: dist
       - name: GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           notes="packaging/release-notes/${GITHUB_REF_NAME}.md"
-          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" \
+          pre=$(case "$GITHUB_REF_NAME" in *-*) echo --prerelease;; esac)  # v0.5.0-rc.1 -> pre-release
+          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" $pre \
             $( [ -f "$notes" ] && echo --notes-file "$notes" || echo --generate-notes )

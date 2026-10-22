@@ -30,5 +30,5 @@ function reaper_installed() {
   <choice id="core" visible="false" title="Hibiki">
     <pkg-ref id="@ID@"/>
   </choice>
-  <pkg-ref id="@ID@" version="@VERSION@" onConclusion="none">core.pkg</pkg-ref>
+  <pkg-ref id="@ID@" version="@PKGVER@" onConclusion="none">core.pkg</pkg-ref>
 </installer-gui-script>

@@ -41,7 +41,7 @@ What it sets up for the logged-in user (`hibiki setup` runs the same steps; safe
 | Piece | Where |
 | --- | --- |
 | Lua bridge, Hibiki panel | `<REAPER resource path>/Scripts/reaper_mcp_bridge.lua`, `Scripts/Hibiki/` |
-| ReaImGui (if missing, pinned + sha256-checked) | `<REAPER resource path>/UserPlugins/` |
+| ReaImGui (if missing, pinned + sha256-checked), and its `imgui.lua` shim | `<REAPER resource path>/UserPlugins/`, `Scripts/ReaTeam Extensions/API/` |
 | Startup hook: starts both with REAPER | a marked block in `Scripts/__startup.lua`; your own lines stay |
 | MCP over HTTP on `127.0.0.1:8787` (bearer in `~/.config/reaper-mcp/token`, 0600) | LaunchAgent `com.hibiki.reaper-mcp` |
 | Agent gateway on `127.0.0.1:47892` | LaunchAgent `com.hibiki.agent-gateway` |
@@ -61,6 +61,24 @@ From a clone instead (the LaunchAgents then run from the clone, so keep it; re-r
 git clone https://github.com/yiw190/hibiki.git ~/hibiki
 sh ~/hibiki/install.sh                # WITH_AGENTS=1 also adds Codex, Claude Code and Kimi
 ```
+
+## Install (Windows)
+
+Release candidate: tested in CI on Windows Server, not yet on a desktop REAPER. Windows 10 1803+ (64-bit).
+
+1. **REAPER first.** Download the 64-bit installer from [reaper.fm](https://www.reaper.fm/download.php), install it and
+   open REAPER once. The installer (and `hibiki setup`) refuses to install on a PC without REAPER.
+2. **Hibiki.** Download `Hibiki-<version>-setup.exe` from [Releases](https://github.com/yiw190/hibiki/releases) and run
+   it. It installs for your Windows user only (`%LOCALAPPDATA%\Programs\Hibiki`, no administrator rights), brings its
+   own Python and adds `hibiki` to your PATH. To upgrade, run a newer installer; to remove, use **Settings → Apps**.
+3. **Restart REAPER.** Same as on macOS: the panel opens docked on the right.
+
+The installer isn't signed yet: if SmartScreen stops it, click **More info → Run anyway**.
+
+Differences from macOS: the REAPER resource path is `%APPDATA%\REAPER`; instead of LaunchAgents one background
+supervisor (`hibiki run`, windowless) keeps the MCP and the gateway running, started at logon from
+`HKCU\...\CurrentVersion\Run`; logs are in `%LOCALAPPDATA%\Hibiki\logs`; **Open in Claude Code / Kimi** opens a
+`cmd` window; the watchdog is macOS only. From a clone: `py -m reaper_mcp setup` (Python 3.9+).
 
 ## Manual setup (any MCP client, any OS)
 
@@ -94,7 +112,7 @@ REAPER_MCP_DEBUG=1     Lua request log
 Mailbox: `~/Library/Application Support/reaper-mcp/ipc` on macOS, `%APPDATA%/reaper-mcp/ipc` on Windows,
 `$XDG_DATA_HOME/reaper-mcp/ipc` on Linux. Time is **beats**. Indices are 0-based.
 
-## Hibiki panel (macOS)
+## Hibiki panel (macOS, Windows)
 
 Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and the Gamut desktop app running on the same Mac — the
 panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamut's own UI uses.

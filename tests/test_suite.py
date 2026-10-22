@@ -55,8 +55,16 @@ class FakeGamut(BaseHTTPRequestHandler):
         self._reply({})
 
 
+def shim(res):
+    """ReaImGui's imgui.lua shim, so setup doesn't download it (tests stay offline)."""
+    f = res / "Scripts/ReaTeam Extensions/API/imgui.lua"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text("-- shim")
+
+
 def run(home, *args, gamut=""):
-    env = dict(os.environ, HOME=str(home), HIBIKI_NO_LAUNCHCTL="1", GAMUT_URL=gamut or "http://127.0.0.1:9",
+    env = dict(os.environ, HOME=str(home), HIBIKI_NO_SERVICES="1", GAMUT_URL=gamut or "http://127.0.0.1:9",
+               USERPROFILE=str(home), APPDATA=str(home / "AppData/Roaming"), LOCALAPPDATA=str(home / "AppData/Local"),
                HIBIKI_SYSTEM_APPLICATIONS=str(home / "no-system-apps"),  # this Mac's own REAPER must not count
                PATH="/usr/bin:/bin")
     env.pop("REAPER_RESOURCE_PATH", None)
@@ -87,6 +95,7 @@ def main():
     # a Mac set up by hand before the suite: hook copied verbatim, bearer in env, old LaunchAgents, user's own hook
     (scripts / "__startup.lua").write_text("-- my own thing\nreaper.ShowConsoleMsg('hi')\n\n" + STARTUP)
     (res / "UserPlugins/reaper_imgui-arm64.dylib").write_bytes(b"x")
+    shim(res)
     (home / ".config/reaper-mcp/env").write_text("REAPER_MCP_BEARER=oldbearer\nREAPER_MCP_PORT=8787\n")
     for old in ("com.yitian.reaper-mcp", "com.yitian.reaper-watchdog", "com.yitian.cloudflared-reaper"):
         with open(la / (old + ".plist"), "wb") as f:
@@ -103,7 +112,7 @@ def main():
     bridge = (scripts / "reaper_mcp_bridge.lua").read_text()
     check("bridge installed", bridge == (ROOT / "reaper_mcp/bridge.lua").read_text())
     check("panel installed", (scripts / "Hibiki/Hibiki.lua").exists())
-    check("ReaImGui already present: no download", "already installed" in out, out)
+    check("ReaImGui already present: no download", "already installed" in out and "shim: installed" not in out, out)
     hook = (scripts / "__startup.lua").read_text()
     check("startup: hand-copied hook adopted into the managed block, not duplicated",
           hook.count("reaper_mcp_bridge.lua") == 1 and "-- >>> hibiki" in hook, hook)
@@ -163,6 +172,7 @@ def main():
     (fresh / "Library/Application Support/REAPER/UserPlugins").mkdir(parents=True)
     (fresh / "Applications/REAPER64.app").mkdir(parents=True)
     (fresh / "Library/Application Support/REAPER/UserPlugins/reaper_imgui-x86_64.dylib").write_bytes(b"x")
+    shim(fresh / "Library/Application Support/REAPER")
     rc, out = run(fresh, "setup", "--no-connect")
     t = (fresh / ".config/reaper-mcp/token").read_text().strip()
     check("fresh Mac: new random token, hook created", rc == 0 and len(t) >= 40
@@ -177,6 +187,7 @@ def main():
     for d in (ores / "Scripts/GamutChat", ores / "UserPlugins", ola, old / "Applications/REAPER.app"):
         d.mkdir(parents=True)
     (ores / "UserPlugins/reaper_imgui-arm64.dylib").write_bytes(b"x")
+    shim(ores)
     (ores / "Scripts/GamutChat/GamutChat.lua").write_text("-- old panel")
     sys.path.insert(0, str(ROOT))
     from reaper_mcp import suite
@@ -193,7 +204,7 @@ def main():
                                                               "com.hibiki.reaper-watchdog.plist"}, out)
     check("rename: hand-copied hook swapped for the managed one",
           "GamutChat" not in hook and hook.count("reaper_mcp_bridge.lua") == 1 and "-- >>> hibiki" in hook
-          and "Scripts/Hibiki/Hibiki.lua" in hook, hook)
+          and "\"Hibiki.lua\"" in hook, hook)
     check("rename: old panel folder gone, new one installed",
           not (ores / "Scripts/GamutChat").exists() and (ores / "Scripts/Hibiki/Hibiki.lua").exists(), out)
 
@@ -204,5 +215,66 @@ def main():
     print("all passed")
 
 
+def main_windows():
+    """The same flow on Windows paths: %APPDATA%\\REAPER, REAPER under Program Files, no LaunchAgents."""
+    failures = []
+
+    def check(label, cond, detail=""):
+        print(("  PASS " if cond else "  FAIL ") + label + ("" if cond else "  " + detail[-800:]))
+        if not cond:
+            failures.append(label)
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), FakeGamut)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    gamut = "http://127.0.0.1:%d" % httpd.server_address[1]
+
+    bare = Path(tempfile.mkdtemp(prefix="hb_noreaper_"))
+    rc, out = run(bare, "setup", "--no-connect")
+    check("win: no REAPER -> setup refuses with the download link", rc != 0 and "reaper.fm" in out, out)
+
+    home = Path(tempfile.mkdtemp(prefix="hb_win_"))
+    res = home / "AppData/Roaming/REAPER"
+    scripts = res / "Scripts"
+    (home / "no-system-apps/REAPER (x64)").mkdir(parents=True)
+    (home / "no-system-apps/REAPER (x64)/reaper.exe").write_bytes(b"MZ")
+    (res / "UserPlugins").mkdir(parents=True)
+    (res / "UserPlugins/reaper_imgui-x64.dll").write_bytes(b"MZ")
+    shim(res)
+    (home / "AppData/Roaming/Claude").mkdir(parents=True)
+    (home / ".cursor").mkdir()
+    FakeGamut.servers = []
+    rc, out = run(home, "setup", gamut=gamut)
+    check("win: setup exits 0", rc == 0, out)
+    check("win: bridge in %APPDATA%\\REAPER\\Scripts", (scripts / "reaper_mcp_bridge.lua").read_text()
+          == (ROOT / "reaper_mcp/bridge.lua").read_text())
+    check("win: panel installed", (scripts / "Hibiki/Hibiki.lua").exists())
+    check("win: ReaImGui present, nothing downloaded", "already installed" in out and "shim: installed" not in out, out)
+    hook = (scripts / "__startup.lua").read_text()
+    check("win: startup hook written", "-- >>> hibiki" in hook and "Hibiki.lua" in hook, hook)
+    check("win: token written", (home / ".config/reaper-mcp/token").read_text().strip() != "")
+    gw = json.loads((home / ".config/agent-gateway/config.json").read_text())
+    check("win: gateway config points at this server.py", gw["mcpServers"][0]["args"] == [str(ROOT / "reaper_mcp/server.py")])
+    check("win: Gamut registration added", len(FakeGamut.servers) == 1 and FakeGamut.servers[0]["url"].endswith("/mcp"))
+    cd = json.loads((home / "AppData/Roaming/Claude/claude_desktop_config.json").read_text())
+    check("win: Claude Desktop registered under %APPDATA%\\Claude", "reaper" in cd["mcpServers"])
+    check("win: no LaunchAgents", not (home / "Library").exists())
+    rc, out2 = run(home, "setup", gamut=gamut)
+    check("win: second setup idempotent", rc == 0 and "bridge: up to date" in out2 and len(FakeGamut.servers) == 1, out2)
+    rc, out = run(home, "doctor", "--json", gamut=gamut)
+    rows = {r["check"]: r for r in json.loads(out[out.index("["):])} if "[" in out else {}
+    check("win: doctor finds REAPER, bridge, panel, ReaImGui", all(rows.get(k, {}).get("level") == "ok"
+          for k in ("REAPER", "bridge script", "chat panel", "ReaImGui", "startup hook", "token")), out)
+    rc, out = run(home, "uninstall", gamut=gamut)
+    check("win: uninstall removes bridge, panel, hook block, registrations",
+          rc == 0 and not (scripts / "reaper_mcp_bridge.lua").exists() and not (scripts / "Hibiki").exists()
+          and FakeGamut.servers == [], out)
+
+    httpd.shutdown()
+    if failures:
+        print("FAILED", failures)
+        sys.exit(1)
+    print("all passed")
+
+
 if __name__ == "__main__":
-    main()
+    main_windows() if os.name == "nt" else main()

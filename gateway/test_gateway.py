@@ -198,6 +198,14 @@ def unit():
     check("resume line runs in the agent's cwd", a.resume_cmd("abc").startswith("cd /tmp && ") and "echo abc" in a.resume_cmd("abc"))
     a.spec["env"] = {"PATH": "/opt/node/bin"}
     check("resume line carries the agent's PATH", "PATH=/opt/node/bin:\"$PATH\" exec " in a.resume_cmd("abc"))
+    ag.WINDOWS = True
+    try:
+        line = ag.shell_line(["C:\\n\\kimi.cmd", "--session", "s_1"], env={"K": "v w"}, cwd="C:\\Users\\x\\My Songs",
+                             path_prefix="C:\\n")
+    finally:
+        ag.WINDOWS = os.name == "nt"
+    check("windows terminal line is cmd syntax",
+          line == 'cd /d "C:\\Users\\x\\My Songs" && set "PATH=C:\\n;%PATH%" && set "K=v w" && "C:\\n\\kimi.cmd" "--session" "s_1"' or print(line))
 
 
 def main():
@@ -380,7 +388,7 @@ def main():
     tmp3 = tempfile.mkdtemp()
     mark = os.path.join(tmp3, "logged-in")
     g = GW(tmp3, gport, {"FAKE_ACP_AUTH": "terminal", "FAKE_ACP_MARK": mark},
-           {"AGENT_GATEWAY_TERMINAL": "sh -c", "AGENT_GATEWAY_LOGIN_POLL": "0.1"})
+           {"AGENT_GATEWAY_TERMINAL": "cmd.exe /d /c" if os.name == "nt" else "sh -c", "AGENT_GATEWAY_LOGIN_POLL": "0.1"})
     try:
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         st = g.get("/api/agents/acp-fake/status")

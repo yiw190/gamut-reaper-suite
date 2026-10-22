@@ -11,8 +11,9 @@ REPO="$(cd "$HERE/../.." && pwd)"
 OUT="$(mkdir -p "${1:-$REPO/dist}" && cd "${1:-$REPO/dist}" && pwd)"
 ID=io.github.yiw190.hibiki
 VERSION=$(sed -n 's/^__version__ = "\([^"]*\)".*/\1/p' "$REPO/reaper_mcp/__init__.py")
+PKGVER=${VERSION%%-*}  # Installer compares package versions numerically: 0.5.0-rc.1 -> 0.5.0
 # shellcheck disable=SC1091
-. "$HERE/python.lock"
+. "$HERE/../python.lock"
 [ "$(uname)" = Darwin ] || { echo "build_pkg.sh needs macOS (pkgbuild, productbuild)" >&2; exit 1; }
 
 WORK=$(mktemp -d)
@@ -74,9 +75,9 @@ cp "$HERE/resources/welcome.html" "$WORK/resources/"
 mv "$WORK/conclusion.html" "$WORK/resources/"
 cp "$REPO/LICENSE" "$WORK/resources/LICENSE.txt"
 chmod -R go-w "$WORK/root"
-pkgbuild --root "$WORK/root" --scripts "$HERE/scripts" --identifier "$ID" --version "$VERSION" \
+pkgbuild --root "$WORK/root" --scripts "$HERE/scripts" --identifier "$ID" --version "$PKGVER" \
   --install-location / --ownership recommended "$WORK/core.pkg"
-sed "s/@VERSION@/$VERSION/g; s/@ID@/$ID/g" "$HERE/Distribution.xml" > "$WORK/Distribution.xml"
+sed "s/@PKGVER@/$PKGVER/g; s/@VERSION@/$VERSION/g; s/@ID@/$ID/g" "$HERE/Distribution.xml" > "$WORK/Distribution.xml"
 PKG="$OUT/Hibiki-$VERSION.pkg"
 productbuild --distribution "$WORK/Distribution.xml" --resources "$WORK/resources" --package-path "$WORK" \
   ${DEV_ID_INSTALLER:+--sign "$DEV_ID_INSTALLER"} "$PKG"

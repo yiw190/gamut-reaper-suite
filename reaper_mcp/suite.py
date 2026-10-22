@@ -39,11 +39,19 @@ LEGACY_LABELS = {"com.yitian.reaper-mcp": MCP_LABEL, "com.yitian.reaper-watchdog
                  "com.gamut-reaper-suite.reaper-watchdog": WD_LABEL}
 GW_PORT = 47892
 
+WINDOWS = sys.platform == "win32"
 IMGUI_VERSION = "0.10.0.5"
-IMGUI_SHA256 = {
-    "arm64": "1f90cf004c0bbada45358609c943f601b2cb0e625ecf7739ae5df8708ab705ae",
-    "x86_64": "2209fec3eae03f22fe94b9d2681b04e21f41c7d4587cb0d69e4eb72e39a64e65",
+IMGUI_SHA256 = {  # by release file name
+    "reaper_imgui-arm64.dylib": "1f90cf004c0bbada45358609c943f601b2cb0e625ecf7739ae5df8708ab705ae",
+    "reaper_imgui-x86_64.dylib": "2209fec3eae03f22fe94b9d2681b04e21f41c7d4587cb0d69e4eb72e39a64e65",
+    "reaper_imgui-x64.dll": "800b216e0937bf5bb6b08ba2767b7b974a746b3fc3b54943b4d3011da0a68f2a",
 }
+# `require 'imgui'` loads this shim from ImGui_GetBuiltinPath() (Scripts/ReaTeam Extensions/API). It isn't a release
+# asset: ReaPack fetches it from the source tree, so without ReaPack the panel can't start unless setup installs it.
+IMGUI_SHIM_URL = "https://raw.githubusercontent.com/cfillion/reaimgui/v%s/shims/imgui.lua" % IMGUI_VERSION
+IMGUI_SHIM_SHA256 = "b73dac959d973e2d8fb47ea73588e84f81d4a3c7fb962c327d08427c2454b093"
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"  # Windows: the supervisor starts at logon from here
+RUN_VALUE = "Hibiki"
 STARTUP_BEGIN = "-- >>> hibiki (managed by hibiki setup; edits inside are overwritten)"
 STARTUP_END = "-- <<< hibiki"
 LEGACY_STARTUP = (("-- >>> gamut-reaper-suite", "-- <<< gamut-reaper-suite"),)  # (begin prefix, end prefix)
@@ -82,17 +90,28 @@ ACP_AGENTS = {
 class Paths:
     def __init__(self, resource_path: str | None = None) -> None:
         self.home = Path.home()
-        self.resource = Path(resource_path or os.environ.get("REAPER_RESOURCE_PATH")
-                             or self.home / "Library/Application Support/REAPER")
+        if WINDOWS:
+            appdata = Path(os.environ.get("APPDATA") or self.home / "AppData/Roaming")
+            self.local = Path(os.environ.get("LOCALAPPDATA") or self.home / "AppData/Local")
+            default_res = appdata / "REAPER"
+            self.logs = self.local / "Hibiki/logs"
+            default_ipc = appdata / "reaper-mcp/ipc"  # what server.py and bridge.lua use when APPDATA is set
+            self.claude_desktop = appdata / "Claude"
+        else:
+            self.local = self.home / "Library/Application Support"
+            default_res = self.home / "Library/Application Support/REAPER"
+            self.logs = self.home / "Library/Logs"
+            default_ipc = self.home / "Library/Application Support/reaper-mcp/ipc"
+            self.claude_desktop = self.home / "Library/Application Support/Claude"
+        self.resource = Path(resource_path or os.environ.get("REAPER_RESOURCE_PATH") or default_res)
         self.scripts = self.resource / "Scripts"
         self.cfg = self.home / ".config/reaper-mcp"
         self.token = self.cfg / "token"
         self.gw_cfg = self.home / ".config/agent-gateway/config.json"
         self.la = self.home / "Library/LaunchAgents"
-        self.logs = self.home / "Library/Logs"
-        self.ipc = Path(os.environ.get("REAPER_MCP_IPC_DIR")
-                        or self.home / "Library/Application Support/reaper-mcp/ipc")
+        self.ipc = Path(os.environ.get("REAPER_MCP_IPC_DIR") or default_ipc)
         self.node = self.home / ".local/node"
+        self.imgui_shim = self.scripts / "ReaTeam Extensions/API/imgui.lua"
 
     def plist(self, label: str) -> Path:
         return self.la / (label + ".plist")
@@ -102,8 +121,30 @@ REAPER_DOWNLOAD = "https://www.reaper.fm/download.php"
 
 
 def reaper_app(p: Paths) -> Path | None:
-    """REAPER.app (REAPER64.app in older releases) in /Applications or ~/Applications."""
-    system = Path(os.environ.get("HIBIKI_SYSTEM_APPLICATIONS", "/Applications"))  # tests point it elsewhere
+    """macOS: REAPER.app (REAPER64.app in older releases) in /Applications or ~/Applications.
+    Windows: reaper.exe under Program Files (or %LOCALAPPDATA%\\Programs), else where the registry says."""
+    override = os.environ.get("HIBIKI_SYSTEM_APPLICATIONS")  # tests point it elsewhere
+    if WINDOWS:
+        roots = [override] if override else [os.environ.get(k) for k in ("ProgramW6432", "ProgramFiles",
+                                                                         "ProgramFiles(x86)")] + [str(p.local / "Programs")]
+        for r in filter(None, roots):
+            for d in ("REAPER (x64)", "REAPER", "REAPER (ARM64)"):
+                if (Path(r) / d / "reaper.exe").exists():
+                    return Path(r) / d / "reaper.exe"
+        if override:
+            return None
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            for view in (winreg.KEY_WOW64_64KEY, winreg.KEY_WOW64_32KEY):
+                try:
+                    with winreg.OpenKey(hive, r"SOFTWARE\REAPER", 0, winreg.KEY_READ | view) as k:
+                        exe = Path(winreg.QueryValueEx(k, "")[0]) / "reaper.exe"
+                except OSError:
+                    continue
+                if exe.exists():
+                    return exe
+        return None
+    system = Path(override or "/Applications")
     for base in (system, p.home / "Applications"):
         for name in ("REAPER.app", "REAPER64.app"):
             if (base / name).exists():
@@ -112,7 +153,17 @@ def reaper_app(p: Paths) -> Path | None:
 
 
 def say(msg: str) -> None:
-    print(msg, flush=True)
+    if sys.stdout:  # None under pythonw (the Windows supervisor)
+        print(msg, flush=True)
+
+
+def no_services() -> bool:
+    """Tests: write files only; no launchd, no Windows Run key, no background processes."""
+    return bool(os.environ.get("HIBIKI_NO_SERVICES"))
+
+
+def no_launchd() -> bool:
+    return no_services() or sys.platform != "darwin"
 
 
 def port() -> int:
@@ -140,7 +191,7 @@ def need(path: Path) -> Path:
 # ---------- launchd ----------
 
 def launchctl(*args: str) -> int:
-    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if no_launchd():
         return 0
     return subprocess.run(["launchctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
@@ -150,7 +201,7 @@ def domain() -> str:
 
 
 def loaded(label: str) -> bool:
-    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if no_launchd():
         return False
     return launchctl("print", "%s/%s" % (domain(), label)) == 0
 
@@ -219,25 +270,35 @@ def install_panel(p: Paths) -> None:
 
 
 def imgui_installed(p: Paths) -> bool:
-    return any((p.resource / "UserPlugins").glob("reaper_imgui-*"))
+    return any((p.resource / "UserPlugins").glob("reaper_imgui-*")) and p.imgui_shim.exists()
+
+
+def fetch_checked(url: str, sha256: str, dst: Path) -> None:
+    with urllib.request.urlopen(url, timeout=60) as r:
+        data = r.read()
+    if hashlib.sha256(data).hexdigest() != sha256:
+        raise SystemExit("download from %s failed its sha256 check" % url)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    dst.with_name(dst.name + ".part").write_bytes(data)
+    os.replace(dst.with_name(dst.name + ".part"), dst)
 
 
 def install_imgui(p: Paths) -> None:
-    if imgui_installed(p):
+    if any((p.resource / "UserPlugins").glob("reaper_imgui-*")):
         say("  ReaImGui: already installed")
-        return
-    arch = "arm64" if platform.machine() == "arm64" else "x86_64"
-    name = "reaper_imgui-%s.dylib" % arch
-    url = "https://github.com/cfillion/reaimgui/releases/download/v%s/%s" % (IMGUI_VERSION, name)
-    with urllib.request.urlopen(url, timeout=60) as r:
-        data = r.read()
-    if hashlib.sha256(data).hexdigest() != IMGUI_SHA256[arch]:
-        raise SystemExit("ReaImGui download from %s failed its sha256 check" % url)
-    dst = p.resource / "UserPlugins" / name
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    dst.with_name(name + ".part").write_bytes(data)
-    os.replace(dst.with_name(name + ".part"), dst)
-    say("  ReaImGui %s: installed" % IMGUI_VERSION)
+    else:
+        if WINDOWS:
+            if platform.machine().lower() in ("arm64", "aarch64"):
+                raise SystemExit("Windows on ARM: install ReaImGui with ReaPack, then run setup again")
+            name = "reaper_imgui-x64.dll"
+        else:
+            name = "reaper_imgui-%s.dylib" % ("arm64" if platform.machine() == "arm64" else "x86_64")
+        fetch_checked("https://github.com/cfillion/reaimgui/releases/download/v%s/%s" % (IMGUI_VERSION, name),
+                      IMGUI_SHA256[name], p.resource / "UserPlugins" / name)
+        say("  ReaImGui %s: installed" % IMGUI_VERSION)
+    if not p.imgui_shim.exists():
+        fetch_checked(IMGUI_SHIM_URL, IMGUI_SHIM_SHA256, p.imgui_shim)
+        say("  ReaImGui Lua shim: installed (%s)" % p.imgui_shim)
 
 
 def strip_managed(text: str) -> str:
@@ -326,7 +387,7 @@ def migrate_legacy(p: Paths) -> set:
 def start_mcp(p: Paths) -> bool:
     start_agent(p, MCP_LABEL, [sys.executable, str(ROOT / "reaper_mcp/http_server.py")],
                 {"REAPER_MCP_PORT": str(port())}, KeepAlive=True, WorkingDirectory=str(ROOT))
-    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if no_launchd():
         return True
     ok = wait_http("http://127.0.0.1:%d/healthz" % port())
     say("  MCP on 127.0.0.1:%d: %s" % (port(), "up" if ok else "NOT answering, see %s" % (p.logs / "reaper-mcp.log")))
@@ -361,7 +422,7 @@ def gateway_config(p: Paths) -> None:
 def start_gateway(p: Paths) -> None:
     start_agent(p, GW_LABEL, [sys.executable, str(need(ROOT / "gateway/agent_gateway.py"))],
                 KeepAlive=True, WorkingDirectory=str(ROOT))
-    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if no_launchd():
         return
     ok = wait_http("http://127.0.0.1:%d/health" % GW_PORT)
     say("  agent gateway on 127.0.0.1:%d: %s" % (GW_PORT, "up" if ok else "NOT answering, see %s" % (p.logs / "agent-gateway.log")))
@@ -376,6 +437,109 @@ def watchdog_on(p: Paths) -> None:
 def watchdog_off(p: Paths) -> None:
     stop_agent(p, WD_LABEL, delete=True)
     say("  watchdog: off")
+
+
+# ---------- Windows services ----------
+# One supervisor (`hibiki run`, under pythonw: no console) keeps the MCP HTTP front and the gateway running and
+# restarts them when they exit; HKCU ...\CurrentVersion\Run starts it at logon. No admin rights, no Task Scheduler.
+
+def win_python(gui: bool = False) -> str:
+    exe = Path(sys.executable)
+    cand = exe.with_name("pythonw.exe" if gui else "python.exe")
+    return str(cand) if cand.exists() else str(exe)
+
+
+def supervisor_cmd() -> list:
+    return [win_python(gui=True), "-s", "-E", str(ROOT / "reaper_mcp/cli.py"), "run", "--port", str(port())]
+
+
+def win_pid_file(p: Paths) -> Path:
+    return p.logs / "supervisor.pid"
+
+
+def win_supervisor_pid(p: Paths) -> int:
+    """PID of the running supervisor, or 0."""
+    try:
+        pid = int(win_pid_file(p).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+    out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"],
+                         capture_output=True, text=True).stdout.lower()
+    return pid if "python" in out else 0  # a reused PID belongs to someone else
+
+
+def win_autostart() -> str:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            return winreg.QueryValueEx(k, RUN_VALUE)[0]
+    except OSError:
+        return ""
+
+
+def win_services_stop(p: Paths, forget: bool = False) -> bool:
+    if no_services():
+        return False
+    pid = win_supervisor_pid(p)
+    if pid:
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+    try:
+        win_pid_file(p).unlink()
+    except OSError:
+        pass
+    if forget and win_autostart():
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+            winreg.DeleteValue(k, RUN_VALUE)
+    return bool(pid)
+
+
+def win_services_start(p: Paths) -> bool:
+    p.logs.mkdir(parents=True, exist_ok=True)
+    if no_services():
+        return True
+    import winreg
+    cmd = supervisor_cmd()
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+        winreg.SetValueEx(k, RUN_VALUE, 0, winreg.REG_SZ, subprocess.list2cmdline(cmd))
+    win_services_stop(p)
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    io = dict(stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd=str(ROOT), close_fds=True)
+    try:  # out of the installer's (or a CI step's) job object, so it outlives the process that ran setup
+        subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
+    except OSError:
+        subprocess.Popen(cmd, creationflags=flags, **io)
+    ok = wait_http("http://127.0.0.1:%d/healthz" % port(), 20)
+    say("  MCP on 127.0.0.1:%d: %s" % (port(), "up" if ok else "NOT answering, see %s" % (p.logs / "reaper-mcp.log")))
+    gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT, 10)
+    say("  agent gateway on 127.0.0.1:%d: %s" % (GW_PORT, "up" if gw else "NOT answering, see %s"
+                                                % (p.logs / "agent-gateway.log")))
+    say("  autostart: on (HKCU Run '%s')" % RUN_VALUE)
+    return ok
+
+
+def cmd_run(a) -> int:
+    """The Windows supervisor: start both services, restart whichever exits. Runs under pythonw, so no prints."""
+    p = Paths()
+    p.logs.mkdir(parents=True, exist_ok=True)
+    win_pid_file(p).write_text(str(os.getpid()))
+    py = win_python() if WINDOWS else sys.executable
+    env = dict(os.environ, REAPER_MCP_PORT=str(a.port))
+    jobs = {"reaper-mcp": [py, str(ROOT / "reaper_mcp/http_server.py")],
+            "agent-gateway": [py, str(ROOT / "gateway/agent_gateway.py")]}
+    flags = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
+    procs: dict = {}
+    while True:
+        for name, argv in jobs.items():
+            pr = procs.get(name)
+            if pr is None or pr.poll() is not None:
+                with open(p.logs / (name + ".log"), "ab") as log:
+                    if pr is not None:
+                        log.write(b"--- exited with %d, restarting\n" % pr.returncode)
+                        log.flush()
+                    procs[name] = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                                   cwd=str(ROOT), env=env, creationflags=flags)
+        time.sleep(2)
 
 
 # ---------- MCP clients ----------
@@ -444,9 +608,9 @@ def connect_claude_code(p: Paths, remove: bool = False) -> str:
 
 CLIENTS = {
     "gamut": (lambda p: True, connect_gamut),
-    "claude-desktop": (lambda p: (p.home / "Library/Application Support/Claude").is_dir(),
+    "claude-desktop": (lambda p: p.claude_desktop.is_dir(),
                        lambda p, remove=False: json_client(
-                           p.home / "Library/Application Support/Claude/claude_desktop_config.json", "mcpServers", remove)),
+                           p.claude_desktop / "claude_desktop_config.json", "mcpServers", remove)),
     "cursor": (lambda p: (p.home / ".cursor").is_dir(),
                lambda p, remove=False: json_client(p.home / ".cursor/mcp.json", "mcpServers", remove)),
     "claude-code": (lambda p: claude_bin(p) is not None, connect_claude_code),
@@ -462,34 +626,41 @@ def connect_detected(p: Paths, remove: bool = False) -> None:
 # ---------- ACP agents for the gateway ----------
 
 def ensure_node(p: Paths) -> Path:
-    node = p.node / "bin/node"
-    if node.exists():
-        return p.node / "bin"
+    """Node in ~/.local/node; returns the directory holding node and npm (bin/ on macOS, the root on Windows)."""
+    bin_dir = p.node if WINDOWS else p.node / "bin"
+    if (bin_dir / ("node.exe" if WINDOWS else "node")).exists():
+        return bin_dir
     with urllib.request.urlopen("https://nodejs.org/dist/index.json", timeout=30) as r:
         version = next(rel["version"] for rel in json.load(r) if rel["lts"])
-    arch = "arm64" if platform.machine() == "arm64" else "x64"
-    name = "node-%s-darwin-%s" % (version, arch)
+    arch = "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+    name = "node-%s-%s-%s" % (version, "win" if WINDOWS else "darwin", arch)
+    ext = ".zip" if WINDOWS else ".tar.gz"
     base = "https://nodejs.org/dist/%s/" % version
     with urllib.request.urlopen(base + "SHASUMS256.txt", timeout=30) as r:
         sums = dict(reversed(line.split()) for line in r.read().decode().splitlines() if line.strip())
     say("  installing Node %s into %s" % (version, p.node))
-    with urllib.request.urlopen(base + name + ".tar.gz", timeout=300) as r:
+    with urllib.request.urlopen(base + name + ext, timeout=300) as r:
         data = r.read()
-    if hashlib.sha256(data).hexdigest() != sums.get(name + ".tar.gz"):
+    if hashlib.sha256(data).hexdigest() != sums.get(name + ext):
         raise SystemExit("Node download failed its sha256 check")
     with tempfile.TemporaryDirectory() as tmp:
-        tar = Path(tmp) / "node.tar.gz"
-        tar.write_bytes(data)
-        with tarfile.open(tar) as t:
-            if hasattr(tarfile, "data_filter"):
-                t.extractall(tmp, filter="data")
-            else:
-                t.extractall(tmp)
+        arc = Path(tmp) / ("node" + ext)
+        arc.write_bytes(data)
+        if WINDOWS:
+            import zipfile
+            with zipfile.ZipFile(arc) as z:
+                z.extractall(tmp)
+        else:
+            with tarfile.open(arc) as t:
+                if hasattr(tarfile, "data_filter"):
+                    t.extractall(tmp, filter="data")
+                else:
+                    t.extractall(tmp)
         if p.node.exists():
             shutil.rmtree(p.node)
         p.node.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(Path(tmp) / name), str(p.node))
-    return p.node / "bin"
+    return bin_dir
 
 
 def agents_add(p: Paths, slugs: list) -> None:
@@ -497,25 +668,33 @@ def agents_add(p: Paths, slugs: list) -> None:
     if unknown:
         raise SystemExit("unknown agent(s) %s; choose from %s" % (", ".join(unknown), ", ".join(ACP_AGENTS)))
     bin_dir = ensure_node(p)
-    env = dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ.get("PATH", "/usr/bin:/bin")))
+    env = dict(os.environ, PATH=os.pathsep.join([str(bin_dir), os.environ.get("PATH", "/usr/bin:/bin")]))
+    system_dirs = ([os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32"),
+                    os.environ.get("SystemRoot", r"C:\Windows")] if WINDOWS else ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
     cfg = load_json(p.gw_cfg) or {"acp": [], "mcpServers": [dict(name="reaper", **stdio_entry())]}
     for slug in slugs:
         a = ACP_AGENTS[slug]
-        cmd = [str(bin_dir / "npm"), "install", "-g", "--no-fund", "--no-audit"]
+        # Windows: --prefix pins the global shims to the node folder (npm's default there is %APPDATA%/npm)
+        cmd = [str(bin_dir / ("npm.cmd" if WINDOWS else "npm")), "install", "-g", "--no-fund", "--no-audit"]
+        if WINDOWS:
+            cmd.append("--prefix=" + str(p.node))
         if a.get("allow_scripts"):
             cmd.append("--allow-scripts=" + a["allow_scripts"])
         say("  npm install %s" % a["package"])
         subprocess.run(cmd + [a["package"]], env=env, check=True)
-        path = ":".join([str(bin_dir)] + [str(Path(x).expanduser()) for x in a.get("path_extra", [])]
-                        + ["/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+        path = os.pathsep.join([str(bin_dir)] + [str(Path(x).expanduser()) for x in a.get("path_extra", [])]
+                               + system_dirs)
         entry = {"slug": slug, "name": a["name"], "description": a["description"],
-                 "command": [str(bin_dir / a["bin"])] + a["args"], "env": {"PATH": path},
+                 "command": [str(bin_dir / (a["bin"] + (".cmd" if WINDOWS else "")))] + a["args"], "env": {"PATH": path},
                  "cwd": "~/Documents/REAPER Media"}
         if a.get("loginVariants"):
             entry["loginVariants"] = a["loginVariants"]
         cfg["acp"] = [x for x in cfg.get("acp", []) if x.get("slug") != slug] + [entry]
     write_json(p.gw_cfg, cfg)
-    if loaded(GW_LABEL):
+    if WINDOWS:
+        if win_supervisor_pid(p):
+            win_services_start(p)  # restarts the gateway with the new agents
+    elif loaded(GW_LABEL):
         launchctl("kickstart", "-k", "%s/%s" % (domain(), GW_LABEL))
     say("  added %s; they show up in the panel's agent picker" % ", ".join(slugs))
 
@@ -523,12 +702,12 @@ def agents_add(p: Paths, slugs: list) -> None:
 # ---------- commands ----------
 
 def cmd_setup(a) -> int:
-    if sys.platform != "darwin" and not os.environ.get("HIBIKI_NO_LAUNCHCTL"):
-        raise SystemExit("setup is macOS only; elsewhere use `reaper-mcp install-bridge` and a stdio MCP config")
+    if sys.platform not in ("darwin", "win32") and not no_services():
+        raise SystemExit("setup is for macOS and Windows; elsewhere use `reaper-mcp install-bridge` and a stdio MCP config")
     p = Paths(a.resource_path)
-    if not reaper_app(p):  # onboarding order: REAPER first, then Hibiki (the .pkg checks the same before installing)
-        raise SystemExit("REAPER isn't installed. Download it from %s, drag it to Applications, then run "
-                         "`hibiki setup` again." % REAPER_DOWNLOAD)
+    if not reaper_app(p):  # onboarding order: REAPER first, then Hibiki (the installers check the same up front)
+        raise SystemExit("REAPER isn't installed. Download it from %s, %s, then run `hibiki setup` again."
+                         % (REAPER_DOWNLOAD, "run its installer" if WINDOWS else "drag it to Applications"))
     say("hibiki %s from %s (python %s)" % (__version__, ROOT, sys.executable))
     say("REAPER")
     install_bridge(p)
@@ -538,12 +717,16 @@ def cmd_setup(a) -> int:
     install_startup(p)
     say("Services")
     ensure_token(p)
-    legacy = migrate_legacy(p)
-    ok = start_mcp(p)
-    gateway_config(p)
-    start_gateway(p)
-    if WD_LABEL in legacy or p.plist(WD_LABEL).exists():
-        watchdog_on(p)
+    if WINDOWS:
+        gateway_config(p)
+        ok = win_services_start(p)
+    else:
+        legacy = migrate_legacy(p)
+        ok = start_mcp(p)
+        gateway_config(p)
+        start_gateway(p)
+        if WD_LABEL in legacy or p.plist(WD_LABEL).exists():
+            watchdog_on(p)
     if not a.no_connect:
         say("MCP clients")
         connect_detected(p)
@@ -566,7 +749,7 @@ def cmd_doctor(a) -> int:
 
     row("ok", "suite", "%s at %s, python %s" % (__version__, ROOT, sys.executable))
     app = reaper_app(p)
-    row("ok" if app else "FAIL", "REAPER.app", str(app) if app else "not installed - get it from " + REAPER_DOWNLOAD)
+    row("ok" if app else "FAIL", "REAPER", str(app) if app else "not installed - get it from " + REAPER_DOWNLOAD)
     row("ok" if p.resource.is_dir() else "FAIL", "resource path", str(p.resource))
     bv = bridge_version(p.scripts / "reaper_mcp_bridge.lua")
     row("ok" if bv == __version__ else "FAIL", "bridge script",
@@ -575,23 +758,34 @@ def cmd_doctor(a) -> int:
     shipped = ROOT / "panel/Hibiki.lua"
     same = panel.exists() and shipped.exists() and panel.read_bytes() == shipped.read_bytes()
     row("ok" if same else "warn", "chat panel", "%s%s" % (panel, "" if same else " (missing or differs from this suite)"))
-    row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p) else "missing: the panel needs it")
+    row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p)
+        else "missing (binary or %s): the panel needs it - run setup" % p.imgui_shim)
     startup = p.scripts / "__startup.lua"
     hooked = startup.exists() and "reaper_mcp_bridge.lua" in startup.read_text()
     row("ok" if hooked else "FAIL", "startup hook", str(startup) if hooked else "REAPER won't start the bridge on launch")
-    if p.token.exists():
+    if not p.token.exists():
+        row("FAIL", "token", "%s missing" % p.token)
+    elif WINDOWS:  # NTFS ACLs, not mode bits: the token sits in the user's profile
+        row("ok", "token", str(p.token))
+    else:
         mode = p.token.stat().st_mode & 0o777
         row("ok" if mode == 0o600 else "warn", "token", "%s mode %o" % (p.token, mode))
+    if WINDOWS:
+        auto = win_autostart()
+        row("ok" if str(ROOT) in auto else "FAIL", "autostart", "HKCU Run \"%s\"" % RUN_VALUE if str(ROOT) in auto
+            else ("points at another install - run setup" if auto else "missing - run setup"))
+        pid = win_supervisor_pid(p)
+        row("ok" if pid else "FAIL", "supervisor", "pid %d" % pid if pid else "not running - run setup")
+        row("ok", "watchdog", "macOS only")
     else:
-        row("FAIL", "token", "%s missing" % p.token)
-    for label in (MCP_LABEL, GW_LABEL, WD_LABEL):
-        if label == WD_LABEL and not p.plist(label).exists():
-            row("ok", label, "off (optional)")
-            continue
-        row("ok" if loaded(label) else "FAIL", label, "loaded" if loaded(label) else "not loaded")
-    for old in LEGACY_LABELS:
-        if p.plist(old).exists():
-            row("warn", old, "old LaunchAgent still installed - run setup")
+        for label in (MCP_LABEL, GW_LABEL, WD_LABEL):
+            if label == WD_LABEL and not p.plist(label).exists():
+                row("ok", label, "off (optional)")
+                continue
+            row("ok" if loaded(label) else "FAIL", label, "loaded" if loaded(label) else "not loaded")
+        for old in LEGACY_LABELS:
+            if p.plist(old).exists():
+                row("warn", old, "old LaunchAgent still installed - run setup")
     up = wait_http("http://127.0.0.1:%d/healthz" % port(), 0)
     row("ok" if up else "FAIL", "MCP http", "127.0.0.1:%d %s" % (port(), "answers" if up else "no answer"))
     gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT, 0)
@@ -627,6 +821,8 @@ def cmd_connect(a) -> int:
 
 
 def cmd_watchdog(a) -> int:
+    if WINDOWS:
+        raise SystemExit("the watchdog is macOS only for now")
     p = Paths()
     watchdog_on(p) if a.state == "on" else watchdog_off(p)
     return 0
@@ -639,9 +835,13 @@ def cmd_agents(a) -> int:
 
 def cmd_uninstall(a) -> int:
     p = Paths(a.resource_path)
-    for label in (MCP_LABEL, GW_LABEL, WD_LABEL, *LEGACY_LABELS):
-        if stop_agent(p, label, delete=True):
-            say("removed LaunchAgent " + label)
+    if WINDOWS:
+        win_services_stop(p, forget=True)
+        say("stopped the services and removed the autostart entry")
+    else:
+        for label in (MCP_LABEL, GW_LABEL, WD_LABEL, *LEGACY_LABELS):
+            if stop_agent(p, label, delete=True):
+                say("removed LaunchAgent " + label)
     remove_startup(p)
     for f in (p.scripts / "reaper_mcp_bridge.lua", p.scripts / "reaper_mcp_bridge.lua.bak",
               p.scripts / "reaper_mcp_bridge.lua.new"):
@@ -655,7 +855,10 @@ def cmd_uninstall(a) -> int:
         for d in (p.cfg, p.gw_cfg.parent):
             shutil.rmtree(d, ignore_errors=True)
         say("removed %s and %s" % (p.cfg, p.gw_cfg.parent))
-    if PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
+    if WINDOWS:
+        if "Programs" in ROOT.parts and "Hibiki" in ROOT.parts:
+            say("App files: remove Hibiki in Settings -> Apps (its uninstaller runs this command too)")
+    elif PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
         say("App files: sudo rm -rf '%s' /usr/local/bin/hibiki && sudo pkgutil --forget %s"
             % (PKG_ROOT, PKG_ID))
     return 0
@@ -664,8 +867,9 @@ def cmd_uninstall(a) -> int:
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hibiki", description="REAPER MCP, Hibiki panel and agent gateway.")
     sub = ap.add_subparsers(dest="cmd")
-    s = sub.add_parser("setup", help="install or upgrade everything for this macOS user (safe to re-run)")
-    s.add_argument("--resource-path", help="REAPER resource path (default: ~/Library/Application Support/REAPER)")
+    s = sub.add_parser("setup", help="install or upgrade everything for this user (safe to re-run)")
+    s.add_argument("--resource-path", help="REAPER resource path (default: ~/Library/Application Support/REAPER, "
+                                           "%%APPDATA%%\\REAPER on Windows)")
     s.add_argument("--no-reaimgui", action="store_true", help="don't download ReaImGui")
     s.add_argument("--no-connect", action="store_true", help="don't register the MCP in Gamut / Claude / Cursor")
     s.set_defaults(fn=cmd_setup)
@@ -688,6 +892,9 @@ def parser() -> argparse.ArgumentParser:
     u.add_argument("--resource-path")
     u.add_argument("--purge", action="store_true", help="also delete tokens, gateway config and ACP transcripts")
     u.set_defaults(fn=cmd_uninstall)
+    r = sub.add_parser("run", help=argparse.SUPPRESS)  # the Windows supervisor (started by setup and at logon)
+    r.add_argument("--port", type=int, default=port())
+    r.set_defaults(fn=cmd_run)
     return ap
 
 

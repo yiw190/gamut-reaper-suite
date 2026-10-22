@@ -14,10 +14,20 @@ package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua;' .. package.path
 local ImGui = require 'imgui' '0.10'
 
 ---------------------------------------------------------------- utils
+-- macOS runs background work through io.popen + sh; Windows through ExecProcess (no console window, no wait):
+-- io.popen there flashes a console and ExecProcess returns -999 on macOS
+local WIN = (reaper.GetOS() or ''):match('^Win') ~= nil
 local function sh(cmd)
   local p = io.popen(cmd)
   if not p then return '' end
   local o = p:read('*a'); p:close(); return o or ''
+end
+local SYS = (os.getenv('SystemRoot') or 'C:\\Windows') .. '\\System32\\'
+-- a cmd.exe line run in the background; /S strips the outer quotes, so inner quoted args survive as written
+local function win_bg(inner)
+  local line = '"' .. SYS .. 'cmd.exe" /D /S /C "' .. inner .. '"'
+  if HIBIKI_TEST then return HIBIKI_TEST.sh(line) end
+  reaper.ExecProcess(line, -2)
 end
 if HIBIKI_TEST then sh = HIBIKI_TEST.sh end -- headless tests record the curl commands instead of running them
 -- one-time move of the saved state (agent, chats per agent, model picks, context switch) from OLD_EXT: key names come
@@ -47,10 +57,33 @@ if reaper.GetExtState(EXT, 'migrated') ~= '1' then
   reaper.SetExtState(EXT, 'migrated', '1', true)
 end
 
-local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
+-- shell quoting: POSIX single quotes; on Windows double quotes (paths and URLs there never hold a ")
+local function q(s)
+  if WIN then return '"' .. tostring(s) .. '"' end
+  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+end
 
-local DIR = (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'hibiki/'
-sh('mkdir -p ' .. q(DIR))
+local HOME = os.getenv('HOME') or os.getenv('USERPROFILE') or ''
+local DIR = WIN and ((os.getenv('TEMP') or os.getenv('TMP') or HOME):gsub('[\\/]?$', '\\') .. 'hibiki\\')
+  or (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'hibiki/'
+local function mkdir() reaper.RecursiveCreateDirectory(DIR, 0) end
+mkdir()
+if WIN then -- stream files of earlier runs (macOS clears them with rm in stream_stop)
+  local i, old = 0, {}
+  while true do
+    local name = reaper.EnumerateFiles(DIR, i)
+    if not name then break end
+    if name:match('^stream%-') then old[#old + 1] = DIR .. name end
+    i = i + 1
+  end
+  for _, f in ipairs(old) do os.remove(f) end
+end
+local CURL = WIN and (SYS .. 'curl.exe') or '/usr/bin/curl' -- Windows 10 1803+ ships curl.exe
+local CURL_FMT = DIR .. 'code.fmt' -- Windows: the write-out format comes from a file; a literal %{..} on a cmd line
+if WIN then                       -- is at the mercy of cmd's % expansion
+  local f = io.open(CURL_FMT, 'wb')
+  if f then f:write('%{http_code}'); f:close() end
+end
 
 local function u8(cp)
   if cp < 0x80 then return string.char(cp)
@@ -135,7 +168,7 @@ end
 
 ---------------------------------------------------------------- http (background curl)
 -- the gateway wants its token (gateway/agent_gateway.py writes it); curl reads the header from a file, not argv
-local TOKEN_FILE = (os.getenv('HOME') or '') .. '/.config/agent-gateway/token'
+local TOKEN_FILE = HOME .. '/.config/agent-gateway/token'
 local AUTH_FILE, auth_token = DIR .. 'gateway-auth', nil
 local function auth_args(url)
   if url:sub(1, #HOSTS[1]) ~= HOSTS[1] then return '' end
@@ -160,22 +193,33 @@ local function http_url(method, url, body, cb)
   local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"' .. auth_args(url)
   if body then
     local f = io.open(b .. '.json', 'wb')
-    if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(b .. '.json', 'wb') end
+    if not f then mkdir(); f = io.open(b .. '.json', 'wb') end
     if not f then if cb then cb(0, '') end; return end
     f:write(body); f:close()
     args = args .. ' --data-binary @' .. q(b .. '.json')
   end
-  sh('( /usr/bin/curl ' .. args .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
-    ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
+  if WIN then
+    win_bg(q(CURL) .. ' ' .. args .. ' -o ' .. q(b .. '.out') .. ' -w @' .. q(CURL_FMT) .. ' ' .. q(url) ..
+      ' > ' .. q(b .. '.code') .. ' & move /Y ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' >NUL')
+  else
+    sh('( /usr/bin/curl ' .. args .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
+      ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
+  end
   pending[#pending + 1] = { b = b, cb = cb }
 end
 -- multipart upload of a local file (curl -F), same completion files as http_url
 local function http_upload(url, path, cb)
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
-  local field = 'file=@"' .. (path:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
-  sh('( /usr/bin/curl -s -m 300' .. auth_args(url) .. ' -F ' .. q(field) .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
-    ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
+  if WIN then -- a Windows path has no quotes; curl reads file=@C:\x y.png up to the end of the argument
+    win_bg(q(CURL) .. ' -s -m 300' .. auth_args(url) .. ' -F ' .. q('file=@' .. path) .. ' -o ' .. q(b .. '.out') ..
+      ' -w @' .. q(CURL_FMT) .. ' ' .. q(url) .. ' > ' .. q(b .. '.code') .. ' & move /Y ' .. q(b .. '.code') .. ' ' ..
+      q(b .. '.done') .. ' >NUL')
+  else
+    local field = 'file=@"' .. (path:gsub('\\', '\\\\'):gsub('"', '\\"')) .. '"'
+    sh('( /usr/bin/curl -s -m 300' .. auth_args(url) .. ' -F ' .. q(field) .. ' -o ' .. q(b .. '.out') .. ' -w "%{http_code}" ' .. q(url) ..
+      ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
+  end
   pending[#pending + 1] = { b = b, cb = cb }
 end
 
@@ -285,25 +329,58 @@ end
 local STREAM_UA = 'HibikiPanel'
 local RUN = tostring(os.time())
 
-local function stream_stop()
-  sh('/usr/bin/pkill -f ' .. q('[c]url -s -N -A ' .. STREAM_UA) .. ' 2>/dev/null; /bin/rm -f ' .. q(DIR) .. 'stream*')
+-- PowerShell -EncodedCommand (UTF-16LE base64) sidesteps every layer of cmd / CreateProcess quoting
+local function ps_encoded(script)
+  local u = script:gsub('.', function(c) return c .. '\0' end)
+  local A = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+  return ((u:gsub('.', function(x)
+    local r, b = '', x:byte()
+    for i = 8, 1, -1 do r = r .. (b % 2 ^ i - b % 2 ^ (i - 1) > 0 and '1' or '0') end
+    return r
+  end) .. '0000'):gsub('%d%d%d?%d?%d?%d?', function(x)
+    if #x < 6 then return '' end
+    local c = 0
+    for i = 1, 6 do c = c + (x:sub(i, i) == '1' and 2 ^ (6 - i) or 0) end
+    return A:sub(c + 1, c + 1)
+  end) .. ({ '', '==', '=' })[#u % 3 + 1])
+end
+
+-- keep = the stream file of a start in flight: on Windows the kill runs asynchronously and must not hit it
+local function stream_stop(keep)
+  if WIN then
+    local ps = "Get-CimInstance Win32_Process -Filter \"Name='curl.exe'\" | Where-Object { $_.CommandLine -like '*-A "
+      .. STREAM_UA .. "*'" .. (keep and (" -and $_.CommandLine -notlike '*" .. keep:match('[^\\/]+$') .. "*'") or '')
+      .. " } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+    local line = '"' .. SYS .. 'WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden '
+      .. '-EncodedCommand ' .. ps_encoded(ps)
+    if HIBIKI_TEST then HIBIKI_TEST.sh(line) else reaper.ExecProcess(line, -2) end
+  else
+    sh('/usr/bin/pkill -f ' .. q('[c]url -s -N -A ' .. STREAM_UA) .. ' 2>/dev/null; /bin/rm -f ' .. q(DIR) .. 'stream*')
+  end
   S.stream.pid = nil
 end
 
 local function stream_start()
-  stream_stop()
-  if S.sid == '' then return end
   local st = S.stream
+  local nxt = DIR .. 'stream-' .. RUN .. '-' .. ((st.starts or 0) + 1) .. '.sse'
+  stream_stop(nxt)
+  if S.sid == '' then return end
   st.starts = (st.starts or 0) + 1
   -- a fresh file per start: a writer that outlives its kill can't interleave into the live stream
-  st.file = DIR .. 'stream-' .. RUN .. '-' .. st.starts .. '.sse'
+  st.file = nxt
   st.dead = st.file .. '.dead'
   local f = io.open(st.file, 'wb')
-  if not f then sh('mkdir -p ' .. q(DIR)); f = io.open(st.file, 'wb') end
+  if not f then mkdir(); f = io.open(st.file, 'wb') end
   if f then f:close() end
   st.off, st.buf, st.check = 0, '', reaper.time_precise()
   -- the wrapper drops the .dead file when curl exits, so liveness is a file check, not a periodic popen (forks stall the UI)
   local url = api('/sessions/' .. S.sid .. '/stream')
+  if WIN then
+    win_bg(q(CURL) .. ' -s -N -A ' .. STREAM_UA .. auth_args(url) .. ' ' .. q(url) .. ' >> ' .. q(st.file) ..
+      ' & type NUL > ' .. q(st.dead))
+    st.pid = 0 -- launched; Windows has no pid here (stream_stop finds the curl by its user agent)
+    return
+  end
   local out = sh('( /usr/bin/curl -s -N -A ' .. STREAM_UA .. auth_args(url) .. ' ' .. q(url) ..
     ' >> ' .. q(st.file) .. '; : > ' .. q(st.dead) .. ' ) >/dev/null 2>&1 & echo $!')
   st.pid = tonumber(out:match('%d+'))
@@ -318,6 +395,14 @@ end
 -- an ACP chat reopens in its own CLI (claude --resume / kimi --session; the gateway builds the line): a .command
 -- file opened with Terminal needs no Automation permission, unlike scripting Terminal through osascript
 local function open_in_terminal(cmd)
+  if WIN then -- a .cmd file in a new console window (cmd /K keeps it open after the CLI exits)
+    local f = io.open(DIR .. 'resume.cmd', 'wb')
+    if not f then return end
+    f:write('@echo off\r\n', cmd, '\r\n')
+    f:close()
+    win_bg('start "Hibiki" ' .. q(SYS .. 'cmd.exe') .. ' /D /K ' .. q(DIR .. 'resume.cmd'))
+    return
+  end
   local f = io.open(DIR .. 'resume.command', 'w')
   if not f then return end
   f:write('#!/bin/sh\n', cmd, '\n')
@@ -326,6 +411,10 @@ local function open_in_terminal(cmd)
 end
 
 local function open_in_gamut()
+  if WIN then -- the deep link opens Gamut (and the chat when there is one)
+    win_bg('start "" ' .. q('superagent://' .. ((S.agent ~= '' and S.sid ~= '') and ('agent/' .. S.agent .. '/sessions/' .. S.sid) or '')))
+    return
+  end
   if S.agent ~= '' and S.sid ~= '' then
     sh('/usr/bin/open ' .. q('superagent://agent/' .. S.agent .. '/sessions/' .. S.sid) .. ' >/dev/null 2>&1 &')
   else
@@ -1361,10 +1450,12 @@ local function font_file(path, index)
 end
 -- CJK (and everything the theme font lacks): PingFang SC, macOS's own UI face for Chinese. It lives in a
 -- versioned asset folder, so it's loaded by family name; ReaImGui resolves that through the system.
+-- Windows: Microsoft YaHei UI (ships with Windows, has a bold) and Consolas
+local CJK = WIN and 'Microsoft YaHei UI' or 'PingFang SC'
 local F = {
-  reg = ImGui.CreateFont('PingFang SC'),
-  bold = ImGui.CreateFont('PingFang SC', ImGui.FontFlags_Bold),
-  mono = font_file('/System/Library/Fonts/Menlo.ttc', 0) or ImGui.CreateFont('monospace'),
+  reg = ImGui.CreateFont(CJK),
+  bold = ImGui.CreateFont(CJK, ImGui.FontFlags_Bold),
+  mono = WIN and ImGui.CreateFont('Consolas') or font_file('/System/Library/Fonts/Menlo.ttc', 0) or ImGui.CreateFont('monospace'),
 }
 for _, f in pairs(F) do ImGui.Attach(ctx, f) end
 
@@ -1375,8 +1466,16 @@ local FONT_DIRS = { (os.getenv('HOME') or '') .. '/Library/Fonts', '/Library/Fon
   '/System/Library/Fonts/Supplemental' }
 local function theme_face(theme)
   if not theme or theme == '' then return nil end
-  local txt = theme:lower():match('%.reaperthemezip$')
-    and sh('/usr/bin/unzip -p ' .. q(theme) .. ' "*.ReaperTheme" 2>/dev/null') or sh('/bin/cat ' .. q(theme))
+  local txt
+  if not theme:lower():match('%.reaperthemezip$') then
+    local f = io.open(theme, 'rb')
+    txt = f and f:read('*a') or ''
+    if f then f:close() end
+  elseif WIN then -- bsdtar (Windows 10+) reads zips; ExecProcess returns "<exit code>\n<stdout>"
+    txt = (reaper.ExecProcess('"' .. SYS .. 'tar.exe" -xOf ' .. q(theme) .. ' "*.ReaperTheme"', 5000) or ''):gsub('^[^\n]*\n', '')
+  else
+    txt = sh('/usr/bin/unzip -p ' .. q(theme) .. ' "*.ReaperTheme" 2>/dev/null')
+  end
   local count, best, bn = {}, nil, 0
   for hex in txt:gmatch('\n[%w_]*font[%w_]*=(%x+)') do
     local name = {}
@@ -1413,10 +1512,15 @@ local function load_theme_fonts()
     if f and f ~= F.reg and f ~= F.bold then ImGui.Detach(ctx, f) end
   end
   local face = theme_face(reaper.GetLastColorThemeFile())
-  local reg, bold
-  if face then reg, bold = face_files(face) end
-  F.ui = reg and font_file(reg, 0) or F.reg
-  F.ui_bold = bold and font_file(bold, 0) or F.bold
+  if WIN then -- font files there are named segoeui.ttf / segoeuib.ttf; ReaImGui resolves the family name instead
+    F.ui = face and ImGui.CreateFont(face) or F.reg
+    F.ui_bold = face and ImGui.CreateFont(face, ImGui.FontFlags_Bold) or F.bold
+  else
+    local reg, bold
+    if face then reg, bold = face_files(face) end
+    F.ui = reg and font_file(reg, 0) or F.reg
+    F.ui_bold = bold and font_file(bold, 0) or F.bold
+  end
   if F.ui ~= F.reg then ImGui.Attach(ctx, F.ui) end
   if F.ui_bold ~= F.bold then ImGui.Attach(ctx, F.ui_bold) end
   S.theme_font = face and (face .. (reg and '' or ' (not installed)')) or 'none'

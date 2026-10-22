@@ -1,5 +1,0 @@
-# python-build-standalone build bundled into the .pkg: release tag, python version, sha256 per arch
-TAG=20261021
-PY=3.12.15
-SHA_arm64=7b8d00b751db21cea87dc551a8f8165147c5fbc5251d5537d7e5497dde00a219
-SHA_x86_64=f12e0504397683d6be0745ffd4c39ef45a455cec169adf35c628840d06133773

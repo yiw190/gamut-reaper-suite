@@ -39,3 +39,26 @@ jobs:
         run: python panel/test_panel.py
       - name: every .lua compiles (Lua 5.4), every .sh parses
         run: python scripts/check_syntax.py
+
+  windows:
+    name: Windows (server, bridge, gateway, panel, installer)
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install lupa
+      - name: MCP server (msvcrt locking, %APPDATA% mailbox)
+        run: python tests/test_server.py
+      - name: bridge.lua against a fake ReaScript API
+        run: python tests/test_bridge_lua.py
+      - name: agent gateway (cmd.exe terminal lines)
+        run: python gateway/test_gateway.py
+      - name: chat panel (macOS and Windows command paths)
+        run: python panel/test_panel.py
+      - name: installer (fake profile, no services)
+        run: python tests/test_suite.py

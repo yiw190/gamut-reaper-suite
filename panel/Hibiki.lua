@@ -3674,6 +3674,42 @@ end
 end
 
 local safe_frame
+-- scripted demo for screen recordings: ExtState Hibiki/demo_agent (slug), demo_new ('1') and demo_type (text) make
+-- the panel switch agent, open a new chat and type the text at a human pace, then send it
+local demo_tick do
+  local D
+  demo_tick = function(now)
+    local agent = reaper.GetExtState(EXT, 'demo_agent')
+    if agent ~= '' then
+      reaper.DeleteExtState(EXT, 'demo_agent', false)
+      if agent ~= S.agent then choose_agent(agent, reaper.GetExtState(EXT, 'demo_agent_name')) end
+    end
+    if reaper.GetExtState(EXT, 'demo_new') == '1' then
+      reaper.DeleteExtState(EXT, 'demo_new', false)
+      new_chat()
+    end
+    local text = reaper.GetExtState(EXT, 'demo_type')
+    if text ~= '' then
+      reaper.DeleteExtState(EXT, 'demo_type', false)
+      D = { text = text, n = 0, next = now + 0.6 }
+      S.input = ''
+    end
+    if not D or now < D.next then return end
+    if D.n >= #D.text then
+      D = nil
+      send()
+      return
+    end
+    local n = D.n + 1
+    while n < #D.text and D.text:byte(n + 1) >= 0x80 and D.text:byte(n + 1) < 0xC0 do n = n + 1 end
+    D.n = n
+    S.input = D.text:sub(1, n)
+    local ch = D.text:sub(n, n)
+    D.next = now + (ch == ' ' and 0.09 or (ch:match('[,.]') and 0.25 or 0.045 + (n * 7919 % 5) * 0.012))
+    if D.n >= #D.text then D.next = now + 0.7 end
+  end
+end
+
 local function frame()
   local t0 = reaper.time_precise()
   if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
@@ -3682,6 +3718,7 @@ local function frame()
   sel_tick()
   poll_http()
   poll_stream()
+  demo_tick(t0)
   ImGui.PushFont(ctx, F.reg, FONT_SIZE)
   for _, c in ipairs(COLORS) do ImGui.PushStyleColor(ctx, c[1], c[2]) end
   for _, v in ipairs(VARS) do ImGui.PushStyleVar(ctx, v[1], v[2], v[3]) end
@@ -3866,6 +3903,7 @@ if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
     ONB = ONB, REC = REC, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
-    draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages }
+    draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages,
+    demo_tick = demo_tick }
 end
 reaper.defer(safe_frame)

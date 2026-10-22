@@ -37,6 +37,7 @@ reaper = setmetatable({
   ImGui_GetBuiltinPath = function() return '/nonexistent' end,
   GetExtState = function(sec, key) return EXT_STATE[sec .. '/' .. key] or '' end,
   SetExtState = function(sec, key, v) EXT_STATE[sec .. '/' .. key] = v end,
+  DeleteExtState = function(sec, key) EXT_STATE[sec .. '/' .. key] = nil end,
   time_precise = function() return NOW end,
   get_action_context = function() return false, '', 0, 0 end,
   GetResourcePath = function() return '/nonexistent' end,
@@ -602,6 +603,26 @@ def _recover_job(p):
     job = [c for c in cmds if "recover --json" in c]
     out = re.search(r"""> ['"]([^'"]+recover[^'"]+)\.out['"]""", job[-1]).group(1) if job else None
     return job, out
+
+
+def test_demo_typing():
+    p = Panel(SESSION)
+    p.boot()
+    p.requests()
+    text = "Make the pizz brighter, 中文 ok."
+    p.lua.globals().EXT_STATE["Hibiki/demo_type"] = text
+    t, partial, sent = 100.0, [], []
+    for _ in range(400):
+        p.m.demo_tick(t)
+        partial.append(p.S.input)
+        sent += [r for r in p.requests() if r.method == "POST" and "/messages" in r.url]
+        if sent:
+            break
+        t += 0.05
+    typed = [x for x in partial if x]
+    check("demo: types the text gradually (valid UTF-8 prefixes) and then sends it once",
+          len(set(typed)) > 10 and all(text.startswith(x) for x in typed) and len(sent) == 1
+          and "Hibiki/demo_type" not in dict(p.lua.globals().EXT_STATE), (len(set(typed)), len(sent)))
 
 
 def test_recover():

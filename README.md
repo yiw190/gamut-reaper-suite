@@ -121,7 +121,7 @@ automation-only; DeepSeek models work through an ACP agent such as OpenCode with
 python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.1 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.2 ready`.
 
 MCP client config (any client that runs stdio servers):
 

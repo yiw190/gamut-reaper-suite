@@ -68,7 +68,7 @@ sh ~/hibiki/install.sh                # WITH_AGENTS=1 also adds Codex, Claude Co
 python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.4.0 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.4.1 ready`.
 
 MCP client config (any client that runs stdio servers):
 

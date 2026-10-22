@@ -228,7 +228,10 @@ def loaded(label: str) -> bool:
 def stop_agent(p: Paths, label: str, delete: bool = False) -> bool:
     plist = p.plist(label)
     existed = plist.exists()
-    launchctl("bootout", "%s/%s" % (domain(), label))
+    if launchctl("bootout", "%s/%s" % (domain(), label)) == 0:
+        deadline = time.time() + 15  # bootout returns before a job that shuts down gracefully is gone
+        while loaded(label) and time.time() < deadline:
+            time.sleep(0.2)
     if delete and existed:
         plist.unlink()
     return existed
@@ -246,8 +249,11 @@ def start_agent(p: Paths, label: str, args: list, env: dict | None = None, **ext
     stop_agent(p, label)
     with open(p.plist(label), "wb") as f:
         plistlib.dump(body, f)
-    if launchctl("bootstrap", domain(), str(p.plist(label))) != 0:
-        say("  launchctl bootstrap %s failed; see %s" % (label, log))
+    for attempt in range(5):
+        if launchctl("bootstrap", domain(), str(p.plist(label))) == 0:
+            return
+        time.sleep(1 + attempt)
+    say("  launchctl bootstrap %s failed; see %s" % (label, log))
 
 
 def wait_http(url: str, seconds: float = 10) -> bool:

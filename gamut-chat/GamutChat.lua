@@ -2112,12 +2112,6 @@ local function draw_icon(dl, kind, cx, cy, col)
     ImGui.DrawList_AddCircle(dl, cx, cy, 6, col, 0, 1.5)
     ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx, cy - 3, col, 1.5)
     ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx + 2.5, cy + 2, col, 1.5)
-  elseif kind == 'gear' then
-    for i = 0, 5 do
-      local t = i / 6 * math.pi * 2
-      ImGui.DrawList_AddLine(dl, cx + math.cos(t) * 4, cy + math.sin(t) * 4, cx + math.cos(t) * 7, cy + math.sin(t) * 7, col, 2.2)
-    end
-    ImGui.DrawList_AddCircle(dl, cx, cy, 4.6, col, 0, 1.6)
   elseif kind == 'plus' then
     ImGui.DrawList_AddLine(dl, cx - 5, cy, cx + 5, cy, col, 1.6)
     ImGui.DrawList_AddLine(dl, cx, cy - 5, cx, cy + 5, col, 1.6)
@@ -2193,7 +2187,7 @@ local function model_label()
   return table.concat(parts, ' · ')
 end
 
--- the agent name field in the header: display only (settings live behind the gear button)
+-- the agent name field in the header (agent + model in effect) is the one way into Agent settings
 local function agent_picker()
   -- Gamut's agent layer stays hidden: any Gamut agent reads as "Gamut"
   local name = S.agent == '' and 'No agent' or (is_acp() and (S.agent_name ~= '' and S.agent_name or S.agent) or 'Gamut')
@@ -2203,12 +2197,20 @@ local function agent_picker()
   local nw = ImGui.CalcTextSize(ctx, name)
   ImGui.PopFont(ctx)
   local mw = ml ~= '' and (ImGui.CalcTextSize(ctx, ml) + 10) or 0
-  local w = nw + mw + 20
-  ImGui.Dummy(ctx, w, h)
+  local w = nw + mw + 20 + 14
+  local clicked = ImGui.InvisibleButton(ctx, '##agentfield', w, h)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
   local ty = y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2
-  ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, C.field, RND)
+  ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, ImGui.IsItemHovered(ctx) and C.btn_down or C.field, RND)
+  chevron(x1 + w, y1, y1 + h, C.lane_text)
+  if ImGui.IsItemHovered(ctx) then show_tip('Settings: provider, agent, model, context') end
+  if clicked then
+    S.cfgwin = not S.cfgwin
+    S.cfgwin_pos = nil
+    load_agents()
+    for _, a in ipairs(S.agents) do if a.acp then load_acp_status(a.slug, true) end end
+  end
   ImGui.PushFont(ctx, F.bold, FONT_SIZE)
   ImGui.DrawList_AddText(dl, x1 + 10, ty, C.field_text, name)
   ImGui.PopFont(ctx)
@@ -2245,7 +2247,7 @@ local function header()
   ImGui.SetCursorScreenPos(ctx, hx + 1, hy + 1)
   agent_picker()
   if S.agent ~= '' then
-    local n = S.active and 4 or 3
+    local n = S.active and 3 or 2
     local right = n * fh + (n - 1) * 3
     ImGui.SameLine(ctx, 0, 8)
     local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
@@ -2265,13 +2267,6 @@ local function header()
       if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
       ImGui.SameLine(ctx, 0, 3)
     end
-    if icon_button('cfg', 'gear', nil, 'Settings: provider, agent, model, context') then
-      S.cfgwin = not S.cfgwin
-      S.cfgwin_pos = nil
-      load_agents()
-      for _, a in ipairs(S.agents) do if a.acp then load_acp_status(a.slug, true) end end
-    end
-    ImGui.SameLine(ctx, 0, 3)
     if icon_button('hist', 'clock', nil, 'Recent chats') then
       load_sessions()
       ImGui.OpenPopup(ctx, 'histpop')

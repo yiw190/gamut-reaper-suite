@@ -1,6 +1,6 @@
 # Hibiki
 
-<img src="icons/reaper-mcp.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
+<img src="icons/hibiki.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
 **Hibiki (響, "resonance")** puts AI agents inside [REAPER](https://reaper.fm): an MCP server that drives REAPER, the
 Hibiki panel docked in REAPER for chatting with an agent about what you have selected, and a local gateway so the

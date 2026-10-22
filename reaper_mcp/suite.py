@@ -15,6 +15,7 @@ import platform
 import plistlib
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
@@ -336,6 +337,22 @@ def strip_managed(text: str) -> str:
     for old in LEGACY_HOOKS:
         text = text.replace(old, "")
     return text
+
+
+def install_cli_shim(p: Paths) -> None:
+    """Source checkouts get a ~/.local/bin/hibiki launcher (the pkg links /usr/local/bin/hibiki); the panel's Recover runs it."""
+    if WINDOWS or PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
+        return
+    shim = p.home / ".local/bin/hibiki"
+    body = '#!/bin/sh\nexec %s -s -E %s "$@"\n' % (shlex.quote(sys.executable), shlex.quote(str(ROOT / "reaper_mcp/cli.py")))
+    if shim.exists() and not shim.is_symlink() and shim.read_text() == body:
+        return
+    if shim.is_symlink():
+        shim.unlink()
+    shim.parent.mkdir(parents=True, exist_ok=True)
+    shim.write_text(body)
+    os.chmod(shim, 0o755)
+    say("  cli: %s" % shim)
 
 
 def install_startup(p: Paths) -> None:
@@ -815,6 +832,7 @@ def cmd_setup(a) -> int:
     if not a.no_reaimgui:
         install_imgui(p)
     install_startup(p)
+    install_cli_shim(p)
     say("Services")
     ensure_token(p)
     if WINDOWS:

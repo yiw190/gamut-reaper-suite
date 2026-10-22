@@ -124,6 +124,9 @@ def main():
     bridge = (scripts / "reaper_mcp_bridge.lua").read_text()
     check("bridge installed", bridge == (ROOT / "reaper_mcp/bridge.lua").read_text())
     check("panel installed", (scripts / "Hibiki/Hibiki.lua").exists())
+    cli = home / ".local/bin/hibiki"
+    check("source checkout: ~/.local/bin/hibiki launcher for the panel's Recover",
+          cli.exists() and os.access(cli, os.X_OK) and str(ROOT / "reaper_mcp/cli.py") in cli.read_text(), out)
     check("ReaImGui already present: no download", "already installed" in out and "shim: installed" not in out, out)
     hook = (scripts / "__startup.lua").read_text()
     check("startup: hand-copied hook adopted into the managed block, not duplicated",

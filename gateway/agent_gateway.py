@@ -370,7 +370,10 @@ class AcpAgent:
         if not exe:
             return None
         args = [exe] + [a.replace("{id}", acp_id) for a in argv[1:]]
-        return "cd %s && %s" % (shlex.quote(self.cwd), " ".join(shlex.quote(a) for a in args))
+        # Terminal's PATH lacks the agent's runtime (kimi is `#!/usr/bin/env node`, node lives in ~/.local/node/bin)
+        env_path = (self.spec.get("env") or {}).get("PATH")
+        prefix = "PATH=%s:\"$PATH\" " % shlex.quote(expand(env_path)) if env_path else ""
+        return "cd %s && %sexec %s" % (shlex.quote(self.cwd), prefix, " ".join(shlex.quote(a) for a in args))
 
     def load_persisted(self):
         d = STATE / self.slug

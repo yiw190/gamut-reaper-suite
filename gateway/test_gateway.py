@@ -196,6 +196,8 @@ def unit():
     check("no resume line without the CLI", a.resume_cmd("abc") is None)
     a.spec["resume"] = ["sh", "-c", "echo {id}"]
     check("resume line runs in the agent's cwd", a.resume_cmd("abc").startswith("cd /tmp && ") and "echo abc" in a.resume_cmd("abc"))
+    a.spec["env"] = {"PATH": "/opt/node/bin"}
+    check("resume line carries the agent's PATH", "PATH=/opt/node/bin:\"$PATH\" exec " in a.resume_cmd("abc"))
 
 
 def main():

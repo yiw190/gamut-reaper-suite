@@ -562,25 +562,172 @@ local function marker_ctx(proj, cur)
     r.region_name = name
     r.region = ('"%s" (region %d, %s–%s)'):format(name, num, pos(p0), pos(p1))
   end
+  local around = {}
   if mk >= 0 then
     local _, _, p0, _, name, num = reaper.EnumProjectMarkers3(proj, mk)
-    r.marker = ('"%s" (marker %d @ %s)'):format(name, num, pos(p0))
+    around[#around + 1] = ('last %d "%s" @ %s'):format(num, name, pos(p0))
   end
+  local _, nm, nr = reaper.CountProjectMarkers(proj)
+  for i = 0, (nm or 0) + (nr or 0) - 1 do
+    local _, isr, p0, _, name, num = reaper.EnumProjectMarkers3(proj, i)
+    if not isr and p0 > cur + 1e-9 then
+      around[#around + 1] = ('next %d "%s" @ %s'):format(num, name, pos(p0))
+      break
+    end
+  end
+  if #around > 0 then r.markers = table.concat(around, ', ') end
   return r
 end
 
+---------------------------------------------------------------- what the user selected, and when
+-- REAPER keeps every selection kind until the user changes it, so a track picked minutes ago still reads as
+-- selected next to a time selection made a second ago; sample each kind and remember when it last changed
+local SEL = { sig = {}, at = {}, t = 0 }
+local SEL_KINDS = { 'razor', 'time', 'items', 'tracks', 'notes', 'env', 'fx', 'cursor' }
+local SEL_LABEL = { razor = 'razor area', time = 'time selection', items = 'items', tracks = 'tracks',
+  notes = 'MIDI notes', env = 'envelope', fx = 'FX window', cursor = 'edit cursor' }
+
+local function sel_sigs(proj)
+  local g = {}
+  local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
+  g.time = e > s and (s .. ':' .. e) or ''
+  local rz = {}
+  for i = 0, reaper.CountTracks(proj) - 1 do
+    local _, v = reaper.GetSetMediaTrackInfo_String(reaper.GetTrack(proj, i), 'P_RAZOREDITS', '', false)
+    if v and v ~= '' then rz[#rz + 1] = i .. '=' .. v end
+  end
+  g.razor = table.concat(rz, '|')
+  local t = {}
+  for i = 0, reaper.CountSelectedTracks(proj) - 1 do t[#t + 1] = tostring(reaper.GetSelectedTrack(proj, i)) end
+  g.tracks = table.concat(t, ',')
+  local n = reaper.CountSelectedMediaItems(proj)
+  local it = {}
+  for i = 0, math.min(n, 64) - 1 do it[#it + 1] = tostring(reaper.GetSelectedMediaItem(proj, i)) end
+  g.items = n > 0 and (n .. ':' .. table.concat(it, ',')) or ''
+  local nt = {}
+  local ed = reaper.MIDIEditor_GetActive()
+  local take = ed and reaper.MIDIEditor_GetTake(ed)
+  if take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
+    local idx = reaper.MIDI_EnumSelNotes(take, -1)
+    while idx ~= -1 and #nt < 256 do nt[#nt + 1] = idx; idx = reaper.MIDI_EnumSelNotes(take, idx) end
+    if #nt > 0 then table.insert(nt, 1, tostring(take)) end
+  end
+  g.notes = table.concat(nt, ',')
+  local env = reaper.GetSelectedEnvelope(proj)
+  g.env = env and tostring(env) or ''
+  local rv, a, b, c = reaper.GetFocusedFX2()
+  g.fx = (rv and rv ~= 0) and (a .. ':' .. b .. ':' .. c) or ''
+  g.cursor = ('%.3f'):format(reaper.GetCursorPosition())
+  return g
+end
+
+local function sel_tick(force)
+  local now = reaper.time_precise()
+  if not force and now - SEL.t < 0.25 then return end
+  SEL.t = now
+  local g = sel_sigs(reaper.EnumProjects(-1))
+  for _, k in ipairs(SEL_KINDS) do
+    if SEL.sig[k] == nil then SEL.at[k] = false -- already like this when the panel opened
+    elseif SEL.sig[k] ~= g[k] then SEL.at[k] = now end
+    SEL.sig[k] = g[k]
+  end
+end
+
+local function age(k)
+  local t = SEL.at[k]
+  if not t then return 'before panel opened' end
+  local d = reaper.time_precise() - t
+  if d < 60 then return ('%ds ago'):format(math.floor(d)) end
+  if d < 3600 then return ('%d min ago'):format(math.floor(d / 60)) end
+  return ('%d h ago'):format(math.floor(d / 3600))
+end
+local function set_ago(k) return ' (set ' .. age(k) .. ')' end
+
+local function recency()
+  local live = {}
+  for _, k in ipairs(SEL_KINDS) do
+    if SEL.sig[k] and SEL.sig[k] ~= '' and not (k == 'cursor' and SEL.at[k] == false) then live[#live + 1] = k end
+  end
+  if #live < 2 then return nil end
+  table.sort(live, function(a, b) return (SEL.at[a] or -1) > (SEL.at[b] or -1) end)
+  local out = {}
+  for _, k in ipairs(live) do out[#out + 1] = SEL_LABEL[k] .. ' ' .. age(k) end
+  return 'newest first: ' .. table.concat(out, ' > ')
+end
+
+-- markers, regions and notes inside a time range; tracks = nil means every track
+local function range_lines(proj, t0, t1, tracks, indent)
+  local L = {}
+  local mk, rg, more = {}, {}, 0
+  local _, nm, nr = reaper.CountProjectMarkers(proj)
+  for i = 0, (nm or 0) + (nr or 0) - 1 do
+    local _, isr, p0, p1, name, num = reaper.EnumProjectMarkers3(proj, i)
+    if isr then
+      if p0 < t1 and p1 > t0 then rg[#rg + 1] = ('"%s" %s–%s'):format(name, pos(p0), pos(p1)) end
+    elseif p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 then
+      if #mk < 16 then mk[#mk + 1] = ('%d "%s" @ %s'):format(num, name, pos(p0)) else more = more + 1 end
+    end
+  end
+  if more > 0 then mk[#mk + 1] = ('… +%d more'):format(more) end
+  if #mk > 0 then L[#L + 1] = indent .. 'markers: ' .. table.concat(mk, ', ') end
+  if #rg > 0 then L[#L + 1] = indent .. 'regions: ' .. table.concat(rg, ', ') end
+  if not tracks then
+    tracks = {}
+    for i = 0, reaper.CountTracks(proj) - 1 do tracks[#tracks + 1] = reaper.GetTrack(proj, i) end
+  end
+  local parts, extra = {}, 0
+  for _, tr in ipairs(tracks) do
+    local notes, lo, hi, audio = 0, 128, -1, 0
+    for i = 0, reaper.CountTrackMediaItems(tr) - 1 do
+      local m = reaper.GetTrackMediaItem(tr, i)
+      local p0 = reaper.GetMediaItemInfo_Value(m, 'D_POSITION')
+      local p1 = p0 + reaper.GetMediaItemInfo_Value(m, 'D_LENGTH')
+      local take = reaper.GetActiveTake(m)
+      if take and p0 < t1 and p1 > t0 and reaper.GetMediaItemInfo_Value(m, 'B_MUTE') == 0 then
+        if reaper.TakeIsMIDI(take) then
+          local a = reaper.MIDI_GetPPQPosFromProjTime(take, math.max(t0, p0))
+          local b = reaper.MIDI_GetPPQPosFromProjTime(take, math.min(t1, p1))
+          local _, nn = reaper.MIDI_CountEvts(take)
+          for k = 0, nn - 1 do
+            local _, _, muted, sp, _, _, pitch = reaper.MIDI_GetNote(take, k)
+            if sp >= b then break end
+            if not muted and sp >= a then notes = notes + 1; lo = math.min(lo, pitch); hi = math.max(hi, pitch) end
+          end
+        else
+          audio = audio + 1
+        end
+      end
+    end
+    if notes > 0 or audio > 0 then
+      if #parts < 16 then
+        local _, tn = reaper.GetTrackName(tr)
+        local d = {}
+        if notes > 0 then d[#d + 1] = ('%d %s %s–%s'):format(notes, notes == 1 and 'note' or 'notes', note_name(lo), note_name(hi)) end
+        if audio > 0 then d[#d + 1] = 'audio' end
+        local muted = reaper.GetMediaTrackInfo_Value(tr, 'B_MUTE') == 1 and ', track muted' or ''
+        parts[#parts + 1] = ('#%d %s (%s%s)'):format(trnum(tr), tn, table.concat(d, ' + '), muted)
+      else
+        extra = extra + 1
+      end
+    end
+  end
+  if extra > 0 then parts[#parts + 1] = ('… +%d more tracks'):format(extra) end
+  L[#L + 1] = indent .. 'playing here: ' .. (#parts > 0 and table.concat(parts, ', ') or 'nothing')
+  return L
+end
+
+-- razor edit = a rectangle (time range × tracks), each track can hold several ranges
 local function razor_ctx(proj)
   local out = {}
   for i = 0, reaper.CountTracks(proj) - 1 do
     local tr = reaper.GetTrack(proj, i)
     local _, s = reaper.GetSetMediaTrackInfo_String(tr, 'P_RAZOREDITS', '', false)
-    if s ~= '' then
-      local segs = {}
-      for a, b, g in s:gmatch('(%S+) (%S+) "([^"]*)"') do
-        segs[#segs + 1] = pos(tonumber(a)) .. '–' .. pos(tonumber(b)) .. (g ~= '' and ' (envelope lane)' or '')
-      end
+    if s and s ~= '' then
       local _, tn = reaper.GetTrackName(tr)
-      out[#out + 1] = ('#%d %s: %s'):format(i + 1, tn, table.concat(segs, ', '))
+      for a, b, g in s:gmatch('(%S+) (%S+) "([^"]*)"') do
+        out[#out + 1] = { tr = tr, t0 = tonumber(a), t1 = tonumber(b), env = g ~= '',
+          label = ('#%d %s %s–%s%s'):format(i + 1, tn, pos(tonumber(a)), pos(tonumber(b)), g ~= '' and ' (envelope lane)' or '') }
+      end
     end
   end
   return out
@@ -649,12 +796,51 @@ local function context(full, all)
     L[#L + 1] = ('arrange grid: %s, snap %s'):format(qn_frac((div or 0) * 4), reaper.GetToggleCommandState(1157) == 1 and 'on' or 'off')
   end
 
+  if full then
+    sel_tick(true)
+    local rc = recency()
+    if rc then L[#L + 1] = 'selection recency: ' .. rc end
+  end
+
   local mk = marker_ctx(proj, cur)
   if mk.region then L[#L + 1] = 'region at cursor: ' .. mk.region; chip[#chip + 1] = mk.region_name end
-  if mk.marker then L[#L + 1] = 'last marker: ' .. mk.marker end
+  if mk.markers then L[#L + 1] = 'markers at cursor: ' .. mk.markers end
 
   local s, e = reaper.GetSet_LoopTimeRange2(proj, false, false, 0, 0, false)
-  if e > s then L[#L + 1] = ('time selection: %s – %s'):format(pos(s), pos(e)); chip[#chip + 1] = 'time sel' end
+  if e > s then
+    chip[#chip + 1] = 'time sel'
+    if full then
+      L[#L + 1] = ('time selection (all tracks): %s – %s%s'):format(pos(s), pos(e), set_ago('time'))
+      for _, x in ipairs(range_lines(proj, s, e, nil, '  ')) do L[#L + 1] = x end
+    else
+      L[#L + 1] = ('time selection: %s – %s'):format(pos(s), pos(e))
+    end
+  end
+
+  local rz = razor_ctx(proj)
+  if #rz > 0 then
+    chip[#chip + 1] = 'razor'
+    -- ranges with the same start/end on several tracks are one rectangle
+    local areas, by = {}, {}
+    for _, r in ipairs(rz) do
+      local key = ('%.6f:%.6f'):format(r.t0, r.t1)
+      local a = by[key]
+      if not a then a = { t0 = r.t0, t1 = r.t1, tracks = {}, names = {} }; by[key] = a; areas[#areas + 1] = a end
+      if not r.env and a.tracks[#a.tracks] ~= r.tr then a.tracks[#a.tracks + 1] = r.tr end
+      local _, tn = reaper.GetTrackName(r.tr)
+      local nm_ = ('#%d %s%s'):format(trnum(r.tr), tn, r.env and ' (envelope lane)' or '')
+      if a.names[#a.names] ~= nm_ then a.names[#a.names + 1] = nm_ end
+    end
+    if full then
+      for n, a in ipairs(areas) do
+        if n > 8 then L[#L + 1] = ('  … +%d more razor areas'):format(#areas - 8); break end
+        L[#L + 1] = ('razor area: %s – %s on %s%s'):format(pos(a.t0), pos(a.t1), table.concat(a.names, ', '), set_ago('razor'))
+        if #a.tracks > 0 then
+          for _, x in ipairs(range_lines(proj, a.t0, a.t1, a.tracks, '  ')) do L[#L + 1] = x end
+        end
+      end
+    end
+  end
 
   local tr = {}
   for i = 0, reaper.CountSelectedTracks(proj) - 1 do
@@ -665,7 +851,7 @@ local function context(full, all)
   if #tr > 0 then
     local names = {}
     for _, x in ipairs(tr) do names[#names + 1] = x[1] end
-    L[#L + 1] = 'selected tracks: ' .. table.concat(names, ', ')
+    L[#L + 1] = 'selected tracks: ' .. table.concat(names, ', ') .. (full and set_ago('tracks') or '')
     chip[#chip + 1] = #tr == 1 and tr[1][2] or (#tr .. ' tracks')
     if all then
       for i = 0, math.min(#tr, 8) - 1 do L[#L + 1] = track_detail(reaper.GetSelectedTrack(proj, i)) end
@@ -675,7 +861,7 @@ local function context(full, all)
   local n = reaper.CountSelectedMediaItems(proj)
   if n > 0 then
     if all then
-      L[#L + 1] = ('selected items (%d):'):format(n)
+      L[#L + 1] = ('selected items (%d)%s:'):format(n, set_ago('items'))
       for i = 0, math.min(n, 32) - 1 do L[#L + 1] = item_detail(reaper.GetSelectedMediaItem(proj, i)) end
       if n > 32 then L[#L + 1] = ('  … +%d more'):format(n - 32) end
     elseif full then
@@ -688,21 +874,19 @@ local function context(full, all)
         it[#it + 1] = ('%s @ %s–%s'):format(tn, pos(p0), pos(p0 + len))
       end
       if n > 8 then it[#it + 1] = ('… +%d more'):format(n - 8) end
-      L[#L + 1] = 'selected items: ' .. table.concat(it, '; ')
+      L[#L + 1] = 'selected items: ' .. table.concat(it, '; ') .. set_ago('items')
     end
     chip[#chip + 1] = n .. (n == 1 and ' item' or ' items')
   end
-
-  local rz = razor_ctx(proj)
-  if #rz > 0 then L[#L + 1] = 'razor edits: ' .. table.concat(rz, '; '); chip[#chip + 1] = 'razor' end
 
   local md = midi_ctx(proj, full, all)
   if md then
     if md.sel > 0 then
       chip[#chip + 1] = md.sel .. (md.sel == 1 and ' note' or ' notes')
       if full then
-        L[#L + 1] = ('MIDI editor: %s, item @ %s, take "%s" — %d of %d notes selected%s:'):format(
-          md.track, md.item, md.take, md.sel, md.total, md.sel > #md.list and (' (first ' .. #md.list .. ' listed)') or '')
+        L[#L + 1] = ('MIDI editor: %s, item @ %s, take "%s" — %d of %d notes selected%s%s:'):format(
+          md.track, md.item, md.take, md.sel, md.total, md.sel > #md.list and (' (first ' .. #md.list .. ' listed)') or '',
+          set_ago('notes'))
         for _, x in ipairs(md.list) do L[#L + 1] = x end
       end
     elseif full then
@@ -721,7 +905,7 @@ local function context(full, all)
   if all then
     local ev = envelope_ctx(proj)
     if ev then
-      L[#L + 1] = ev.head
+      L[#L + 1] = ev.head:gsub(':$', '') .. set_ago('env') .. (ev.head:find(':$') and ':' or '')
       for _, x in ipairs(ev.list) do L[#L + 1] = x end
     end
   end
@@ -730,9 +914,9 @@ local function context(full, all)
   if fx then
     chip[#chip + 1] = 'FX: ' .. fx.short
     if full then
-      L[#L + 1] = ('%s FX: %s on %s (%s) — %d params%s:'):format(fx.focused and 'focused' or 'open (last focused)',
+      L[#L + 1] = ('%s FX: %s on %s (%s) — %d params%s%s:'):format(fx.focused and 'focused' or 'open (last focused)',
         fx.name, fx.where, fx.enabled and 'enabled' or 'bypassed', fx.n,
-        fx.n > #fx.params and (', first ' .. #fx.params .. ' shown') or '')
+        fx.n > #fx.params and (', first ' .. #fx.params .. ' shown') or '', set_ago('fx'))
       for _, x in ipairs(fx.params) do L[#L + 1] = x end
     end
   end
@@ -752,6 +936,8 @@ end
 
 local CTX_OPEN = '[REAPER context — auto-attached by the Gamut Chat panel in REAPER; #N = REAPER track number, MCP index = N-1]'
 local CTX_CLOSE = '[/REAPER context]'
+-- first line of the block; CTX_OPEN itself stays fixed so older messages still fold
+local CTX_NOTE = 'note: REAPER keeps every selection until it is changed, so stale ones linger; "set … ago" says what the user touched last. Read the request first, then the newest selection.'
 
 local function split_context(text)
   local a, b = text:find(CTX_OPEN, 1, true)
@@ -835,7 +1021,7 @@ local function send()
   local payload = text
   if S.ctx_level > 0 then
     local ctx_text = context(true, S.ctx_level == 2)
-    payload = CTX_OPEN .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
+    payload = CTX_OPEN .. '\n' .. CTX_NOTE .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
   end
   if #S.files == 0 then return deliver(payload, text, text) end
   -- upload the attachments first, then send the message with Gamut's "[Attached files:]" block
@@ -2324,6 +2510,7 @@ local function frame()
   if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
   if S.waiting and #S.greqs == 0 and t0 - S.greq_at > 3 then load_requests() end
   check_theme()
+  sel_tick()
   poll_http()
   poll_stream()
   ImGui.PushFont(ctx, F.reg, FONT_SIZE)
@@ -2489,6 +2676,6 @@ S.boot = true
 load_agents()
 if GAMUTCHAT_TEST then -- gamut-chat/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
-    greq_card = greq_card, decode = decode, jstr = jstr }
+    greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL }
 end
 reaper.defer(frame)

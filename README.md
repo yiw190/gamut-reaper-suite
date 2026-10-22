@@ -2,7 +2,7 @@
 
 <img src="icons/hibiki.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
-**Hibiki is the agent inside your music editor.** Talk to it about what you're working on, let it edit, arrange
+**Hibiki is the agent inside your music editor, built for professionals.** Talk to it about what you're working on, let it edit, arrange
 and mix alongside you, and bring the AI agents you already use. It runs in [REAPER](https://reaper.fm) today.
 
 | Path | What |

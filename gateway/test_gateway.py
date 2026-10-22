@@ -195,9 +195,17 @@ def unit():
     a.spec, a.cwd = {"slug": "kimi", "command": ["/nonexistent/kimi", "acp"], "resume": ["no-such-cli-xyz", "{id}"]}, "/tmp"
     check("no resume line without the CLI", a.resume_cmd("abc") is None)
     a.spec["resume"] = ["sh", "-c", "echo {id}"]
-    check("resume line runs in the agent's cwd", a.resume_cmd("abc").startswith("cd /tmp && ") and "echo abc" in a.resume_cmd("abc"))
+    line = a.resume_cmd("abc") or ""
+    if os.name == "nt":
+        check("resume line runs in the agent's cwd", line.startswith('cd /d "/tmp" && ') and '"echo abc"' in line or print(line))
+    else:
+        check("resume line runs in the agent's cwd", line.startswith("cd /tmp && ") and "echo abc" in line)
     a.spec["env"] = {"PATH": "/opt/node/bin"}
-    check("resume line carries the agent's PATH", "PATH=/opt/node/bin:\"$PATH\" exec " in a.resume_cmd("abc"))
+    line = a.resume_cmd("abc") or ""
+    if os.name == "nt":
+        check("resume line carries the agent's PATH", 'set "PATH=/opt/node/bin;%PATH%" && ' in line or print(line))
+    else:
+        check("resume line carries the agent's PATH", "PATH=/opt/node/bin:\"$PATH\" exec " in line)
     ag.WINDOWS = True
     try:
         line = ag.shell_line(["C:\\n\\kimi.cmd", "--session", "s_1"], env={"K": "v w"}, cwd="C:\\Users\\x\\My Songs",

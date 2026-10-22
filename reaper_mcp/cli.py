@@ -6,14 +6,14 @@ import sys
 if not __package__:  # run by path (the .pkg's bin/hibiki): make the package importable
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "uninstall"}
+SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "uninstall", "run"}  # run = the Windows supervisor
 USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | uninstall]
 
   serve            stdio MCP server (the default when stdin isn't a terminal)
   http             bearer-protected HTTP front on 127.0.0.1:$REAPER_MCP_PORT (default 8787)
   install-bridge   copy the Lua bridge into REAPER's Scripts folder
   version          print the version
-  setup ...        macOS: install / upgrade the whole suite for this user (see `setup -h`)
+  setup ...        macOS / Windows: install / upgrade the whole suite for this user (see `setup -h`)
 """
 
 

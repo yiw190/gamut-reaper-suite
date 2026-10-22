@@ -522,9 +522,19 @@ def cmd_run(a) -> int:
     """The Windows supervisor: start both services, restart whichever exits. Runs under pythonw, so no prints."""
     p = Paths()
     p.logs.mkdir(parents=True, exist_ok=True)
+    try:
+        return supervise(p, a.port)
+    except BaseException:  # pythonw has no stderr: leave the reason where doctor's hint points
+        import traceback
+        with open(p.logs / "supervisor.log", "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S ") + traceback.format_exc())
+        raise
+
+
+def supervise(p: Paths, port_: int) -> int:
     win_pid_file(p).write_text(str(os.getpid()))
     py = win_python() if WINDOWS else sys.executable
-    env = dict(os.environ, REAPER_MCP_PORT=str(a.port))
+    env = dict(os.environ, REAPER_MCP_PORT=str(port_))
     jobs = {"reaper-mcp": [py, str(ROOT / "reaper_mcp/http_server.py")],
             "agent-gateway": [py, str(ROOT / "gateway/agent_gateway.py")]}
     flags = subprocess.CREATE_NO_WINDOW if WINDOWS else 0
@@ -775,7 +785,8 @@ def cmd_doctor(a) -> int:
         row("ok" if str(ROOT) in auto else "FAIL", "autostart", "HKCU Run \"%s\"" % RUN_VALUE if str(ROOT) in auto
             else ("points at another install - run setup" if auto else "missing - run setup"))
         pid = win_supervisor_pid(p)
-        row("ok" if pid else "FAIL", "supervisor", "pid %d" % pid if pid else "not running - run setup")
+        row("ok" if pid else "FAIL", "supervisor", "pid %d" % pid if pid else
+            "not running - see %s, then run setup" % (p.logs / "supervisor.log"))
         row("ok", "watchdog", "macOS only")
     else:
         for label in (MCP_LABEL, GW_LABEL, WD_LABEL):

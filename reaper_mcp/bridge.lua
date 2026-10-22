@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.5.0-rc.2"
+local VERSION = "0.5.0-rc.3"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -69,19 +69,17 @@ do
     local b = s:byte(i)
     return b ~= nil and b >= 0x80 and b < 0xC0
   end
+  local SPECIAL = '[%c"\\\128-\255]'
   local function esc_str(s)
-    local parts = {'"'}
-    local i, n = 1, #s
-    while i <= n do
+    local i = s:find(SPECIAL)
+    if not i then return '"' .. s .. '"' end
+    local parts, np, run, n = {'"'}, 1, 1, #s
+    while i do
       local b = s:byte(i)
+      local skip
       if b < 32 or b == 34 or b == 92 then
-        local c = s:sub(i, i)
-        parts[#parts + 1] = esc[c] or string.format('\\u%04x', b)
-        i = i + 1
-      elseif b < 128 then
-        parts[#parts + 1] = s:sub(i, i)
-        i = i + 1
-      else
+        skip = esc[s:sub(i, i)] or string.format('\\u%04x', b)
+      elseif b >= 128 then
         local len = utf8_len(s, i)
         local ok = len ~= nil and (i + len - 1) <= n
         if ok then
@@ -89,16 +87,17 @@ do
             if not is_cont(s, j) then ok = false break end
           end
         end
-        if ok then
-          parts[#parts + 1] = s:sub(i, i + len - 1)
-          i = i + len
-        else
-          parts[#parts + 1] = string.format('\\u%04x', b)
-          i = i + 1
-        end
+        if ok then i = i + len - 1 else skip = string.format('\\u%04x', b) end
       end
+      if skip then
+        if i > run then np = np + 1; parts[np] = s:sub(run, i - 1) end
+        np = np + 1; parts[np] = skip
+        run = i + 1
+      end
+      i = s:find(SPECIAL, i + 1)
     end
-    parts[#parts + 1] = '"'
+    if run <= n then np = np + 1; parts[np] = s:sub(run, n) end
+    parts[np + 1] = '"'
     return table.concat(parts)
   end
   local encode
@@ -160,87 +159,91 @@ do
   json.encode = function(v) return encode(v, nil) end
   json.object = function(t) return setmetatable(t or {}, { __jsontype = "object" }) end
 
+  local UNESC = { n = "\n", t = "\t", r = "\r", b = "\b", f = "\f",
+                  ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
+  local function ws(s, j) return s:find("[^ \t\r\n]", j) or (#s + 1) end
+  local function utf8_char(cp)
+    if cp < 0x80 then return string.char(cp)
+    elseif cp < 0x800 then
+      return string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
+    elseif cp < 0x10000 then
+      return string.char(
+        0xE0 + math.floor(cp / 0x1000),
+        0x80 + math.floor(cp / 0x40) % 0x40,
+        0x80 + cp % 0x40)
+    end
+    return string.char(
+      0xF0 + math.floor(cp / 0x40000),
+      0x80 + math.floor(cp / 0x1000) % 0x40,
+      0x80 + math.floor(cp / 0x40) % 0x40,
+      0x80 + cp % 0x40)
+  end
+
   local function decode(s, i)
-    local function ws(j) return s:find("[^ \t\r\n]", j) or (#s + 1) end
-    i = ws(i)
-    local c = s:sub(i, i)
-    if c == "{" then
+    i = ws(s, i)
+    local c = s:byte(i)
+    if c == 123 then
       local obj = {}
-      i = ws(i + 1)
-      if s:sub(i, i) == "}" then return obj, i + 1 end
+      i = ws(s, i + 1)
+      if s:byte(i) == 125 then return obj, i + 1 end
       while true do
         local key, val
         key, i = decode(s, i)
-        i = ws(i)
-        assert(s:sub(i, i) == ":", "expected :")
+        i = ws(s, i)
+        assert(s:byte(i) == 58, "expected :")
         val, i = decode(s, i + 1)
         obj[key] = val
-        i = ws(i)
-        local ch = s:sub(i, i)
-        if ch == "," then i = i + 1
-        elseif ch == "}" then return obj, i + 1
+        i = ws(s, i)
+        local ch = s:byte(i)
+        if ch == 44 then i = i + 1
+        elseif ch == 125 then return obj, i + 1
         else error("expected , or }") end
       end
-    elseif c == "[" then
+    elseif c == 91 then
       local arr, n = {}, 0
-      i = ws(i + 1)
-      if s:sub(i, i) == "]" then return arr, i + 1 end
+      i = ws(s, i + 1)
+      if s:byte(i) == 93 then return arr, i + 1 end
       while true do
         local val
         val, i = decode(s, i)
         n = n + 1
         arr[n] = val
-        i = ws(i)
-        local ch = s:sub(i, i)
-        if ch == "," then i = i + 1
-        elseif ch == "]" then return setmetatable(arr, { __n = n }), i + 1
+        i = ws(s, i)
+        local ch = s:byte(i)
+        if ch == 44 then i = i + 1
+        elseif ch == 93 then return setmetatable(arr, { __n = n }), i + 1
         else error("expected , or ]") end
       end
-    elseif c == '"' then
-      local buf, j = {}, i + 1
+    elseif c == 34 then
+      local j = i + 1
+      local k = s:find('["\\]', j)
+      if not k then error("unterminated string") end
+      if s:byte(k) == 34 then return s:sub(j, k - 1), k + 1 end
+      local buf, nb = {}, 0
       while true do
-        local ch = s:sub(j, j)
-        if ch == "" then error("unterminated string") end
-        if ch == '"' then return table.concat(buf), j + 1 end
-        if ch == "\\" then
-          local e = s:sub(j + 1, j + 1)
-          local map = { n = "\n", t = "\t", r = "\r", b = "\b", f = "\f",
-                        ['"'] = '"', ["\\"] = "\\", ["/"] = "/" }
-          if e == "u" then
-            local cp = tonumber(s:sub(j + 2, j + 5), 16) or 0
-            -- a UTF-16 surrogate pair (\uD83C\uDFB5) is one code point: combine it, don't emit two halves
-            local lo = cp >= 0xD800 and cp <= 0xDBFF and s:sub(j + 6, j + 7) == "\\u"
-              and tonumber(s:sub(j + 8, j + 11), 16)
-            if lo and lo >= 0xDC00 and lo <= 0xDFFF then
-              cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
-              j = j + 6
-            end
-            if cp < 0x80 then buf[#buf + 1] = string.char(cp)
-            elseif cp < 0x800 then
-              buf[#buf + 1] = string.char(0xC0 + math.floor(cp / 0x40), 0x80 + cp % 0x40)
-            elseif cp < 0x10000 then
-              buf[#buf + 1] = string.char(
-                0xE0 + math.floor(cp / 0x1000),
-                0x80 + math.floor(cp / 0x40) % 0x40,
-                0x80 + cp % 0x40)
-            else
-              buf[#buf + 1] = string.char(
-                0xF0 + math.floor(cp / 0x40000),
-                0x80 + math.floor(cp / 0x1000) % 0x40,
-                0x80 + math.floor(cp / 0x40) % 0x40,
-                0x80 + cp % 0x40)
-            end
-            j = j + 6
-          else
-            buf[#buf + 1] = map[e] or e
-            j = j + 2
+        if k > j then nb = nb + 1; buf[nb] = s:sub(j, k - 1) end
+        if s:byte(k) == 34 then return table.concat(buf), k + 1 end
+        local e = s:sub(k + 1, k + 1)
+        if e == "u" then
+          local cp = tonumber(s:sub(k + 2, k + 5), 16) or 0
+          -- a UTF-16 surrogate pair (\uD83C\uDFB5) is one code point: combine it, don't emit two halves
+          local lo = cp >= 0xD800 and cp <= 0xDBFF and s:sub(k + 6, k + 7) == "\\u"
+            and tonumber(s:sub(k + 8, k + 11), 16)
+          if lo and lo >= 0xDC00 and lo <= 0xDFFF then
+            cp = 0x10000 + (cp - 0xD800) * 0x400 + (lo - 0xDC00)
+            k = k + 6
           end
+          nb = nb + 1; buf[nb] = utf8_char(cp)
+          j = k + 6
         else
-          buf[#buf + 1] = ch
-          j = j + 1
+          if e == "" then error("unterminated string") end
+          nb = nb + 1; buf[nb] = UNESC[e] or e
+          j = k + 2
         end
+        k = s:find('["\\]', j)
+        if not k then error("unterminated string") end
       end
-    elseif c:match("[%d%-]") then
+    elseif c and (c == 45 or (c >= 48 and c <= 57)) then
       local num = s:match("^%-?%d+%.?%d*[eE]?[%+%-]?%d*", i)
       return tonumber(num), i + #num
     elseif s:sub(i, i + 3) == "true" then return true, i + 4

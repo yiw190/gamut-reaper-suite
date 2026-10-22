@@ -38,6 +38,97 @@ load = function(chunk, name, mode, env)
 end
 """
 
+REFERENCE_ESC = r"""
+local esc = {['"'] = '\\"', ['\\'] = '\\\\', ['\b'] = '\\b', ['\f'] = '\\f', ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t'}
+local function utf8_len(s, i)
+  local b = s:byte(i)
+  if not b then return nil end
+  if b < 0x80 then return 1 end
+  if b < 0xC2 then return nil end
+  if b < 0xE0 then return 2 end
+  if b < 0xF0 then return 3 end
+  if b < 0xF5 then return 4 end
+  return nil
+end
+local function is_cont(s, i) local b = s:byte(i) return b ~= nil and b >= 0x80 and b < 0xC0 end
+return function(s)
+  local parts = {'"'}
+  local i, n = 1, #s
+  while i <= n do
+    local b = s:byte(i)
+    if b < 32 or b == 34 or b == 92 then
+      parts[#parts + 1] = esc[s:sub(i, i)] or string.format('\\u%04x', b)
+      i = i + 1
+    elseif b < 128 then
+      parts[#parts + 1] = s:sub(i, i)
+      i = i + 1
+    else
+      local len = utf8_len(s, i)
+      local ok = len ~= nil and (i + len - 1) <= n
+      if ok then for j = i + 1, i + len - 1 do if not is_cont(s, j) then ok = false break end end end
+      if ok then parts[#parts + 1] = s:sub(i, i + len - 1); i = i + len
+      else parts[#parts + 1] = string.format('\\u%04x', b); i = i + 1 end
+    end
+  end
+  parts[#parts + 1] = '"'
+  return table.concat(parts)
+end
+"""
+
+
+def json_checks(lupa, check) -> None:
+    """bridge.lua's JSON codec on its own: fast paths must not change what goes over the mailbox."""
+    import random
+    src = BRIDGE.read_text(encoding="utf-8")
+    block = src[src.index("local json = {}"):src.index("-" * 70 + "\n-- files")]
+    lua = lupa.LuaRuntime(encoding=None)
+    lua.execute(COMPAT)
+    js = lua.execute(block + "\nreturn json")
+    ref = lua.execute(REFERENCE_ESC)
+    enc = js.encode
+
+    def dec(raw: bytes):
+        return lua.eval("function(j, s) return j.decode(s) end")(js, raw)
+
+    cases = {
+        "ascii": b"Piano 1", "cjk": "鼓 钢琴 Lead".encode(), "emoji": "\U0001F3B5 Lead".encode(),
+        "escapes": b'a"b\\c\n\t\r\x08\x0c/', "controls": b"\x00\x01\x1f\x7f",
+        "invalid utf-8": b"ok\xff\xc3(\xe4\xb8", "lone continuation": b"\x80\xbfx", "overlong lead": b"\xc0\xaf",
+        "empty": b"",
+    }
+    for name, raw in cases.items():
+        out = enc(raw)
+        check("json encode %s: same bytes as the reference encoder" % name, out == ref(raw), (raw, out, ref(raw)))
+    check("json encode cjk passes through unescaped", enc("鼓".encode()) == '"鼓"'.encode())
+    check("json encode invalid utf-8 -> \\u00XX per bad byte",
+          enc(b"ok\xff\xc3(") == b'"ok\\u00ff\\u00c3("', enc(b"ok\xff\xc3("))
+    check("json encode controls", enc(b"\x01\n\x1f") == b'"\\u0001\\n\\u001f"', enc(b"\x01\n\x1f"))
+    rng = random.Random(7)
+    alphabet = [bytes([b]) for b in range(256)] + ["é".encode(), "鼓".encode(), "\U0001F3B5".encode()] * 20
+    mismatch = None
+    for _ in range(3000):
+        raw = b"".join(rng.choice(alphabet) for _ in range(rng.randint(0, 24)))
+        if enc(raw) != ref(raw):
+            mismatch = raw
+            break
+    check("json encode: 3000 random byte strings match the reference encoder", mismatch is None, repr(mismatch))
+
+    for name, value in {"cjk": "鼓 钢琴", "escapes": 'q"b\\s\n\t\r\x08\x0c/', "controls": "\x01\x1f",
+                        "emoji": "\U0001F3B5x", "bmp": "é€"}.items():
+        for ascii_only in (True, False):
+            wire = json.dumps(value, ensure_ascii=ascii_only).encode()
+            got = dec(wire)
+            check("json decode %s (ensure_ascii=%s)" % (name, ascii_only), got == value.encode(), (wire, got))
+            check("json round trip %s (ensure_ascii=%s)" % (name, ascii_only), dec(enc(dec(wire))) == value.encode())
+    doc = {"notes": [{"pitch": 60 + i, "start_beats": i * 0.5, "name": "鼓 %d \"x\"" % i, "muted": i % 2 == 0}
+                     for i in range(50)], "track": "Piano", "empty": [], "nested": {"a": [1, -2.5, 3e2]}}
+    wire = json.dumps(doc, ensure_ascii=False).encode()
+    back = json.loads(enc(dec(wire)).decode())
+    check("json round trip: notes document", back == dict(doc, nested={"a": [1, -2.5, 300]}), back)
+    bad = lua.eval("function(j, s) return select(2, j.decode(s)) end")
+    check("json decode: unterminated string is an error", bad(js, b'"abc') is not None
+          and bad(js, b'"ab\\') is not None and bad(js, b'"\\u00e9') is not None)
+
 
 def main() -> None:
     try:
@@ -324,6 +415,8 @@ def main() -> None:
     r = rpc("delete_midi_notes", [0, item, [0, 0, 99]])
     left = rpc("get_midi_notes", [0, item])["ret"]
     check("delete [0,0,99] removes one note", r.get("ok") and r["ret"]["deleted"] == 1 and len(left) == 1, r)
+
+    json_checks(lupa, check)
 
     # --- the bridge is still responsive -------------------------------
     r = rpc("ping")

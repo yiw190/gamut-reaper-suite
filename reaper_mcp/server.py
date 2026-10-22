@@ -659,7 +659,7 @@ def handle_request(bridge, msg):
     if method == "ping":
         return make_result(rid, {})
     if method in ("notifications/initialized", "notifications/cancelled"):
-        return None
+        return None if rid is None else make_result(rid, {})
     if method == "tools/list":
         return make_result(rid, {
             "tools": [{"name": t["name"], "description": t["description"],
@@ -715,6 +715,8 @@ def main():
                 response = handle_request(bridge, msg)
             except Exception as e:  # noqa: BLE001
                 response = make_error(msg.get("id"), -32603, f"internal error: {e}")
+            if msg.get("id") is None:
+                response = None
         if response is not None:
             sys.stdout.write(json.dumps(response, ensure_ascii=False) + "\n")
             sys.stdout.flush()

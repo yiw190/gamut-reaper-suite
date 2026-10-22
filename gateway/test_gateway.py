@@ -20,6 +20,8 @@ HERE = Path(__file__).resolve().parent
 GAMUT_BODIES = []
 GAMUT_MCPS = [{"id": "r1", "name": "REAPER", "url": "http://localhost:8787/mcp"}]
 GAMUT_ASSIGNED = {}
+GAMUT_MSGS = []
+GAMUT_PATHS = []
 
 
 class FakeGamut(BaseHTTPRequestHandler):
@@ -37,6 +39,9 @@ class FakeGamut(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_GET(self):
+        GAMUT_PATHS.append(self.path)
+        if self.path.startswith("/api/agents/g1/sessions/gs1/messages"):
+            return self.j(GAMUT_MSGS)
         if self.path == "/api/agents":
             return self.j([{"slug": "g1", "name": "Gamut One"}])
         if self.path == "/api/llm-connections":
@@ -223,6 +228,23 @@ def unit():
         ag.WINDOWS = os.name == "nt"
     check("windows terminal line is cmd syntax",
           line == 'cd /d "C:\\Users\\x\\My Songs" && set "PATH=C:\\n;%PATH%" && set "K=v w" && "C:\\n\\kimi.cmd" "--session" "s_1"' or print(line))
+    ag.WINDOWS = True
+    try:
+        pct = ag.shell_line(["a%PATH%b"], env={"K": "100%"})
+        refused = []
+        for argv, env in ((['x" & calc & "'], None), (["ok"], {"K": 'v" & calc'}), (["a\r\nb"], None), (["ok"], {"A B": "v"})):
+            try:
+                ag.shell_line(argv, env=env)
+            except ValueError:
+                refused.append(True)
+    finally:
+        ag.WINDOWS = os.name == "nt"
+    check("windows: % doubled so cmd doesn't expand it", pct == 'set "K=100%%" && "a%%PATH%%b"' or print(pct))
+    check("windows: quotes, line breaks and odd env names refused", len(refused) == 4)
+    a.spec = {"slug": "x", "command": ["/bin/sh"], "resume": ["sh", "{id}"]}
+    check("resume refuses an unsafe session id", a.resume_cmd("a;rm -rf ~") is None)
+    check("safe ids", ag.safe_id("acp-kimi") and ag.safe_id("6f1c.2_x") and not ag.safe_id("..")
+          and not ag.safe_id("a/b") and not ag.safe_id("a b") and not ag.safe_id(""))
 
 
 def unit_terminal_login():
@@ -327,13 +349,54 @@ def main():
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"}, {"Host": "evil.example"})
         check("foreign Host refused", code == 403)
 
-        g.get("/api/agents/acp-fake/status?probe=1")
+        GAMUT_MSGS[:] = [{"id": "m1", "type": "user"}, {"id": "m2", "type": "assistant"}, {"id": "m3", "type": "user"}]
+        base = "/api/agents/g1/sessions/gs1/messages"
+        check("gamut messages without after: proxied as is", g.get(base) == GAMUT_MSGS)
+        check("gamut messages?after=m1", g.get(base + "?after=m1") == {"after": "m1", "messages": GAMUT_MSGS[1:]})
+        check("gamut messages?after=m3", g.get(base + "?after=m3") == {"after": "m3", "messages": []})
+        check("gamut messages?after=<unknown>: full", g.get(base + "?after=zz") == {"full": True, "messages": GAMUT_MSGS})
+        check("gamut never sees the after param", all("after=" not in p_ for p_ in GAMUT_PATHS))
+
+        try:
+            g.get("/api/agents/..%2F..%2Fapi%2Fsettings/sessions")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("agent slug outside [A-Za-z0-9._-] refused", code == 400)
+        try:
+            g.get("/api/agents/g1/sessions/a%20b/messages")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("session id outside [A-Za-z0-9._-] refused", code == 400)
+
+        c = socket.create_connection(("127.0.0.1", g.port), timeout=10)
+        c.sendall(b"POST /api/agents/acp-fake/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  b"Content-Length: 50000000\r\n\r\n")
+        t0 = time.time()
+        resp = c.recv(4096)
+        c.close()
+        check("unauthenticated 50 MB body refused from the headers, before any of it is read",
+              resp.startswith(b"HTTP/1.1 403") and time.time() - t0 < 5)
+        c = socket.create_connection(("127.0.0.1", g.port), timeout=10)
+        c.sendall(b"POST /api/agents/acp-fake/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                  b"Authorization: " + g.auth["Authorization"].encode() + b"\r\nContent-Length: 999999999\r\n\r\n")
+        resp = c.recv(4096)
+        c.close()
+        check("oversized Content-Length refused before reading", resp.startswith(b"HTTP/1.1 413"))
+
+        st = g.get("/api/agents/acp-fake/status?probe=1")
+        time.sleep(0.5)
+        st2 = g.get("/api/agents/acp-fake/status")
+        check("probe=1 is a cheap check: nothing spawned", st["running"] is False and st2["running"] is False
+              and st2["state"] == "stopped" and not st2["connected"])
+        g.get("/api/agents/acp-fake/status?probe=acp-fake")
         for _ in range(100):
             st = g.get("/api/agents/acp-fake/status")
             if st["connected"]:
                 break
             time.sleep(0.05)
-        check("probe connects", st["connected"] and st["state"] == "ready")
+        check("probe=<slug> starts that agent and connects", st["connected"] and st["state"] == "ready" and st["running"])
         acfg = g.get("/api/agents/acp-fake/config")["configOptions"]
         check("acp model selector", acfg[0]["category"] == "model" and acfg[0]["currentValue"] == "fast")
         code, s = g.post("/api/agents/acp-fake/sessions", {"message": "[REAPER context]\n#1 Drums\n[/REAPER context]\n\n"
@@ -356,6 +419,13 @@ def main():
         text = msgs[-1]["content"]["text"]
         check("acp transcript", msgs[0]["type"] == "user" and "[smart]" in text and "permission=allow" in text
               and msgs[-1]["toolCalls"][0]["name"] == "Edit REAPER project")
+        base = "/api/agents/acp-fake/sessions/%s/messages" % sid
+        inc = g.get(base + "?after=" + msgs[0]["id"])
+        check("acp messages?after=<id>: only newer messages", inc == {"after": msgs[0]["id"], "messages": msgs[1:]})
+        check("acp messages?after=<last id>: empty", g.get(base + "?after=" + msgs[-1]["id"]) == {"after": msgs[-1]["id"],
+                                                                                                 "messages": []})
+        check("acp messages?after=<unknown>: full list flagged", g.get(base + "?after=nope") == {"full": True, "messages": msgs})
+        check("acp messages without after: plain array as before", isinstance(g.get(base), list))
 
         g.post("/api/agents/acp-fake/sessions/%s/messages" % sid, {"content": "tool again"})
 
@@ -448,7 +518,7 @@ def main():
     tmp2 = tempfile.mkdtemp()
     g = GW(tmp2, gport, {"FAKE_ACP_AUTH": "1"})
     try:
-        g.get("/api/agents/acp-fake/status?probe=1")
+        g.get("/api/agents/acp-fake/status?probe=fake")
         for _ in range(100):
             st = g.get("/api/agents/acp-fake/status")
             if st["state"] == "auth_required":
@@ -488,6 +558,70 @@ def main():
               and st["state"] == "ready")
         code, _ = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         check("session after terminal login", code == 201)
+    finally:
+        g.stop()
+
+    tmp4 = tempfile.mkdtemp()
+    kids = os.path.join(tmp4, "kids")
+    g = GW(tmp4, gport, {"FAKE_ACP_CHILD": kids},
+           {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2", "AGENT_GATEWAY_MAX_REQUESTS": "1"})
+    try:
+        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
+        sid4 = s["id"]
+        for _ in range(100):
+            if not g.get("/api/agents/acp-fake/sessions/%s" % sid4)["isActive"]:
+                break
+            time.sleep(0.05)
+        check("idle test: agent ran a turn", code == 201 and g.get("/api/agents/acp-fake/status")["running"])
+        q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % sid4)
+        until(q, "connected")
+        time.sleep(1.6)
+        check("idle reaper leaves an agent with an open stream alone", g.get("/api/agents/acp-fake/status")["running"])
+        g.stop()
+        g = GW(tmp4, gport, {"FAKE_ACP_CHILD": kids},
+               {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2", "AGENT_GATEWAY_MAX_REQUESTS": "1"})
+        code, s = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
+        pids = [tuple(map(int, ln.split())) for ln in open(kids).read().splitlines() if ln.strip()]
+        agent_pid, child_pid = pids[-1]
+        st = {}
+        for _ in range(100):
+            st = g.get("/api/agents/acp-fake/status")
+            if not st["running"]:
+                break
+            time.sleep(0.05)
+        check("idle reaper stops an idle agent; last login state still shown",
+              st["running"] is False and st["connected"] is True and st["state"] == "ready")
+        if os.name != "nt":
+            def alive(pid):
+                try:
+                    os.kill(pid, 0)
+                except OSError:
+                    return False
+                try:  # a zombie still answers kill(0); it has exited
+                    return open("/proc/%d/stat" % pid).read().split(")")[-1].split()[0] != "Z"
+                except OSError:
+                    return True
+            time.sleep(0.5)
+            check("idle stop takes the agent's MCP children with it", not alive(agent_pid) and not alive(child_pid))
+        q = g.stream("/api/agents/acp-fake/sessions/%s/stream" % s["id"])
+        g.post("/api/agents/acp-fake/sessions/%s/messages" % s["id"], {"content": "back again"})
+        seen = until(q, "session_idle")
+        check("a stopped agent restarts lazily on the next message",
+              "notice" in [d["type"] for d in seen] and g.get("/api/agents/acp-fake/status")["running"])
+
+        stall = socket.create_connection(("127.0.0.1", g.port), timeout=10)
+        stall.sendall(b"POST /api/agents/acp-fake/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                      b"Authorization: " + g.auth["Authorization"].encode() + b"\r\nContent-Length: 10\r\n\r\n")
+        time.sleep(0.3)
+        try:
+            g.get("/api/agents")
+            code = 200
+        except urllib.error.HTTPError as e:
+            code = e.code
+        check("requests over the in-flight cap get 503", code == 503)
+        stall.close()
+        time.sleep(0.3)
+        check("the slot frees when the stalled request ends", isinstance(g.get("/api/agents"), list))
     finally:
         g.stop()
     print("all passed")

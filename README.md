@@ -48,6 +48,7 @@ What it sets up for the logged-in user (`hibiki setup` runs the same steps; safe
 
 ```bash
 hibiki doctor                         # what's installed, what's running, what's wrong
+hibiki recover                        # restart the MCP + gateway, drop stuck panel streams (REAPER untouched)
 hibiki connect gamut|claude-desktop|claude-code|cursor [--remove]
 hibiki agents add codex claude kimi   # ACP agents for the panel (Node goes in ~/.local/node)
 hibiki watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
@@ -121,7 +122,7 @@ automation-only; DeepSeek models work through an ACP agent such as OpenCode with
 python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.2 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.3 ready`.
 
 MCP client config (any client that runs stdio servers):
 
@@ -202,9 +203,31 @@ python3 gateway/test_gateway.py                   # fake Gamut + fake ACP agent,
 
 Agents are listed in `~/.config/agent-gateway/config.json` (`acp: [{slug, name, command, env, cwd}]`,
 `mcpServers: [...]`). Transcripts of ACP sessions are kept in `~/.config/agent-gateway/sessions/`.
+`hibiki agents add` installs each adapter at a pinned npm version with install scripts off (MiniMax keeps them: its
+SQLite binding and ripgrep are fetched by them).
+
+An ACP agent starts on first use (a message, its config, or `/status?probe=<slug>`; `probe=1` only checks that the
+binary is there and returns the last-known login state). After 10 minutes with no running turn and no open stream
+(`AGENT_GATEWAY_IDLE`, seconds) the gateway stops it and the MCP servers it started; the next message restarts it and
+reloads the chat.
 
 Gamut desktop on the same Mac: `install.sh` registers the MCP as `http://localhost:8787/mcp` (no tunnel). Agent running somewhere
 else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/remote-host.md).
+
+## Troubleshooting
+
+`hibiki recover` (also the **Recover** button in the panel's settings) restarts the MCP front and the gateway (their
+ACP agents go with it), kills leftover panel stream `curl`s, puts back a missing bridge script / panel / token, waits
+up to 10 s for both services and reports the bridge heartbeat. It never touches REAPER: a stale heartbeat means
+REAPER is busy or hung, and the watchdog restarts a hung one. `--json` prints `{"ok", "steps": [{"name", "ok",
+"detail"}]}`; exit 0 when the MCP and the gateway answer. `hibiki doctor` lists everything else.
+
+## Security notes
+
+- The HTTP front (`127.0.0.1:8787`) refuses to start with a bearer shorter than 32 characters; `hibiki setup` and
+  `scripts/macos-host-bootstrap.sh` generate one with a CSPRNG when none is given.
+- Exposed through a Cloudflare tunnel, the bearer is the only gate. Put a Cloudflare Access policy (service token or
+  identity) in front of the tunnel hostname so requests are filtered before they reach the Mac.
 
 ## Tools
 

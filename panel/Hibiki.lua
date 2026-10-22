@@ -57,18 +57,44 @@ if reaper.GetExtState(EXT, 'migrated') ~= '1' then
   reaper.SetExtState(EXT, 'migrated', '1', true)
 end
 
--- shell quoting: POSIX single quotes; on Windows double quotes (paths and URLs there never hold a ")
+-- shell quoting: POSIX single quotes. Windows: double quotes; a " is refused (paths there never hold one) and every
+-- % is closed out of the quotes ("%") so cmd's %VAR% expansion never sees a name it could expand
 local function q(s)
-  if WIN then return '"' .. tostring(s) .. '"' end
-  return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+  s = tostring(s)
+  if WIN then
+    if s:find('"', 1, true) then error('refused: double quote in a shell argument', 0) end
+    return '"' .. s:gsub('(\\*)%%', function(bs) return bs .. bs .. '"%"' end) .. '"'
+  end
+  return "'" .. s:gsub("'", "'\\''") .. "'"
 end
 
+-- private scratch dir (curl output, the gateway auth header, resume scripts): per-user temp, else a per-user cache
+-- dir; never a shared /tmp
 local HOME = os.getenv('HOME') or os.getenv('USERPROFILE') or ''
-local DIR = WIN and ((os.getenv('TEMP') or os.getenv('TMP') or HOME):gsub('[\\/]?$', '\\') .. 'hibiki\\')
-  or (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'hibiki/'
-local function mkdir() reaper.RecursiveCreateDirectory(DIR, 0) end
+local DIR
+do
+  local function env(k) local v = os.getenv(k); return v ~= '' and v or nil end
+  if WIN then
+    local base = env('TEMP') or env('TMP')
+    DIR = base and (base:gsub('[\\/]?$', '\\') .. 'hibiki\\')
+      or ((env('LOCALAPPDATA') or (HOME .. '\\AppData\\Local')):gsub('[\\/]?$', '\\') .. 'Hibiki\\')
+  else
+    local t = env('TMPDIR')
+    if t and not t:match('^/tmp/*$') and not t:match('^/var/tmp/*$') and not t:match('^/private/tmp/*$') then
+      DIR = t:gsub('/?$', '/') .. 'hibiki/'
+    elseif (reaper.GetOS() or ''):match('^OSX') or (reaper.GetOS() or ''):match('^macOS') then
+      DIR = HOME .. '/Library/Caches/Hibiki/'
+    else
+      DIR = (env('XDG_RUNTIME_DIR') and (env('XDG_RUNTIME_DIR'):gsub('/?$', '/') .. 'hibiki/')) or (HOME .. '/.cache/hibiki/')
+    end
+  end
+end
+local function mkdir()
+  if not WIN then sh('/bin/mkdir -p -m 700 ' .. q(DIR) .. ' 2>/dev/null; /bin/chmod 700 ' .. q(DIR) .. ' 2>/dev/null') end
+  reaper.RecursiveCreateDirectory(DIR, 0)
+end
 mkdir()
-if WIN then -- stream files of earlier runs (macOS clears them with rm in stream_stop)
+do -- stream files of earlier runs (this run removes its own by name in stream_stop)
   local i, old = 0, {}
   while true do
     local name = reaper.EnumerateFiles(DIR, i)
@@ -168,6 +194,17 @@ local function jstr(s)
   end)) .. '"'
 end
 
+-- agent slugs, session / message / request ids go into URLs and shell lines: only [A-Za-z0-9._-], never all dots
+local function idok(v)
+  return type(v) == 'string' and v:match('^[A-Za-z0-9._-]+$') and not v:match('^%.+$') and v or nil
+end
+-- one URL path segment, percent-encoded (ids that pass idok come out unchanged)
+local function seg(v)
+  v = tostring(v)
+  if v:match('^%.*$') then return (v:gsub('.', '%%2E')) end
+  return (v:gsub('[^A-Za-z0-9._~-]', function(c) return ('%%%02X'):format(c:byte()) end))
+end
+
 ---------------------------------------------------------------- http (background curl)
 -- the gateway wants its token (gateway/agent_gateway.py writes it); curl reads the header from a file, not argv
 local TOKEN_FILE = HOME .. '/.config/agent-gateway/token'
@@ -179,6 +216,8 @@ local function auth_args(url)
   if f then f:close() end
   if token == '' then return '' end
   if token ~= auth_token then
+    -- the header is a secret: the file exists with mode 600 before the token goes in
+    if not WIN then sh('umask 077; : > ' .. q(AUTH_FILE) .. '; /bin/chmod 600 ' .. q(AUTH_FILE)) end
     local h = io.open(AUTH_FILE, 'wb')
     if not h then return '' end
     h:write('Authorization: Bearer ' .. token .. '\n'); h:close()
@@ -189,7 +228,10 @@ end
 -- the run id keeps a curl left over from a closed panel from answering this run's request of the same number
 local RUN = ('%x'):format(math.floor(reaper.time_precise() * 1000) % 0xFFFFFF)
 local reqn, pending = 0, {}
-local function http_url(method, url, body, cb)
+local http_url, http_upload
+do
+local URL_OK = '^https?://[A-Za-z0-9.:-]+/[A-Za-z0-9._~/%%?=&-]*$' -- nothing a shell or cmd.exe would act on
+local function http_line(method, url, body, cb)
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
   local args = '-s -m 60 -X ' .. method .. ' -H "Content-Type: application/json"' .. auth_args(url)
@@ -209,8 +251,14 @@ local function http_url(method, url, body, cb)
   end
   pending[#pending + 1] = { b = b, cb = cb }
 end
+function http_url(method, url, body, cb)
+  if not url:match(URL_OK) then if cb then cb(0, '') end; return end
+  local ok, err = pcall(http_line, method, url, body, cb)
+  if not ok and cb then cb(0, tostring(err)) end
+end
 -- multipart upload of a local file (curl -F), same completion files as http_url
-local function http_upload(url, path, cb)
+function http_upload(url, path, cb)
+  if not url:match(URL_OK) or (WIN and path:find('"', 1, true)) then if cb then cb(0, '') end; return end
   reqn = reqn + 1
   local b = DIR .. 'req' .. RUN .. '_' .. reqn
   if WIN then -- a Windows path has no quotes; curl reads file=@C:\x y.png up to the end of the argument
@@ -223,6 +271,7 @@ local function http_upload(url, path, cb)
       ' > ' .. q(b .. '.code') .. '; mv ' .. q(b .. '.code') .. ' ' .. q(b .. '.done') .. ' ) >/dev/null 2>&1 &')
   end
   pending[#pending + 1] = { b = b, cb = cb }
+end
 end
 
 local function poll_http()
@@ -243,7 +292,7 @@ end
 
 ---------------------------------------------------------------- state
 local S = {
-  agent = reaper.GetExtState(EXT, 'agent'), agent_name = reaper.GetExtState(EXT, 'agent_name'),
+  agent = idok(reaper.GetExtState(EXT, 'agent')) or '', agent_name = reaper.GetExtState(EXT, 'agent_name'),
   agents = {},
   sid = '', title = '',
   msgs = {}, live = {}, queued = {}, -- queued: user messages sent while a turn runs, shown after it
@@ -276,7 +325,7 @@ local function cfg_json()
   return ',"config":{' .. table.concat(L, ',') .. '}'
 end
 local function load_agent_session()
-  S.sid = reaper.GetExtState(EXT, 'session_' .. S.agent)
+  S.sid = idok(reaper.GetExtState(EXT, 'session_' .. S.agent)) or ''
   S.title = reaper.GetExtState(EXT, 'title_' .. S.agent)
 end
 local function save_agent_session()
@@ -285,41 +334,67 @@ local function save_agent_session()
 end
 if S.agent ~= '' then load_agent_session() end
 
-local function api(path) return HOST .. '/api/agents/' .. S.agent .. path end
+local function api(path) return HOST .. '/api/agents/' .. seg(S.agent) .. path end
 local function http(method, path, body, cb) http_url(method, api(path), body, cb) end
 local function scroll() S.scroll = true end
 
-local function refresh_messages()
+-- full = the whole transcript. Otherwise only what follows the last message that is certainly final (the one
+-- before the newest assistant message, which may still be updating): the gateway answers ?after=<id> with
+-- {after, messages} (or {full = true, messages}); Gamut's own API ignores it and sends the whole array
+local function refresh_messages(full)
   if S.sid == '' then return end
-  local sid = S.sid
-  http('GET', '/sessions/' .. sid .. '/messages', nil, function(code, body)
+  local sid, after = S.sid, nil
+  if not full then
+    for i = #S.msgs, 1, -1 do
+      if S.msgs[i].role == 'assistant' and S.msgs[i].id then
+        for j = i - 1, 1, -1 do if S.msgs[j].id then after = idok(S.msgs[j].id); break end end
+        break
+      end
+    end
+  end
+  http('GET', '/sessions/' .. seg(sid) .. '/messages' .. (after and ('?after=' .. seg(after)) or ''), nil, function(code, body)
     if code ~= 200 or sid ~= S.sid then return end
-    local list = decode(body)
-    if type(list) ~= 'table' then return end
-    if list.messages then list = list.messages end
+    local r = decode(body)
+    if type(r) ~= 'table' then return end
+    local list, keep = r, 0
+    if r.messages ~= nil then
+      list = type(r.messages) == 'table' and r.messages or {}
+      if after and r.full ~= true and r.after == after then
+        keep = nil
+        for i, m in ipairs(S.msgs) do if m.id == after then keep = i end end
+        if not keep then return refresh_messages(true) end
+      end
+    end
     local out = {}
     for _, m in ipairs(list) do
-      local role = m.type
-      local text = type(m.content) == 'table' and m.content.text or (type(m.content) == 'string' and m.content) or ''
-      if type(text) ~= 'string' then text = '' end
-      local tools = {}
-      if type(m.toolCalls) == 'table' then
-        for _, tc in ipairs(m.toolCalls) do tools[#tools + 1] = tc.name end
-      end
-      if role == 'user' and text ~= '' then
-        out[#out + 1] = { role = 'user', text = text }
-      elseif role == 'assistant' and (text ~= '' or #tools > 0) then
-        out[#out + 1] = { role = 'assistant', text = text, tools = tools }
+      if type(m) == 'table' then
+        local role = m.type
+        local text = type(m.content) == 'table' and m.content.text or (type(m.content) == 'string' and m.content) or ''
+        if type(text) ~= 'string' then text = '' end
+        local tools = {}
+        if type(m.toolCalls) == 'table' then
+          for _, tc in ipairs(m.toolCalls) do tools[#tools + 1] = type(tc) == 'table' and tc.name or nil end
+        end
+        if role == 'user' and text ~= '' then
+          out[#out + 1] = { role = 'user', text = text, id = sval(m.id) }
+        elseif role == 'assistant' and (text ~= '' or #tools > 0) then
+          out[#out + 1] = { role = 'assistant', text = text, tools = tools, id = sval(m.id) }
+        end
       end
     end
     local old = {}
-    for _, m in ipairs(S.msgs) do old[m.role .. '\0' .. m.text] = m end
-    for i, m in ipairs(out) do
+    for i = keep + 1, #S.msgs do local m = S.msgs[i]; old[m.role .. '\0' .. m.text] = m end
+    for _, m in ipairs(out) do
       local o = old[m.role .. '\0' .. m.text]
-      if o then m._md, m._bubble = o._md, o._bubble end
+      if o then m._md, m._bubble, m._h = o._md, o._bubble, o._h end
     end
     if #S.msgs == 0 then scroll() end
-    S.msgs = out
+    if keep > 0 then
+      local msgs = table.move(S.msgs, 1, keep, 1, {})
+      S.msgs = table.move(out, 1, #out, keep + 1, msgs)
+    else
+      S.msgs = out
+    end
     S.live, S.queued = {}, {}
   end)
 end
@@ -347,43 +422,55 @@ local function ps_encoded(script)
   end) .. ({ '', '==', '=' })[#u % 3 + 1])
 end
 
--- keep = the stream file of a start in flight: on Windows the kill runs asynchronously and must not hit it
-local function stream_stop(keep)
+-- every start gets its own user agent HibikiPanel/<run>.<n>; a stop kills the panel streams of other runs (orphans)
+-- and this run's starts up to the current one, so a kill that lands late can never hit a stream started after it.
+-- It runs in the background and the old stream files go by name: nothing on the UI thread waits for a process
+local function stream_stop()
+  local st = S.stream
+  local max = st.starts or 0
   if WIN then
     local ps = "Get-CimInstance Win32_Process -Filter \"Name='curl.exe'\" | Where-Object { $_.CommandLine -like '*-A "
-      .. STREAM_UA .. "*'" .. (keep and (" -and $_.CommandLine -notlike '*" .. keep:match('[^\\/]+$') .. "*'") or '')
-      .. " } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
+      .. STREAM_UA .. "*' -and -not ($_.CommandLine -match '" .. STREAM_UA .. "/" .. RUN .. "\\.(\\d+)' -and [int]$Matches[1] -gt "
+      .. max .. ") } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }"
     local line = '"' .. SYS .. 'WindowsPowerShell\\v1.0\\powershell.exe" -NoProfile -NonInteractive -WindowStyle Hidden '
       .. '-EncodedCommand ' .. ps_encoded(ps)
     if HIBIKI_TEST then HIBIKI_TEST.sh(line) else reaper.ExecProcess(line, -2) end
   else
-    sh('/usr/bin/pkill -f ' .. q('[c]url -s -N -A ' .. STREAM_UA) .. ' 2>/dev/null; /bin/rm -f ' .. q(DIR) .. 'stream*')
+    local awk = '/[c]url -s -N -A ' .. STREAM_UA .. '/ { t = ""; if (match($0, /' .. STREAM_UA .. '\\/[0-9]+\\.[0-9]+ /)) '
+      .. 't = substr($0, RSTART + ' .. (#STREAM_UA + 1) .. ', RLENGTH - ' .. (#STREAM_UA + 2) .. '); split(t, a, "."); '
+      .. 'if (a[1] != run || a[2] + 0 <= max) print $1 }'
+    sh('( /bin/ps -axwwo pid=,command= | /usr/bin/awk -v run=' .. RUN .. ' -v max=' .. max .. ' ' .. q(awk)
+      .. ' | /usr/bin/xargs /bin/kill ) >/dev/null 2>&1 &')
   end
-  S.stream.pid = nil
+  for n = 1, max do
+    local f = DIR .. 'stream-' .. RUN .. '-' .. n .. '.sse'
+    os.remove(f); os.remove(f .. '.dead')
+  end
+  st.pid = nil
 end
 
 local function stream_start()
   local st = S.stream
-  local nxt = DIR .. 'stream-' .. RUN .. '-' .. ((st.starts or 0) + 1) .. '.sse'
-  stream_stop(nxt)
+  stream_stop()
   if S.sid == '' then return end
   st.starts = (st.starts or 0) + 1
   -- a fresh file per start: a writer that outlives its kill can't interleave into the live stream
-  st.file = nxt
+  st.file = DIR .. 'stream-' .. RUN .. '-' .. st.starts .. '.sse'
   st.dead = st.file .. '.dead'
   local f = io.open(st.file, 'wb')
   if not f then mkdir(); f = io.open(st.file, 'wb') end
   if f then f:close() end
-  st.off, st.buf, st.check = 0, '', reaper.time_precise()
+  st.off, st.buf, st.pos, st.cr, st.check = 0, '', 1, false, reaper.time_precise()
   -- the wrapper drops the .dead file when curl exits, so liveness is a file check, not a periodic popen (forks stall the UI)
-  local url = api('/sessions/' .. S.sid .. '/stream')
+  local url = api('/sessions/' .. seg(S.sid) .. '/stream')
+  local ua = STREAM_UA .. '/' .. RUN .. '.' .. st.starts
   if WIN then
-    win_bg(q(CURL) .. ' -s -N -A ' .. STREAM_UA .. auth_args(url) .. ' ' .. q(url) .. ' >> ' .. q(st.file) ..
+    win_bg(q(CURL) .. ' -s -N -A ' .. ua .. auth_args(url) .. ' ' .. q(url) .. ' >> ' .. q(st.file) ..
       ' & type NUL > ' .. q(st.dead))
     st.pid = 0 -- launched; Windows has no pid here (stream_stop finds the curl by its user agent)
     return
   end
-  local out = sh('( /usr/bin/curl -s -N -A ' .. STREAM_UA .. auth_args(url) .. ' ' .. q(url) ..
+  local out = sh('( /usr/bin/curl -s -N -A ' .. ua .. auth_args(url) .. ' ' .. q(url) ..
     ' >> ' .. q(st.file) .. '; : > ' .. q(st.dead) .. ' ) >/dev/null 2>&1 & echo $!')
   st.pid = tonumber(out:match('%d+'))
 end
@@ -398,6 +485,7 @@ end
 -- file opened with Terminal needs no Automation permission, unlike scripting Terminal through osascript
 local function open_in_terminal(cmd)
   if WIN then -- a .cmd file in a new console window (cmd /K keeps it open after the CLI exits)
+    os.remove(DIR .. 'resume.cmd')
     local f = io.open(DIR .. 'resume.cmd', 'wb')
     if not f then return end
     f:write('@echo off\r\n', cmd, '\r\n')
@@ -405,19 +493,20 @@ local function open_in_terminal(cmd)
     win_bg('start "Hibiki" ' .. q(SYS .. 'cmd.exe') .. ' /D /K ' .. q(DIR .. 'resume.cmd'))
     return
   end
+  os.remove(DIR .. 'resume.command') -- a fresh file in the private dir, never one that was there before
   local f = io.open(DIR .. 'resume.command', 'w')
   if not f then return end
   f:write('#!/bin/sh\n', cmd, '\n')
   f:close()
-  sh('chmod +x ' .. q(DIR .. 'resume.command') .. ' && /usr/bin/open -a Terminal ' .. q(DIR .. 'resume.command') .. ' >/dev/null 2>&1 &')
+  sh('/bin/chmod 700 ' .. q(DIR .. 'resume.command') .. ' && /usr/bin/open -a Terminal ' .. q(DIR .. 'resume.command') .. ' >/dev/null 2>&1 &')
 end
 
 local function open_in_gamut()
   if WIN then -- the deep link opens Gamut (and the chat when there is one)
-    win_bg('start "" ' .. q('superagent://' .. ((S.agent ~= '' and S.sid ~= '') and ('agent/' .. S.agent .. '/sessions/' .. S.sid) or '')))
+    win_bg('start "" ' .. q('superagent://' .. ((idok(S.agent) and idok(S.sid)) and ('agent/' .. S.agent .. '/sessions/' .. S.sid) or '')))
     return
   end
-  if S.agent ~= '' and S.sid ~= '' then
+  if idok(S.agent) and idok(S.sid) then
     sh('/usr/bin/open ' .. q('superagent://agent/' .. S.agent .. '/sessions/' .. S.sid) .. ' >/dev/null 2>&1 &')
   else
     sh('/usr/bin/open -a Gamut >/dev/null 2>&1 &')
@@ -431,7 +520,7 @@ local function on_event(d)
     -- the gateway replays an ACP turn in progress right after this event; start the live view from that replay
     if S.active and is_acp() then S.live = {} end
     -- a turn that ended while we weren't subscribed (late first subscribe, reconnect) only shows in the transcript
-    if not S.active then refresh_messages() end
+    if not S.active then refresh_messages(true) end
   elseif t == 'session_active' and #S.queued > 0 and #S.live > 0 then
     -- the gateway starts a queued message: settle the previous reply above it
     local text, tools = {}, {}
@@ -474,7 +563,7 @@ local function on_event(d)
     -- Gamut ships the whole request (question / secret / review) in the event
     local q = type(d.request) == 'table' and d.request
     local scope = q and type(q.scope) == 'table' and q.scope or {}
-    if q and sval(q.id) and sval(q.kind) and q.autoApproved ~= true
+    if q and idok(q.id) and sval(q.kind) and q.autoApproved ~= true
         and (sval(scope.sessionId) == nil or scope.sessionId == S.sid) then
       q.payload = type(q.payload) == 'table' and q.payload or {}
       for i = #S.greqs, 1, -1 do if S.greqs[i].id == q.id then table.remove(S.greqs, i) end end
@@ -498,32 +587,53 @@ local function on_event(d)
   end
 end
 
+-- SSE: events end at a blank line. One pass with a read position over the buffer, at most 400 events a frame
+-- (a long replay drains over several frames); \r\n is normalised on each new chunk only, the buffer is cut once
 local function poll_stream()
   local st = S.stream
   if not st.file then return end
-  local f = io.open(st.file, 'rb')
-  if f then
-    f:seek('set', st.off)
-    local chunk = f:read('*a') or ''
-    f:close()
-    if #chunk > 0 then
-      st.fails = 0
-      st.off = st.off + #chunk
-      st.buf = (st.buf .. chunk):gsub('\r\n', '\n')
-      while true do
-        local e = st.buf:find('\n\n', 1, true)
-        if not e then break end
-        local ev = st.buf:sub(1, e - 1)
-        st.buf = st.buf:sub(e + 2)
-        local data = {}
-        for line in (ev .. '\n'):gmatch('(.-)\n') do
-          local v = line:match('^data: ?(.*)$')
-          if v then data[#data + 1] = v end
-        end
-        local d = decode(table.concat(data, '\n'))
-        if type(d) == 'table' then on_event(d) end
+  local pos = st.pos or 1
+  if pos == 1 then -- no backlog left from the last frame: read what curl appended
+    local f = io.open(st.file, 'rb')
+    if f then
+      f:seek('set', st.off)
+      local chunk = f:read('*a') or ''
+      f:close()
+      if #chunk > 0 then
+        st.fails = 0
+        st.off = st.off + #chunk
+        if st.cr then chunk = '\r' .. chunk; st.cr = false end
+        if chunk:byte(-1) == 13 then chunk = chunk:sub(1, -2); st.cr = true end -- its \n may come with the next read
+        if chunk:find('\r', 1, true) then chunk = chunk:gsub('\r\n', '\n') end
+        st.buf = st.buf .. chunk
       end
     end
+  end
+  local buf, n = st.buf, 0
+  while n < 400 do
+    local e = buf:find('\n\n', pos, true)
+    if not e then break end
+    local data
+    local p = pos
+    while p < e do
+      local le = buf:find('\n', p, true)
+      if not le or le > e then le = e end
+      if buf:sub(p, p + 4) == 'data:' then
+        local v = buf:sub(buf:byte(p + 5) == 32 and p + 6 or p + 5, le - 1)
+        data = data and (data .. '\n' .. v) or v
+      end
+      p = le + 1
+    end
+    pos, n = e + 2, n + 1
+    local d = data and decode(data)
+    if type(d) == 'table' then on_event(d) end
+    if st.buf ~= buf then return end -- on_event restarted the stream
+  end
+  if n < 400 then
+    if pos > 1 then st.buf = buf:sub(pos) end
+    st.pos = 1
+  else
+    st.pos = pos
   end
   local now = reaper.time_precise()
   -- 3 s, doubling up to 60 s while the stream keeps dying (host down, session deleted): no fork storm
@@ -771,18 +881,33 @@ local function sel_pills(proj)
   local ed = reaper.MIDIEditor_GetActive()
   local take = ed and reaper.MIDIEditor_GetTake(ed)
   if SEL.sig.notes and SEL.sig.notes ~= '' and take and reaper.ValidatePtr2(proj, take, 'MediaItem_Take*') then
-    local n, lo, hi, t0, t1 = 0, 128, -1, nil, nil
-    local idx = reaper.MIDI_EnumSelNotes(take, -1)
-    while idx ~= -1 do
-      local _, _, _, sp, ep, _, pitch = reaper.MIDI_GetNote(take, idx)
-      n, lo, hi = n + 1, math.min(lo, pitch), math.max(hi, pitch)
-      local a, b = reaper.MIDI_GetProjTimeFromPPQPos(take, sp), reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
-      t0, t1 = math.min(t0 or a, a), math.max(t1 or b, b)
-      idx = reaper.MIDI_EnumSelNotes(take, idx)
+    -- recounted only when the take's notes change (the hash covers selection too): a big MIDI item stays cheap
+    local _, hash = reaper.MIDI_GetHash(take, true, '')
+    local key = tostring(take) .. '\0' .. tostring(hash) .. '\0' .. SEL.sig.notes
+    local c = SEL.note_pill
+    if not c or c.key ~= key then
+      local n, lo, hi, first, last = 0, 128, -1, nil, nil
+      local idx = reaper.MIDI_EnumSelNotes(take, -1)
+      while idx ~= -1 do
+        n, first, last = n + 1, first or idx, idx
+        if n <= 2000 then
+          local _, _, _, _, _, _, pitch = reaper.MIDI_GetNote(take, idx)
+          lo, hi = math.min(lo, pitch), math.max(hi, pitch)
+        end
+        idx = reaper.MIDI_EnumSelNotes(take, idx)
+      end
+      local t0, t1 = 0, 0
+      if first then
+        local _, _, _, sp = reaper.MIDI_GetNote(take, first)
+        local _, _, _, _, ep = reaper.MIDI_GetNote(take, last)
+        t0, t1 = reaper.MIDI_GetProjTimeFromPPQPos(take, sp), reaper.MIDI_GetProjTimeFromPPQPos(take, ep)
+      end
+      c = { key = key, n = n, detail = n > 0 and ('%d note%s, %s–%s\n%s – %s'):format(n, n == 1 and '' or 's',
+        note_name(lo), note_name(hi), pos(t0), pos(t1)) or '' }
+      SEL.note_pill = c
     end
     local _, tn = reaper.GetTrackName(reaper.GetMediaItemTake_Track(take))
-    add('notes', ('Notes  %d in %s'):format(n, tn),
-      ('%d note%s, %s–%s\n%s – %s'):format(n, n == 1 and '' or 's', note_name(lo), note_name(hi), pos(t0), pos(t1)))
+    if c.n > 0 then add('notes', ('Notes  %d in %s'):format(c.n, tn), c.detail) end
   end
   local env = reaper.GetSelectedEnvelope(proj)
   if env then
@@ -877,7 +1002,13 @@ local function range_lines(proj, t0, t1, tracks, indent)
           local a = reaper.MIDI_GetPPQPosFromProjTime(take, math.max(t0, p0))
           local b = reaper.MIDI_GetPPQPosFromProjTime(take, math.min(t1, p1))
           local _, nn = reaper.MIDI_CountEvts(take)
-          for k = 0, nn - 1 do
+          local k0, k1 = 0, nn -- notes are sorted by start: binary search for the first one at or after a
+          while k0 < k1 do
+            local mid = (k0 + k1) // 2
+            local _, _, _, sp = reaper.MIDI_GetNote(take, mid)
+            if sp < a then k0 = mid + 1 else k1 = mid end
+          end
+          for k = k0, nn - 1 do
             local _, _, muted, sp, _, _, pitch = reaper.MIDI_GetNote(take, k)
             if sp >= b then break end
             if not muted and sp >= a then notes = notes + 1; lo = math.min(lo, pitch); hi = math.max(hi, pitch) end
@@ -1164,7 +1295,7 @@ local function deliver(payload, text, typed, files)
       local r = decode(body)
       if gen ~= S.gen then return end -- the user switched agent/session meanwhile
       S.creating = false
-      if code >= 200 and code < 300 and type(r) == 'table' and sval(r.id) then
+      if code >= 200 and code < 300 and type(r) == 'table' and idok(r.id) then
         S.sid = r.id
         S.title = utf8_prefix(text, 60)
         save_agent_session()
@@ -1178,7 +1309,7 @@ local function deliver(payload, text, typed, files)
     end)
   else
     if not S.stream.file then stream_start() end -- the boot-time restore never ran (hosts were down then)
-    http('POST', '/sessions/' .. S.sid .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
+    http('POST', '/sessions/' .. seg(S.sid) .. '/messages', '{"content":' .. jstr(payload) .. cfg_json() .. '}', function(code)
       if gen ~= S.gen then return end
       if code < 200 or code >= 300 then failed(('send failed (%d)'):format(code)) end
     end)
@@ -1208,7 +1339,7 @@ local function send()
   local files = S.files
   S.files, S.uploading, S.input, S.err = {}, #files, '', nil
   local gen, paths, failed = S.gen, {}, {}
-  local url = api(S.sid ~= '' and ('/sessions/' .. S.sid .. '/upload-file') or '/upload-file')
+  local url = api(S.sid ~= '' and ('/sessions/' .. seg(S.sid) .. '/upload-file') or '/upload-file')
   for n, f in ipairs(files) do
     http_upload(url, f.path, function(code, body)
       if gen ~= S.gen then return end
@@ -1232,7 +1363,7 @@ local function send()
 end
 
 local function stop()
-  if S.sid ~= '' then http('POST', '/sessions/' .. S.sid .. '/interrupt', '{}') end
+  if S.sid ~= '' then http('POST', '/sessions/' .. seg(S.sid) .. '/interrupt', '{}') end
 end
 
 local function reset_view()
@@ -1273,7 +1404,7 @@ local function load_sessions()
     if list.sessions then list = list.sessions end
     local out = {}
     for _, x in ipairs(list) do
-      if type(x.id) == 'string' then
+      if idok(x.id) then
         out[#out + 1] = { id = x.id, name = type(x.name) == 'string' and x.name or x.id:sub(1, 8),
           age = iso_age(x.lastActivityAt), active = x.isActive == true,
           resume = type(x.resume) == 'string' and x.resume or nil }
@@ -1300,7 +1431,7 @@ local function load_agents(try)
     HOST = host
     local out = {}
     for _, a in ipairs(list) do
-      if type(a.slug) == 'string' then
+      if idok(a.slug) then
         out[#out + 1] = { slug = a.slug, name = type(a.name) == 'string' and a.name or a.slug,
           desc = type(a.description) == 'string' and a.description or '', acp = a.backend == 'acp',
           status = type(a.status) == 'string' and a.status or nil }
@@ -1310,16 +1441,17 @@ local function load_agents(try)
     if (changed or not S.cfg_loaded) and S.agent ~= '' then load_config() end
     if S.boot then
       S.boot = false -- the saved session is reopened once we know which host answers
-      if S.sid ~= '' then stream_start(); refresh_messages(); load_requests() end
+      if S.sid ~= '' then stream_start(); refresh_messages(true); load_requests() end
     end
   end)
 end
 
--- ACP agent status for the picker dots and the login card; probe=true starts the agent to find out
+-- ACP agent status for the picker dots and the login card; probe = true: cheap check (binary + last login state),
+-- probe = 'start': the gateway starts this agent to find out (?probe=<slug>)
 local function load_acp_status(slug, probe)
   if not via_gateway() or slug:sub(1, 4) ~= 'acp-' then return end
   if slug == S.agent then S.auth_at = reaper.time_precise() end
-  http_url('GET', HOST .. '/api/agents/' .. slug .. '/status' .. (probe and '?probe=1' or ''), nil, function(code, body)
+  http_url('GET', HOST .. '/api/agents/' .. seg(slug) .. '/status' .. (probe == 'start' and ('?probe=' .. seg(slug)) or (probe and '?probe=1' or '')), nil, function(code, body)
     local r = decode(body)
     if code ~= 200 or type(r) ~= 'table' then return end
     local err = sval(r.error)
@@ -1363,7 +1495,7 @@ end
 local function answer_perm(p, option_id)
   for i = #S.perms, 1, -1 do if S.perms[i] == p then table.remove(S.perms, i) end end
   local opt = option_id and jstr(option_id) or 'null'
-  http('POST', '/sessions/' .. S.sid .. '/permission', '{"requestId":' .. jstr(p.id) .. ',"optionId":' .. opt .. '}')
+  http('POST', '/sessions/' .. seg(S.sid) .. '/permission', '{"requestId":' .. jstr(p.id) .. ',"optionId":' .. opt .. '}')
 end
 
 -- Gamut's pending user-input requests (questions, secrets, approvals) for the open session
@@ -1371,14 +1503,14 @@ function load_requests()
   S.greq_at = reaper.time_precise()
   if S.agent == '' or is_acp() or S.sid == '' then S.greqs = {}; return end
   local agent, sid = S.agent, S.sid
-  http('GET', '/pending-requests?sessionId=' .. sid, nil, function(code, body)
+  http('GET', '/pending-requests?sessionId=' .. seg(sid), nil, function(code, body)
     if agent ~= S.agent or sid ~= S.sid or code ~= 200 then return end
     local r = decode(body)
     local list = type(r) == 'table' and r.requests
     local out = {}
     if type(list) == 'table' then
       for _, req in ipairs(list) do
-        if type(req) == 'table' and sval(req.id) and sval(req.kind) and req.autoApproved ~= true then
+        if type(req) == 'table' and idok(req.id) and sval(req.kind) and req.autoApproved ~= true then
           req.payload = type(req.payload) == 'table' and req.payload or {}
           out[#out + 1] = req
         end
@@ -1419,20 +1551,23 @@ local function start_login(method_id, terminal)
 end
 
 local function switch_session(id, name)
-  if id == S.sid then return end
+  if id == S.sid or not idok(id) then return end
   reset_view()
   S.sid, S.title = id, name or ''
   save_agent_session()
   stream_start()
-  refresh_messages()
+  refresh_messages(true)
   load_requests()
   S.focus = true
 end
 
+local ONB = { installable = nil, inst_at = 0, reaper = {}, busy = {} } -- onboarding, filled in below
 local function choose_agent(slug, name)
+  if not idok(slug) then return end
   if slug:sub(1, 4) ~= 'acp-' then reaper.SetExtState(EXT, 'gamut_agent', slug, true) end
   if slug == S.agent then return end
   reset_view()
+  if ONB.reaper[slug] then ONB.reaper[slug].stale = true end
   S.agent, S.agent_name = slug, name
   reaper.SetExtState(EXT, 'agent', slug, true)
   reaper.SetExtState(EXT, 'agent_name', name, true)
@@ -1440,14 +1575,13 @@ local function choose_agent(slug, name)
   cfg_load()
   S.auth = nil
   load_config()
-  if is_acp() then load_acp_status(S.agent, true) end
-  if S.sid ~= '' then stream_start(); refresh_messages(); load_requests() end
+  if is_acp() then load_acp_status(S.agent, 'start') end
+  if S.sid ~= '' then stream_start(); refresh_messages(true); load_requests() end
   S.focus = true
 end
 
 ---------------------------------------------------------------- onboarding: install a CLI agent, enable REAPER in Gamut
 -- one table (the main chunk is near Lua's 200-local limit); all of it goes through the gateway's /api/hibiki routes
-local ONB = { installable = nil, inst_at = 0, reaper = {}, busy = {} }
 do
   local GW_ = HOSTS[1]
   ONB.gamut_url = WIN and 'https://updates.gamutagents.com/download/win' or 'https://updates.gamutagents.com/download/mac'
@@ -1487,25 +1621,30 @@ do
         if a.slug == ONB.just.slug then
           choose_agent(a.slug, a.name)
           S.cfgwin, ONB.just = true, nil
-          load_acp_status(a.slug, true)
+          load_acp_status(a.slug, 'start')
           break
         end
       end
     end
   end
   function ONB.load_reaper(slug)
-    ONB.reaper[slug] = ONB.reaper[slug] or {}
-    ONB.reaper[slug].at = reaper.time_precise()
-    http_url('GET', GW_ .. '/api/hibiki/gamut-reaper?agent=' .. slug, nil, function(code, body)
+    local e = ONB.reaper[slug] or {}
+    ONB.reaper[slug] = e
+    e.at, e.stale, e.loading = reaper.time_precise(), nil, true
+    http_url('GET', GW_ .. '/api/hibiki/gamut-reaper?agent=' .. seg(slug), nil, function(code, body)
+      e.loading = nil
       local r = code == 200 and decode(body)
       if type(r) == 'table' then ONB.reaper[slug] = { enabled = r.enabled == true, registered = r.registered == true,
         at = reaper.time_precise() } end
     end)
   end
-  -- Gamut agents only: true / false once known, nil while unknown (or no gateway)
+  -- Gamut agents only: true / false once known, nil while unknown (or no gateway). Once enabled it is not asked
+  -- again until Settings opens or the agent changes (stale); while off it is re-read every 15 s
   function ONB.reaper_enabled(slug)
     local r = ONB.reaper[slug]
-    if not r or reaper.time_precise() - (r.at or 0) > 15 then ONB.load_reaper(slug) end
+    if not r or (r.stale and not r.loading) or (r.enabled ~= true and not r.loading and reaper.time_precise() - (r.at or 0) > 15) then
+      ONB.load_reaper(slug)
+    end
     return r and r.enabled
   end
   function ONB.enable_reaper(slug)
@@ -1516,6 +1655,79 @@ do
       if code ~= 200 then ONB.err = (type(r) == 'table' and sval(r.error)) or ('Gamut refused (' .. code .. ')') end
       ONB.load_reaper(slug)
     end)
+  end
+end
+
+---------------------------------------------------------------- recover: the "it froze, retry" key
+-- local part: interrupt, stop the stream, drop pending requests; then `hibiki recover --json` in the background
+-- (result polled like a request), then hosts, the open chat and the stream come back through the boot path
+local REC = { running = false }
+do
+  local function step_line(x)
+    if type(x) ~= 'table' then return nil end
+    local name = sval(x.name) or sval(x.step) or sval(x.title) or sval(x.id) or 'step'
+    local ok = x.ok
+    if type(ok) ~= 'boolean' then
+      local st = (sval(x.status) or sval(x.state) or ''):lower()
+      ok = st == 'ok' or st == 'done' or st == 'pass' or st == 'passed' or st == 'success' or st == 'skipped'
+    end
+    local d = sval(x.detail) or sval(x.message) or sval(x.msg) or sval(x.error) or ''
+    return { ok = ok, text = (ok and '✓ ' or '✗ ') .. name .. (d ~= '' and (' — ' .. d) or '') }
+  end
+  local function finished(code, body)
+    REC.running = false
+    local r = decode(body)
+    local list = type(r) == 'table' and (type(r.steps) == 'table' and r.steps or (r[1] ~= nil and r) or nil)
+    local lines = {}
+    for _, x in ipairs(list or {}) do lines[#lines + 1] = step_line(x) end
+    if #lines == 0 and type(r) == 'table' and type(r.ok) == 'boolean' then
+      lines[1] = { ok = r.ok, text = (r.ok and '✓ ' or '✗ ') .. (sval(r.message) or sval(r.error) or 'hibiki recover') }
+    end
+    if #lines == 0 then
+      REC.lines = { { ok = true, text = 'Restarted the connection; run `hibiki recover` in Terminal for a full reset' } }
+    else
+      REC.lines = lines
+    end
+    REC.code = code
+    S.boot = true -- the next answer from a host reopens the chat: full transcript + stream
+    load_agents()
+  end
+  function REC.start()
+    if REC.running then return end
+    for i = #pending, 1, -1 do
+      local r = pending[i]
+      os.remove(r.b .. '.done'); os.remove(r.b .. '.out'); os.remove(r.b .. '.json')
+      pending[i] = nil
+    end
+    if S.active and S.sid ~= '' then stop() end
+    stream_stop()
+    S.gen = S.gen + 1
+    S.active, S.waiting, S.perms, S.err, S.creating, S.uploading = false, false, {}, nil, false, false
+    REC.running, REC.lines, REC.at = true, nil, reaper.time_precise()
+    reqn = reqn + 1
+    local b = DIR .. 'recover' .. RUN .. '_' .. reqn
+    local out, code, done = q(b .. '.out'), q(b .. '.code'), q(b .. '.done')
+    if WIN then
+      local exe = (os.getenv('LOCALAPPDATA') or (HOME .. '\\AppData\\Local')) .. '\\Programs\\Hibiki\\bin\\hibiki.cmd'
+      local ok, line = pcall(function()
+        return '(if exist ' .. q(exe) .. ' (call ' .. q(exe) .. ' recover --json > ' .. out .. ' 2>NUL && (> ' .. code
+          .. ' echo 0) || (> ' .. code .. ' echo 1)) else (call hibiki recover --json > ' .. out .. ' 2>NUL && (> ' .. code
+          .. ' echo 0) || (> ' .. code .. ' echo 127))) & move /Y ' .. code .. ' ' .. done .. ' >NUL'
+      end)
+      if not ok then return finished(127, '') end
+      win_bg(line)
+    else
+      sh('( for h in /usr/local/bin/hibiki "$HOME/.local/bin/hibiki" "$(command -v hibiki)"; do [ -n "$h" ] && [ -x "$h" ] '
+        .. '&& break; h=; done; if [ -n "$h" ]; then "$h" recover --json > ' .. out .. ' 2>/dev/null; echo $? > ' .. code
+        .. '; else echo 127 > ' .. code .. '; fi; /bin/mv ' .. code .. ' ' .. done .. ' ) >/dev/null 2>&1 &')
+    end
+    REC.job = { b = b, cb = finished }
+    pending[#pending + 1] = REC.job
+  end
+  function REC.tick() -- a CLI that never returns must not leave the button disabled
+    if not REC.running or reaper.time_precise() - REC.at < 180 then return end
+    for i = #pending, 1, -1 do if pending[i] == REC.job then table.remove(pending, i) end end
+    finished(124, '')
   end
 end
 
@@ -1978,8 +2190,8 @@ local function layout_table(ops, b, y, maxw, size)
   return y + 6
 end
 
-local function layout_md(text, maxw, size)
-  local ops, y = {}, 0
+local function layout_md(text, maxw, size, y0)
+  local ops, y = {}, y0 or 0
   local lh = math.floor(size * 1.5 + 0.5)
   for _, b in ipairs(parse_md(text)) do
     if b.t == 'blank' then
@@ -2136,12 +2348,48 @@ local function draw_ops(L, w)
   end
 end
 
+-- Incremental layout for a growing (streamed) reply. Blocks never span a complete blank line outside a ``` fence,
+-- so the text splits there into a prefix whose ops are kept and a tail that is laid out again, starting at the
+-- prefix's height. md_cut returns the last such split (the \n before that blank line) after byte `from`.
+local md_layout
+do
+local function md_cut(text, from)
+  local fence, best, p = false, nil, from + 1
+  while true do
+    local e = text:find('\n', p, true)
+    if not e then break end -- the last line may still grow: never split on it
+    local line = text:sub(p, e - 1)
+    if fence then
+      if line:match('^%s*```%s*$') then fence = false end
+    elseif line:match('^%s*```') then fence = true
+    elseif p - 1 > from and line:match('^%s*$') then best = p - 1 end
+    p = e + 1
+  end
+  return best
+end
+function md_layout(old, text, w)
+  local cut, pre_ops, pre_h, pre = 0, {}, 0, nil
+  if old and old.w == w and old.pal == pal_ver and old.cut > 0 and text:sub(1, old.cut) == old.pre then
+    cut, pre_ops, pre_h, pre = old.cut, old.pre_ops, old.pre_h, old.pre
+  end
+  local nc = md_cut(text, cut)
+  if nc then
+    local more, h = layout_md(text:sub(cut + 1, nc - 1), w, FONT_SIZE, pre_h)
+    table.move(more, 1, #more, #pre_ops + 1, pre_ops)
+    cut, pre_h, pre = nc, h, text:sub(1, nc)
+  end
+  local ops = table.move(pre_ops, 1, #pre_ops, 1, {})
+  local tail, h = layout_md(cut > 0 and text:sub(cut + 1) or text, w, FONT_SIZE, pre_h)
+  table.move(tail, 1, #tail, #ops + 1, ops)
+  return { w = w, text = text, pal = pal_ver, ops = ops, h = h, cut = cut, pre = pre, pre_ops = pre_ops, pre_h = pre_h }
+end
+end
+
 local function md(holder, text)
   local w = math.floor(ImGui.GetContentRegionAvail(ctx))
   local L = holder._md
   if not L or L.w ~= w or L.text ~= text or L.pal ~= pal_ver then
-    local ops, h = layout_md(text, w, FONT_SIZE)
-    L = { w = w, text = text, pal = pal_ver, ops = ops, h = h }
+    L = md_layout(L, text, w)
     holder._md = L
   end
   draw_ops(L, w)
@@ -2186,15 +2434,31 @@ local function accept_file_drop() -- call right after the item that should take 
   end
 end
 
-local function truncate(str, w)
-  if ImGui.CalcTextSize(ctx, str) <= w then return str end
-  local n = utf8.len(str) or #str
-  while n > 1 do
-    n = n - 1
-    local cut = str:sub(1, (utf8.offset(str, n + 1) or (#str + 1)) - 1) .. '…'
-    if ImGui.CalcTextSize(ctx, cut) <= w then return cut end
+-- longest prefix (whole UTF-8 characters) + "…" that fits w in the current font: binary search, cached per
+-- string, width, font size and palette (fonts follow the theme)
+local truncate
+do
+  local cache, n = {}, 0
+  function truncate(str, w)
+    w = math.floor(w)
+    local key = str .. '\0' .. w .. '\0' .. ImGui.GetFontSize(ctx) .. '\0' .. pal_ver
+    local hit = cache[key]
+    if hit then return hit end
+    local out = str
+    if ImGui.CalcTextSize(ctx, str) > w then
+      local lo, hi = 0, (utf8.len(str) or #str) - 1 -- chars kept: lo always fits (0 = just "…")
+      while lo < hi do
+        local mid = (lo + hi + 1) // 2
+        local cut = str:sub(1, (utf8.offset(str, mid + 1) or (#str + 1)) - 1) .. '…'
+        if ImGui.CalcTextSize(ctx, cut) <= w then lo = mid else hi = mid - 1 end
+      end
+      out = str:sub(1, (utf8.offset(str, lo + 1) or (#str + 1)) - 1) .. '…'
+    end
+    n = n + 1
+    if n > 2000 then cache, n = {}, 0 end
+    cache[key] = out
+    return out
   end
-  return '…'
 end
 
 local function push_btn(bg, hovered, active, text) -- pop with ImGui.PopStyleColor(ctx, 4)
@@ -2221,8 +2485,13 @@ local function ctx_tag(m, id)
   ImGui.PushFont(ctx, F.reg, FONT_SIZE - 3)
   local lh = ImGui.GetTextLineHeight(ctx)
   local title = 'REAPER context'
-  local tw = ImGui.CalcTextSize(ctx, title)
-  local sw = m._ctx_sum ~= '' and (ImGui.CalcTextSize(ctx, m._ctx_sum) + 8) or 0
+  local cw = m._ctx_w
+  if not cw or cw.pal ~= pal_ver then
+    cw = { pal = pal_ver, tw = ImGui.CalcTextSize(ctx, title),
+      sw = m._ctx_sum ~= '' and (ImGui.CalcTextSize(ctx, m._ctx_sum) + 8) or 0 }
+    m._ctx_w = cw
+  end
+  local tw, sw = cw.tw, cw.sw
   local x, y = ImGui.GetCursorScreenPos(ctx)
   ImGui.InvisibleButton(ctx, '##ctxtag_' .. tostring(id), math.min(10 + tw + sw, ImGui.GetContentRegionAvail(ctx)), lh + 2)
   local dl = ImGui.GetWindowDrawList(ctx)
@@ -2238,18 +2507,25 @@ local function ctx_tag(m, id)
 end
 
 -- tool calls: one small muted line under the reply (no fill, so it never reads like a message bubble); a run of
--- calls collapses into one line with per-tool counts and the total in blue
-local function tool_lane(labels, id)
-  local order, cnt = {}, {}
-  for _, l in ipairs(labels) do
-    if not cnt[l] then cnt[l] = 0; order[#order + 1] = l end
-    cnt[l] = cnt[l] + 1
-  end
-  local parts = {}
-  for _, l in ipairs(order) do parts[#parts + 1] = cnt[l] > 1 and (l .. ' ×' .. cnt[l]) or l end
-  local count = #labels == 1 and '1 call' or (#labels .. ' calls')
+-- calls collapses into one line with per-tool counts and the total in blue. holder keeps the label and its widths
+local function tool_lane(labels, id, holder)
   ImGui.PushFont(ctx, F.reg, FONT_SIZE - 2)
   local w = ImGui.GetContentRegionAvail(ctx)
+  local c = holder and holder._lane
+  if not c or c.n ~= #labels or c.w ~= w or c.pal ~= pal_ver then
+    local order, cnt = {}, {}
+    for _, l in ipairs(labels) do
+      if not cnt[l] then cnt[l] = 0; order[#order + 1] = l end
+      cnt[l] = cnt[l] + 1
+    end
+    local parts = {}
+    for _, l in ipairs(order) do parts[#parts + 1] = cnt[l] > 1 and (l .. ' ×' .. cnt[l]) or l end
+    local count = #labels == 1 and '1 call' or (#labels .. ' calls')
+    local cw = ImGui.CalcTextSize(ctx, count)
+    local text = truncate(table.concat(parts, ' · '), w - cw - 30)
+    c = { n = #labels, w = w, pal = pal_ver, count = count, text = text, tw = ImGui.CalcTextSize(ctx, text) }
+    if holder then holder._lane = c end
+  end
   local lh = ImGui.GetTextLineHeight(ctx)
   local x1, y1 = ImGui.GetCursorScreenPos(ctx)
   ImGui.InvisibleButton(ctx, '##lane_' .. id, w, lh + 2)
@@ -2258,10 +2534,8 @@ local function tool_lane(labels, id)
   ImGui.DrawList_AddLine(dl, x1 + 1, cy - 3 * s, x1 + 4 * s + 1, cy, C.muted, 1.3)
   ImGui.DrawList_AddLine(dl, x1 + 4 * s + 1, cy, x1 + 1, cy + 3 * s, C.muted, 1.3)
   ImGui.DrawList_AddLine(dl, x1 + 6, cy + 3 * s, x1 + 11, cy + 3 * s, C.muted, 1.3)
-  local cw = ImGui.CalcTextSize(ctx, count)
-  local text = truncate(table.concat(parts, ' · '), w - cw - 30)
-  ImGui.DrawList_AddText(dl, x1 + 16, y1 + 1, C.muted, text)
-  ImGui.DrawList_AddText(dl, x1 + 16 + ImGui.CalcTextSize(ctx, text) + 8, y1 + 1, C.value, count)
+  ImGui.DrawList_AddText(dl, x1 + 16, y1 + 1, C.muted, c.text)
+  ImGui.DrawList_AddText(dl, x1 + 16 + c.tw + 8, y1 + 1, C.value, c.count)
   ImGui.PopFont(ctx)
   if ImGui.IsItemHovered(ctx) and #labels > 1 then
     local seq = {}
@@ -2423,7 +2697,7 @@ end
 local function history_popup()
   ImGui.SetNextWindowSizeConstraints(ctx, 260, 0, 460, 480)
   if ImGui.BeginPopup(ctx, 'histpop') then
-    if reaper.time_precise() - S.sess_at > 2 then load_sessions() end
+    if reaper.time_precise() - S.sess_at > 10 then load_sessions() end
     ImGui.TextDisabled(ctx, 'Recent chats')
     local dl = ImGui.GetWindowDrawList(ctx)
     for _, x in ipairs(S.sessions) do
@@ -2488,7 +2762,18 @@ end
 local function cfg_window()
   local SMALL = 12
   -- other scripts (the agent via MCP) can pop the window open: SetExtState('Hibiki', 'open', 'settings')
-  if reaper.GetExtState(EXT, 'open') == 'settings' then reaper.DeleteExtState(EXT, 'open', false); S.cfgwin = true end
+  local want_open = reaper.GetExtState(EXT, 'open')
+  if want_open == 'settings' or want_open == 'recover' then
+    reaper.DeleteExtState(EXT, 'open', false)
+    S.cfgwin = true
+    if want_open == 'recover' then REC.start() end
+  end
+  if S.cfgwin and not S.cfgwin_was then -- just opened: re-read what is otherwise only polled while unknown
+    local r = ONB.reaper[S.agent]
+    if r then r.stale = true end
+    S.agentpop_at = 0
+  end
+  S.cfgwin_was = S.cfgwin
   if not S.cfgwin then return end
   local model, effort, mode
   for _, o in ipairs(S.cfg_opts) do
@@ -2644,12 +2929,12 @@ local function cfg_window()
       ImGui.PopTextWrapPos(ctx)
     end
 
-    if reaper.time_precise() - (S.agentpop_at or 0) > 2 then -- keep local agents' login state fresh while open
+    if reaper.time_precise() - (S.agentpop_at or 0) > 10 then -- keep local agents' login state fresh while open
       S.agentpop_at = reaper.time_precise()
       for _, a in ipairs(S.agents) do if a.acp then load_acp_status(a.slug, false) end end
     end
 
-    if is_acp() and S.sid ~= '' and reaper.time_precise() - (S.sess_at or 0) > 5 then load_sessions() end
+    if is_acp() and S.sid ~= '' and reaper.time_precise() - (S.sess_at or 0) > 10 then load_sessions() end
     -- providers: Gamut stands for the current (or last used) Gamut agent; its agent layer sits inside the box
     local want = (S.agent ~= '' and not is_acp()) and S.agent or reaper.GetExtState(EXT, 'gamut_agent')
     local gamut
@@ -2815,6 +3100,29 @@ local function cfg_window()
         if mode then row('Mode:', function(cw) combo(mode, 'mode', cw) end) end
       end)
     end
+    ImGui.Dummy(ctx, 0, 2)
+    section('Recovery', COL)
+    REC.tick()
+    box('recover', COL, function(w, x0)
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.Text(ctx, REC.running and 'Resetting the connection…' or 'Stuck or not answering?')
+      local bt = REC.running and 'Recovering…' or 'Recover'
+      local bw = ImGui.CalcTextSize(ctx, bt) + 16
+      ImGui.SameLine(ctx)
+      ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+      if light_btn('recover', bt, bw, false, REC.running) then REC.start() end
+      if ImGui.IsItemHovered(ctx) and not REC.running then
+        show_tip('Stops the reply, restarts the connection, runs  hibiki recover  and reloads this chat.')
+      end
+      if REC.lines then
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        ImGui.PushTextWrapPos(ctx, x0 + w)
+        for _, l in ipairs(REC.lines) do
+          ImGui.TextColored(ctx, l.ok and shade(C.win_text, 0x30) or C.razor, l.text)
+        end
+        ImGui.PopTextWrapPos(ctx)
+      end
+    end)
     ImGui.EndGroup(ctx)
 
     -- right column (like Receives): the context switch, then one box per live REAPER selection
@@ -3027,7 +3335,7 @@ local function question_card(q)
     end
     return '{' .. table.concat(L, ',') .. '}'
   end
-  local path = '/sessions/' .. S.sid .. '/answer-question'
+  local path = '/sessions/' .. seg(S.sid) .. '/answer-question'
   if q.sending then ImGui.TextDisabled(ctx, 'Sending…')
   else
     if ready then
@@ -3058,11 +3366,11 @@ local function greq_card(q, who)
     st.value = v
     if not q.sending then
       if st.value ~= '' and primary('Save##' .. id) then
-        answer_request(q, '/sessions/' .. sid .. '/provide-secret',
+        answer_request(q, '/sessions/' .. seg(sid) .. '/provide-secret',
           '{' .. tid .. ',"secretName":' .. jstr(sval(p.secretName) or '') .. ',"value":' .. jstr(st.value) .. '}')
       end
       ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Decline##' .. id) then answer_request(q, '/sessions/' .. sid .. '/provide-secret', '{' .. tid .. ',"decline":true}') end
+      if ImGui.Button(ctx, 'Decline##' .. id) then answer_request(q, '/sessions/' .. seg(sid) .. '/provide-secret', '{' .. tid .. ',"decline":true}') end
     end
   elseif kind == 'script_run' then
     wrapped(sval(p.explanation) or (who .. ' wants to run a script'))
@@ -3076,17 +3384,17 @@ local function greq_card(q, who)
     end
     if not q.sending then
       if primary('Run##' .. id) then
-        answer_request(q, '/sessions/' .. sid .. '/run-script',
+        answer_request(q, '/sessions/' .. seg(sid) .. '/run-script',
           '{' .. tid .. ',"script":' .. jstr(sval(p.script) or '') .. ',"scriptType":' .. jstr(sval(p.scriptType) or '') .. '}')
       end
       ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/sessions/' .. sid .. '/run-script', '{' .. tid .. ',"decline":true}') end
+      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/sessions/' .. seg(sid) .. '/run-script', '{' .. tid .. ',"decline":true}') end
     end
   elseif kind == 'capability_review' then
     wrapped(who .. ' wants to use ' .. (sval(p.toolName) or sval(p.capability) or 'a capability'))
     if not q.sending then
       local cap = ',"capability":' .. jstr(sval(p.capability) or '')
-      local path = '/sessions/' .. sid .. '/capability-review'
+      local path = '/sessions/' .. seg(sid) .. '/capability-review'
       if primary('Allow once##' .. id) then answer_request(q, path, '{' .. tid .. cap .. ',"scope":"once"}') end
       ImGui.SameLine(ctx)
       if ImGui.Button(ctx, 'Allow for this chat##' .. id) then answer_request(q, path, '{' .. tid .. cap .. ',"scope":"session"}') end
@@ -3104,9 +3412,9 @@ local function greq_card(q, who)
     wrapped(who .. ' wants to ' .. (xa and what or ('call ' .. what)))
     if xa and sval(xa.preview) then wrapped(xa.preview, C.muted) end
     if not q.sending then
-      if primary('Allow##' .. id) then answer_request(q, '/proxy-review/' .. id, '{"decision":"allow"}') end
+      if primary('Allow##' .. id) then answer_request(q, '/proxy-review/' .. seg(id), '{"decision":"allow"}') end
       ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/proxy-review/' .. id, '{"decision":"deny"}') end
+      if ImGui.Button(ctx, 'Deny##' .. id) then answer_request(q, '/proxy-review/' .. seg(id), '{"decision":"deny"}') end
     end
   else
     local f = GAMUT_ASKS[kind]
@@ -3210,6 +3518,113 @@ local function scroll_engine()
   if math.abs(S.sy_target - ny) <= 1 then ny = S.sy_target; S.trip = false end
   if ny ~= ImGui.GetScrollY(ctx) then ImGui.SetScrollY(ctx, ny) end
   S.sy_last = ny
+end
+
+-- the conversation. Every element (sent message, reply, tool line) remembers its drawn height; one whose height is
+-- known for this width and palette and lies outside the visible scroll range is replaced by a Dummy of that height,
+-- so off-screen history costs two calls and the scroll range (and scroll_engine) stays exact
+local draw_log
+do
+  local W, SP, V0, V1 = 0, 6, 0, 0
+  local function skip(holder, slot, key)
+    local c = holder[slot]
+    local y = ImGui.GetCursorPosY(ctx)
+    if c and c.w == W and c.key == key and c.pal == pal_ver and (y + c.h < V0 or y > V1) then
+      ImGui.Dummy(ctx, W, math.max(0, c.h - SP))
+      return true, y
+    end
+    return false, y
+  end
+  local function measured(holder, slot, key, y)
+    local c = holder[slot]
+    if not c then c = {}; holder[slot] = c end
+    c.w, c.key, c.pal, c.h = W, key, pal_ver, ImGui.GetCursorPosY(ctx) - y
+  end
+  local lane, lane_holder, lane_id = {}, nil, ''
+  local function flush()
+    if #lane == 0 then return end
+    local skipped, y = skip(lane_holder, '_hl', #lane)
+    if not skipped then
+      tool_lane(lane, lane_id, lane_holder)
+      ImGui.Spacing(ctx)
+      measured(lane_holder, '_hl', #lane, y)
+    end
+    for i = #lane, 1, -1 do lane[i] = nil end
+  end
+  local function to_lane(holder, id, labels)
+    if #lane == 0 then lane_id, lane_holder = id, holder end
+    for _, l in ipairs(labels) do lane[#lane + 1] = l end
+  end
+  local function user_msg(m, id)
+    if m._had == nil then
+      m._body, m._had, m._ctx = split_context(m.text)
+      local at = m._body:find('[Attached files:]', 1, true)
+      if at then
+        local names = {}
+        for path in m._body:sub(at):gmatch('\n%- ([^\n]+)') do names[#names + 1] = path:match('[^/]+$') or path end
+        m._files = table.concat(names, ', ')
+        m._body = m._body:sub(1, at - 1):gsub('%s+$', '')
+      end
+    end
+    if m._had then ctx_tag(m, id) end
+    if m._body ~= '' then bubble(m, m._body) end
+    if m._files then
+      ImGui.PushTextWrapPos(ctx, 0)
+      ImGui.TextDisabled(ctx, 'Attached: ' .. m._files)
+      ImGui.PopTextWrapPos(ctx)
+    end
+    ImGui.Spacing(ctx)
+  end
+  local function draw_msg(m, id)
+    local tools = m.tools and #m.tools > 0
+    if m.role == 'user' then
+      flush()
+      local skipped, y = skip(m, '_h', 0)
+      if not skipped then user_msg(m, id); measured(m, '_h', 0, y) end
+    elseif m.text ~= '' then
+      flush()
+      local skipped, y = skip(m, '_h', #m.text)
+      if not skipped then
+        md(m, m.text)
+        if not tools then ImGui.Spacing(ctx) end
+        measured(m, '_h', #m.text, y)
+      end
+    end
+    if m.role ~= 'user' and tools then
+      if not m._tl then
+        m._tl = {}
+        for _, n in ipairs(m.tools) do m._tl[#m._tl + 1] = tool_label(n) end
+      end
+      to_lane(m, id, m._tl)
+    end
+  end
+  local one = {}
+  function draw_log()
+    W = math.floor(ImGui.GetContentRegionAvail(ctx))
+    local _, sp = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing)
+    SP = sp or 6
+    local sy, wh = ImGui.GetScrollY(ctx), ImGui.GetWindowHeight(ctx)
+    V0, V1 = sy - 200, sy + wh + 200
+    for i, m in ipairs(S.msgs) do draw_msg(m, i) end
+    for i, b in ipairs(S.live) do
+      if b.kind == 'text' then
+        flush()
+        local skipped, y = skip(b, '_h', #b.text)
+        if not skipped then md(b, b.text); measured(b, '_h', #b.text, y) end
+      else
+        one[1] = b.text
+        to_lane(b, 'live' .. i, one)
+      end
+    end
+    flush()
+    for i, m in ipairs(S.queued) do draw_msg(m, 'q' .. i) end
+    flush()
+    if S.active and not S.waiting then
+      local s = spin[(math.floor(reaper.time_precise() * 6) % #spin) + 1]
+      ImGui.TextColored(ctx, C.accent, 'Working ' .. s)
+    end
+    if S.err then ImGui.TextColored(ctx, C.danger, S.err) end
+  end
 end
 
 local perf = { n = 0, sum = 0, max = 0, gap = 0, last = reaper.time_precise(), at = reaper.time_precise() }
@@ -3342,61 +3757,7 @@ local function frame()
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
-        local lane, lane_id = {}, ''
-        local function flush()
-          if #lane > 0 then tool_lane(lane, lane_id); lane = {}; ImGui.Spacing(ctx) end
-        end
-        local function add_tools(m, id)
-          if not m._tl then
-            m._tl = {}
-            for _, n in ipairs(m.tools) do m._tl[#m._tl + 1] = tool_label(n) end
-          end
-          if #lane == 0 then lane_id = id end
-          for _, l in ipairs(m._tl) do lane[#lane + 1] = l end
-        end
-        local function draw_msg(m, id)
-          if m.role == 'user' then
-            flush()
-            if m._had == nil then
-              m._body, m._had, m._ctx = split_context(m.text)
-              local at = m._body:find('[Attached files:]', 1, true)
-              if at then
-                local names = {}
-                for path in m._body:sub(at):gmatch('\n%- ([^\n]+)') do names[#names + 1] = path:match('[^/]+$') or path end
-                m._files = table.concat(names, ', ')
-                m._body = m._body:sub(1, at - 1):gsub('%s+$', '')
-              end
-            end
-            local body, had = m._body, m._had
-            if had then ctx_tag(m, id) end
-            if body ~= '' then bubble(m, body) end
-            if m._files then
-              ImGui.PushTextWrapPos(ctx, 0)
-              ImGui.TextDisabled(ctx, 'Attached: ' .. m._files)
-              ImGui.PopTextWrapPos(ctx)
-            end
-            ImGui.Spacing(ctx)
-          else
-            if m.text ~= '' then flush(); md(m, m.text) end
-            if m.tools and #m.tools > 0 then add_tools(m, id) elseif m.text ~= '' then ImGui.Spacing(ctx) end
-          end
-        end
-        for i, m in ipairs(S.msgs) do draw_msg(m, i) end
-        for i, b in ipairs(S.live) do
-          if b.kind == 'text' then flush(); md(b, b.text)
-          else
-            if #lane == 0 then lane_id = 'live' .. i end
-            lane[#lane + 1] = b.text
-          end
-        end
-        flush()
-        for i, m in ipairs(S.queued) do draw_msg(m, 'q' .. i) end
-        flush()
-        if S.active and not S.waiting then
-          local s = spin[(math.floor(reaper.time_precise() * 6) % #spin) + 1]
-          ImGui.TextColored(ctx, C.accent, 'Working ' .. s)
-        end
-        if S.err then ImGui.TextColored(ctx, C.danger, S.err) end
+        draw_log()
         ImGui.EndChild(ctx)
       end
       accept_file_drop() -- files dropped on the conversation attach too
@@ -3504,6 +3865,7 @@ load_agents()
 if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
-    ONB = ONB }
+    ONB = ONB, REC = REC, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
+    draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages }
 end
 reaper.defer(safe_frame)

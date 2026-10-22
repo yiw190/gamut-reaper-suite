@@ -4,13 +4,15 @@ on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+permissions:
+  contents: read
 jobs:
   build:
     name: build + install the .pkg on macOS
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/cache@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: ~/.cache/hibiki
           key: python-${{ hashFiles('packaging/python.lock') }}
@@ -27,8 +29,10 @@ jobs:
       - name: install
         run: |
           sudo mkdir -p /Applications/REAPER.app  # stand-in: the runner has no REAPER
-          sudo installer -pkg dist/Hibiki-*.pkg -target / || { sudo cat /var/log/hibiki-install.log; exit 1; }
+          sudo installer -pkg dist/Hibiki-*.pkg -target / || { sudo cat /var/log/hibiki-install.log; cat ~/Library/Logs/hibiki-install.log; exit 1; }
           sudo cat /var/log/hibiki-install.log
+          cat ~/Library/Logs/hibiki-install.log
+          test ! -L ~/Library/Logs/hibiki-install.log && test -O ~/Library/Logs/hibiki-install.log
       - name: doctor
         run: hibiki doctor
       - name: MCP answers over HTTP with the bundled Python
@@ -46,7 +50,7 @@ jobs:
           hibiki uninstall
           ! ls ~/Library/LaunchAgents/com.hibiki.* 2>/dev/null
           ! curl -fsS http://127.0.0.1:8787/healthz
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: pkg
           path: dist/*
@@ -59,17 +63,17 @@ jobs:
       run:
         shell: pwsh
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: "3.12"
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830  # v4.3.0
         with:
           path: ~/.cache/hibiki
           key: python-win-${{ hashFiles('packaging/python.lock') }}
       - name: Inno Setup
         run: |
-          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup -y --no-progress }
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) { choco install innosetup --version=6.7.1 -y --no-progress }
       - name: build
         run: python packaging/windows/build_exe.py dist
       - name: tag matches the version
@@ -130,7 +134,7 @@ jobs:
           try { Invoke-RestMethod http://127.0.0.1:8787/healthz | Out-Null } catch { $up = $false }
           if ($up) { throw "MCP still running" }
           if ((Get-ItemProperty HKCU:\Environment).Path -match 'Programs\\Hibiki') { throw "PATH entry left behind" }
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
           name: exe
           path: dist/Hibiki-*
@@ -142,12 +146,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: pkg
           path: dist
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
         with:
           name: exe
           path: dist

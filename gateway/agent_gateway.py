@@ -7,13 +7,16 @@ Gemini CLI, ...) run as stdio subprocesses and are served under the same routes,
 
   GET  /api/agents                                   Gamut agents + ACP agents
   GET  /api/agents/<slug>/config                     model / effort / mode selectors (normalized config options)
-  GET  /api/agents/<slug>/status[?probe=1]           ACP: {state, connected, authMethods, error}; probe starts it
+  GET  /api/agents/<slug>/status[?probe=1|<slug>]    ACP: {state, connected, running, authMethods, error}. probe=1 is a
+                                                     cheap check (binary present + last-known login, nothing spawned);
+                                                     probe=<slug> starts that agent to find out
   POST /api/agents/<slug>/auth          {methodId}   ACP: start login (terminal methods open Terminal.app)
   GET  /api/agents/<slug>/sessions
   POST /api/agents/<slug>/sessions      {message, config}
   GET  /api/agents/<slug>/sessions/<id>
   POST /api/agents/<slug>/sessions/<id>/messages {content, config}
-  GET  /api/agents/<slug>/sessions/<id>/messages
+  GET  /api/agents/<slug>/sessions/<id>/messages[?after=<msgId>]  plain array; with after: {"after", "messages"}
+                                                     (strictly newer), or {"full": true, "messages"} if msgId is unknown
   GET  /api/agents/<slug>/sessions/<id>/stream       SSE: connected, session_active, stream_delta, tool_use_ready,
                                                      session_idle, session_error, notice, permission_request,
                                                      permission_resolved, config_options
@@ -71,6 +74,12 @@ MAX_IMAGE_BLOCK = 10 * 1024 * 1024
 ATTACHED = "[Attached files:]"  # Gamut's attachment block, appended to a message as "- <path>" lines
 LOGIN_POLL = float(os.environ.get("AGENT_GATEWAY_LOGIN_POLL", "3"))
 LOGIN_TIMEOUT = 900
+IDLE_STOP = float(os.environ.get("AGENT_GATEWAY_IDLE", "600"))
+IDLE_CHECK = float(os.environ.get("AGENT_GATEWAY_IDLE_CHECK", "30"))
+MAX_REQUESTS = int(os.environ.get("AGENT_GATEWAY_MAX_REQUESTS", "32"))
+MAX_STREAMS = int(os.environ.get("AGENT_GATEWAY_MAX_STREAMS", "64"))
+SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def log(*a):
@@ -94,18 +103,33 @@ def load_config():
 WINDOWS = os.name == "nt"
 
 
+def safe_id(v):
+    return isinstance(v, str) and len(v) <= 200 and bool(SAFE_ID.match(v)) and v not in (".", "..")
+
+
+def cmd_value(s):
+    """Text for a line of a .cmd file: a quote or line break would end the argument, a bare % would expand a variable."""
+    s = str(s)
+    if any(c in s for c in '"\r\n\0'):
+        raise ValueError("cannot pass %r to cmd.exe safely" % s)
+    return s.replace("%", "%%")
+
+
 def cmd_quote(s):
-    """One cmd.exe argument. Inside double quotes cmd takes & | < > ^ literally; Windows paths can't hold a quote."""
-    return '"%s"' % str(s).replace('"', '')
+    """One cmd.exe argument. Inside double quotes cmd takes & | < > ^ literally."""
+    return '"%s"' % cmd_value(s)
 
 
 def shell_line(argv, env=None, cwd=None, path_prefix=None):
     """A command line for a visible terminal: POSIX sh on macOS/Linux, cmd.exe on Windows."""
+    bad = [k for k in (env or {}) if not ENV_KEY.match(str(k))]
+    if bad:
+        raise ValueError("bad environment variable name %r" % bad[0])
     if WINDOWS:
         parts = ["cd /d %s" % cmd_quote(cwd)] if cwd else []
         if path_prefix:
-            parts.append('set "PATH=%s;%%PATH%%"' % path_prefix)
-        parts += ['set "%s=%s"' % (k, v) for k, v in (env or {}).items()]
+            parts.append('set "PATH=%s;%%PATH%%"' % cmd_value(path_prefix))
+        parts += ['set "%s=%s"' % (k, cmd_value(v)) for k, v in (env or {}).items()]
         parts.append(" ".join(cmd_quote(a) for a in argv))
         return " && ".join(parts)
     out = "cd %s && " % shlex.quote(cwd) if cwd else ""
@@ -184,6 +208,56 @@ def load_token():
     with os.fdopen(fd, "w") as f:
         f.write(token + "\n")
     return token
+
+
+def descendants(pid):
+    """Every process below `pid` (the ACP agent's MCP servers and their children), from one `ps` snapshot."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True, text=True,
+                             timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    kids = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            kids.setdefault(int(f[1]), []).append(int(f[0]))
+    found, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            if c not in found:
+                found.append(c)
+                todo.append(c)
+    return found
+
+
+def kill_tree(proc, grace=3.0):
+    """Stop an agent and everything it started; a plain terminate() would orphan its MCP servers."""
+    if proc is None or proc.poll() is not None:
+        return
+    if WINDOWS:
+        subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+    else:
+        import signal
+        kids = descendants(proc.pid)
+        for pid in [proc.pid] + kids:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        try:
+            proc.wait(grace)
+        except subprocess.TimeoutExpired:
+            pass
+        for pid in [proc.pid] + kids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+    try:
+        proc.wait(5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 class AcpError(Exception):
@@ -395,12 +469,15 @@ class AcpAgent:
         self.by_acp = {}
         self.config_cache = None  # None = not fetched yet; [] = agent has no options
         self.warm = None
+        self.last_used = time.monotonic()
+        self.known = {}  # last-known login state, kept across stops and gateway restarts
         self.load_persisted()
+        self.load_known()
 
     def resume_cmd(self, acp_id):
         """Shell line that reopens this chat in the agent's CLI, or None when there is no such CLI here."""
         argv = self.spec.get("resume") or RESUME.get(self.spec["slug"])
-        if not acp_id or not argv:
+        if not acp_id or not argv or not safe_id(acp_id):
             return None
         dirs = [(self.spec.get("env") or {}).get("PATH", ""), os.path.dirname(expand(self.spec["command"][0])),
                 expand("~/.local/bin"), os.environ.get("PATH", "")]
@@ -410,7 +487,89 @@ class AcpAgent:
         args = [exe] + [a.replace("{id}", acp_id) for a in argv[1:]]
         # Terminal's PATH lacks the agent's runtime (kimi is `#!/usr/bin/env node`, node lives in ~/.local/node/bin)
         env_path = (self.spec.get("env") or {}).get("PATH")
-        return shell_line(args, cwd=self.cwd, path_prefix=expand(env_path) if env_path else None)
+        try:
+            return shell_line(args, cwd=self.cwd, path_prefix=expand(env_path) if env_path else None)
+        except ValueError:
+            return None
+
+    def known_path(self):
+        return STATE / (self.slug + ".status.json")
+
+    def load_known(self):
+        try:
+            k = json.loads(self.known_path().read_text())
+            self.known = k if isinstance(k, dict) else {}
+        except (OSError, ValueError):
+            self.known = {}
+
+    def remember(self):
+        """Record the login state the picker shows while the agent isn't running."""
+        k = {"state": "ready" if self.connected else self.state, "connected": self.connected,
+             "authMethods": self.auth_methods}
+        if k["state"] not in ("ready", "auth_required") or k == self.known:
+            return
+        self.known = k
+        try:
+            p = self.known_path()
+            p.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + "." + uuid.uuid4().hex[:8] + ".tmp")
+            tmp.write_text(json.dumps(k))
+            tmp.replace(p)
+        except OSError as e:
+            log(self.slug, "could not save status:", e)
+
+    def running(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def installed(self):
+        exe = expand(self.spec["command"][0])
+        if os.path.isabs(exe):
+            return os.path.isfile(exe)
+        dirs = [expand((self.spec.get("env") or {}).get("PATH", "")), os.environ.get("PATH", "")]
+        return shutil.which(exe, path=os.pathsep.join(d for d in dirs if d)) is not None
+
+    def status(self):
+        """What the picker and the login card show; a stopped agent reports its last-known login state."""
+        if self.probing:
+            return {"state": "starting", "connected": False, "running": self.running(), "error": None,
+                    "authMethods": self.auth_methods}
+        if self.running() or self.state in ("starting", "authenticating", "auth_required", "error"):
+            return {"state": self.state, "connected": self.connected, "running": self.running(), "error": self.error,
+                    "authMethods": self.auth_methods}
+        if not self.installed():
+            return {"state": "error", "connected": False, "running": False, "authMethods": [],
+                    "error": "%s is not installed (%s)" % (self.name, self.spec["command"][0])}
+        k = self.known
+        return {"state": k.get("state") or "stopped", "connected": bool(k.get("connected")), "running": False,
+                "error": self.error, "authMethods": self.auth_methods or k.get("authMethods") or []}
+
+    def busy(self):
+        """Something still needs the process: a turn, a pending permission, a login, an open stream."""
+        if self.probing or self.state in ("starting", "authenticating"):
+            return True
+        for sess in list(self.sessions.values()) + ([self.warm] if self.warm else []):
+            if sess.active or sess.subs or sess.perms:
+                return True
+        return False
+
+    def stop_if_idle(self, idle):
+        with self.lock:
+            if not self.running() or self.busy() or time.monotonic() - self.last_used < idle:
+                return False
+            log(self.slug, "idle for %ds; stopping it (it restarts on the next message)" % idle)
+            self.remember()
+            proc = self.proc
+            self.state, self.connected = "stopped", False
+            with self.cfg_lock:
+                self.warm = None
+            self.by_acp.clear()
+        kill_tree(proc)
+        return True
+
+    def shutdown(self):
+        with self.lock:
+            proc = self.proc
+        kill_tree(proc)
 
     def load_persisted(self):
         d = STATE / self.slug
@@ -445,13 +604,7 @@ class AcpAgent:
             box["ev"].set()
 
     def start(self):
-        old = self.proc
-        if old and old.poll() is None:
-            old.terminate()
-            try:
-                old.wait(3)
-            except subprocess.TimeoutExpired:
-                old.kill()
+        kill_tree(self.proc)
         self._fail_pending("agent restarted")
         env = dict(os.environ)
         for k, v in (self.spec.get("env") or {}).items():
@@ -479,7 +632,7 @@ class AcpAgent:
                 raise AcpError(-1, "%s speaks ACP protocol %s, gateway speaks 1" % (self.name, res.get("protocolVersion")))
         except AcpError as e:
             self.state, self.error = "error", e.message
-            self.proc.terminate()
+            kill_tree(self.proc)
             raise
         self.caps = res.get("agentCapabilities") or {}
         self.auth_methods = login_variants(res.get("authMethods") or [], self.spec)
@@ -496,6 +649,7 @@ class AcpAgent:
             raise AcpError(-1, self.name + " is not running")
 
     def request(self, method, params, timeout=None):
+        self.last_used = time.monotonic()
         with self.lock:
             self.next_id += 1
             rid = self.next_id
@@ -509,6 +663,7 @@ class AcpAgent:
         if not box["ev"].wait(timeout):
             self.pending.pop(rid, None)
             raise AcpError(-1, method + " timed out")
+        self.last_used = time.monotonic()
         if "error" in box:
             e = box["error"]
             raise AcpError(e.get("code"), e.get("message", "error"))
@@ -547,6 +702,7 @@ class AcpAgent:
                     s.drop_perms()
 
     def _dispatch(self, msg):
+        self.last_used = time.monotonic()
         if "method" not in msg and "id" in msg:
             box = self.pending.pop(msg["id"], None)
             if box:
@@ -594,10 +750,12 @@ class AcpAgent:
         except AcpError as e:
             if e.code == AUTH_REQUIRED:
                 self.state, self.connected = "auth_required", False
+                self.remember()
             raise
         if not res.get("sessionId"):
             raise AcpError(-1, self.name + " returned no sessionId")
         self.state, self.connected = "ready", True
+        self.remember()
         s.acp_id, s.config = res["sessionId"], normalize_config(res)
         self.config_cache = s.config
         self.by_acp[s.acp_id] = s
@@ -694,6 +852,7 @@ class AcpAgent:
                 code, message = (e.code, e.message) if isinstance(e, AcpError) else (-1, repr(e))
                 if code == AUTH_REQUIRED:
                     self.state, self.connected = "auth_required", False
+                    self.remember()
                 if s.backlog:
                     message += " (%d queued message%s not sent)" % (len(s.backlog), "" if len(s.backlog) == 1 else "s")
                 with s.lock:
@@ -766,9 +925,13 @@ class AcpAgent:
     def probe(self):
         """Start the agent and open a warm session so the picker knows whether it is logged in."""
         with self.lock:
-            if self.probing or self.connected:
-                return
+            if self.probing or self.connected or self.state not in ("stopped", "ready", "error"):
+                return False
             self.probing = True
+        threading.Thread(target=self._probe, daemon=True).start()
+        return True
+
+    def _probe(self):
         try:
             self.get_config()
         except Exception as e:  # surfaced through state/error
@@ -787,6 +950,7 @@ class AcpAgent:
             self.state = "authenticating"
             self.request("authenticate", {"methodId": method_id}, timeout=900)
             self.state, self.error, self.connected = "ready", None, True
+            self.remember()
         except AcpError as e:
             self.state, self.error = "auth_required", e.message
 
@@ -795,7 +959,7 @@ class AcpAgent:
         self.state, self.error = "authenticating", None
         try:
             open_terminal(shell_line(argv, env={k: expand(v) for k, v in env.items()}))
-        except OSError as e:
+        except (OSError, ValueError) as e:
             self.state, self.error = "auth_required", "cannot open a terminal: %s" % e
             return
         deadline = time.time() + LOGIN_TIMEOUT
@@ -935,12 +1099,41 @@ def mcp_specs(cfg):
             for m in cfg.get("mcpServers", [])]
 
 
+def messages_after(msgs, after):
+    """The panel's incremental refresh: messages strictly after `after`, or all of them if it isn't there."""
+    for i, m in enumerate(msgs):
+        if isinstance(m, dict) and m.get("id") == after:
+            return {"after": after, "messages": msgs[i + 1:]}
+    return {"full": True, "messages": msgs}
+
+
 class Gateway:
     def __init__(self):
         self.token = load_token()
         self.acp = {}
         self.installs = Installs()
+        self.requests = threading.BoundedSemaphore(MAX_REQUESTS)
+        self.streams = threading.BoundedSemaphore(MAX_STREAMS)
         self.reload()
+
+    def reap_idle(self, idle=None):
+        stopped = []
+        for a in list(self.acp.values()):
+            try:
+                if a.stop_if_idle(IDLE_STOP if idle is None else idle):
+                    stopped.append(a.slug)
+            except Exception as e:
+                log(a.slug, "idle check failed:", repr(e))
+        return stopped
+
+    def reaper(self):
+        while True:
+            time.sleep(IDLE_CHECK)
+            self.reap_idle()
+
+    def shutdown(self):
+        for a in list(self.acp.values()):
+            a.shutdown()
 
     def reload(self):
         """Pick up ACP agents added to the config (by an install) without restarting; running ones stay as they are."""
@@ -957,6 +1150,7 @@ GW = None
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 60  # header and body reads; a stalled client can't hold a thread forever
 
     def log_message(self, fmt, *args):
         if os.environ.get("AGENT_GATEWAY_DEBUG"):
@@ -984,8 +1178,9 @@ class Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self.route("DELETE")
 
-    def refuse(self):
-        """Only local, non-browser clients: no Origin, a host name we expect, JSON bodies."""
+    def refuse(self, n):
+        """Only local, non-browser clients: no Origin, a host name we expect, JSON bodies. Headers only: the body
+        isn't read until the request is known to be allowed."""
         if self.headers.get("Origin") is not None:
             return "browser requests are not accepted"
         host = (self.headers.get("Host") or "").rsplit(":", 1)[0].strip("[]").lower()
@@ -996,31 +1191,40 @@ class Handler(BaseHTTPRequestHandler):
             return "missing or wrong gateway token (%s)" % TOKEN_FILE
         ctype = self.headers.get("Content-Type") or ""
         upload = self.path.split("?", 1)[0].endswith("/upload-file")
-        if self.raw and "json" not in ctype and not (upload and ctype.startswith("multipart/form-data")):
+        if n > 0 and "json" not in ctype and not (upload and ctype.startswith("multipart/form-data")):
             return "JSON body required"
         return None
 
     def route(self, method):
+        self.raw, self.json = b"", {}
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             n = -1
+        why = self.refuse(max(n, 0))
+        if why:
+            return self.reply(403, {"error": why})
         if not 0 <= n <= MAX_UPLOAD:
-            self.raw, self.json = b"", {}
             return self.reply(413, {"error": "bad or too large Content-Length"})
-        self.raw = self.rfile.read(n) if n > 0 else b""
-        try:
-            self.json = json.loads(self.raw) if self.raw else {}
-        except ValueError:
-            self.json = {}
-        if not isinstance(self.json, dict):
-            self.json = {}
         path = self.path.split("?", 1)[0]  # acp_route reads the query (?probe=1) from self.path
+        sem = GW.streams if method == "GET" and path.endswith("/stream") else GW.requests
+        if not sem.acquire(blocking=False):
+            return self.reply(503, {"error": "too many requests in flight"})
+        try:
+            self.raw = self.rfile.read(n) if n > 0 else b""
+            try:
+                self.json = json.loads(self.raw) if self.raw else {}
+            except ValueError:
+                self.json = {}
+            if not isinstance(self.json, dict):
+                self.json = {}
+            return self.dispatch(method, path)
+        finally:
+            sem.release()
+
+    def dispatch(self, method, path):
         parts = [p for p in path.split("/") if p]
         try:
-            why = self.refuse()
-            if why:
-                return self.reply(403, {"error": why})
             if not path.startswith("/"):
                 return self.reply(400, {"error": "bad path"})
             if path == "/health":
@@ -1029,12 +1233,17 @@ class Handler(BaseHTTPRequestHandler):
                 return self.agents()
             if parts[:2] == ["api", "hibiki"]:
                 return self.hibiki(method, parts[2:])
-            if len(parts) >= 3 and parts[:2] == ["api", "agents"]:
+            if parts[:2] == ["api", "agents"] and len(parts) >= 3:
+                if not safe_id(parts[2]) or (len(parts) >= 5 and parts[3] == "sessions" and not safe_id(parts[4])):
+                    return self.reply(400, {"error": "bad agent or session id"})
                 slug, rest = parts[2], parts[3:]
                 if slug in GW.acp:
                     return self.acp_route(method, GW.acp[slug], rest)
                 if method == "GET" and rest == ["config"]:
                     return self.reply(200, {"configOptions": gamut_config(slug)})
+                if method == "GET" and len(rest) == 3 and rest[0] == "sessions" and rest[2] == "messages" \
+                        and self.query("after") is not None:
+                    return self.gamut_messages_after(path, self.query("after"))
             return self.proxy(method, path)
         except AcpError as e:
             code = 401 if e.code == AUTH_REQUIRED else 502
@@ -1049,6 +1258,29 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(500, {"error": repr(e)})
             except OSError:
                 return None
+
+    def query(self, name):
+        vals = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query, keep_blank_values=True).get(name)
+        return vals[0] if vals else None
+
+    def gamut_messages_after(self, path, after):
+        q = [(k, v) for k, v in urllib.parse.parse_qsl(urllib.parse.urlsplit(self.path).query, keep_blank_values=True)
+             if k != "after"]
+        url = GAMUT + path + ("?" + urllib.parse.urlencode(q) if q else "")
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                data = json.load(r)
+        except urllib.error.HTTPError as e:
+            body = e.read()
+            try:
+                return self.reply(e.code, json.loads(body))
+            except ValueError:
+                return self.reply(e.code, {"error": body.decode(errors="replace")[:300]})
+        msgs = data.get("messages") if isinstance(data, dict) else data
+        if not isinstance(msgs, list):
+            return self.reply(502, {"error": "Gamut returned no message list"})
+        return self.reply(200, messages_after(msgs, after))
 
     def agents(self):
         out = []
@@ -1083,20 +1315,24 @@ class Handler(BaseHTTPRequestHandler):
         if rest == ["gamut-reaper"]:
             s = suite()
             if method == "GET":
-                slug = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query).get("agent", [""])[0]
+                slug = self.query("agent") or ""
+                if slug and not safe_id(slug):
+                    return self.reply(400, {"error": "bad agent id"})
                 return self.reply(200, {"registered": bool(s.gamut_reaper_id()),
                                         "enabled": bool(slug) and s.gamut_reaper_enabled(slug)})
             if method == "POST" and self.json.get("agent"):
+                if not safe_id(self.json["agent"]):
+                    return self.reply(400, {"error": "bad agent id"})
                 return self.reply(200, {"status": s.gamut_enable(s.Paths(), self.json["agent"])})
         return self.reply(404, {"error": "unknown hibiki route"})
 
     def acp_route(self, method, a, rest):
         b = self.json
         if method == "GET" and rest == ["status"]:
-            if "probe=1" in self.path and not a.connected and a.state in ("stopped", "ready", "error"):
-                threading.Thread(target=a.probe, daemon=True).start()
-            return self.reply(200, {"state": "starting" if a.probing else a.state, "connected": a.connected,
-                                    "error": a.error, "authMethods": a.auth_methods})
+            probe = self.query("probe")
+            if probe in (a.slug, a.spec["slug"]):
+                a.probe()
+            return self.reply(200, a.status())
         if method == "POST" and rest == ["auth"]:
             threading.Thread(target=a.authenticate, args=(b.get("methodId"),), daemon=True).start()
             return self.reply(202, {"state": "authenticating"})
@@ -1128,7 +1364,8 @@ class Handler(BaseHTTPRequestHandler):
             if method == "GET" and tail == ["messages"]:
                 with s.lock:
                     msgs = list(s.msgs)
-                return self.reply(200, msgs)
+                after = self.query("after")
+                return self.reply(200, msgs if after is None else messages_after(msgs, after))
             if method == "POST" and tail == ["messages"]:
                 text = str(b.get("content") or "").strip()
                 if not text:
@@ -1249,6 +1486,18 @@ def main():
     GW = Gateway()
     srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     srv.daemon_threads = True
+    threading.Thread(target=GW.reaper, daemon=True).start()
+
+    def stop(*_):
+        GW.shutdown()  # the agents and their MCP servers go with the gateway
+        os._exit(0)
+    import signal
+    for sig in ("SIGTERM", "SIGINT", "SIGHUP"):
+        if hasattr(signal, sig):
+            try:
+                signal.signal(getattr(signal, sig), stop)
+            except (OSError, ValueError):
+                pass
     log("agent gateway on 127.0.0.1:%d, gamut %s, acp: %s" % (PORT, GAMUT, ", ".join(GW.acp) or "none"))
     srv.serve_forever()
 

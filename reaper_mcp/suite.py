@@ -72,13 +72,16 @@ do
 end""",)
 LEGACY_PANEL_DIRS = ("GamutChat",)
 
+# exact versions; bump deliberately. Only minimax runs install scripts: better-sqlite3 fetches its native
+# binding and @vscode/ripgrep fetches rg. kimi's postinstall only renames a legacy shim and node-pty ships
+# darwin/win32 prebuilds; grok's launcher unpacks its binary on first run.
 ACP_AGENTS = {
-    "codex": {"package": "@agentclientprotocol/codex-acp", "bin": "codex-acp", "args": [],
+    "codex": {"package": "@agentclientprotocol/codex-acp", "version": "2.2.2", "bin": "codex-acp", "args": [],
               "name": "Codex", "description": "OpenAI Codex CLI over ACP"},
-    "claude": {"package": "@agentclientprotocol/claude-agent-acp", "bin": "claude-agent-acp", "args": [],
+    "claude": {"package": "@agentclientprotocol/claude-agent-acp", "version": "0.94.0", "bin": "claude-agent-acp", "args": [],
                "name": "Claude Code", "description": "Claude Code (Claude Agent SDK) over ACP; uses the local claude login",
                "path_extra": ["~/.local/bin"]},
-    "kimi": {"package": "@moonshot-ai/kimi-code", "bin": "kimi", "args": ["acp"], "allow_scripts": "@moonshot-ai/kimi-code,node-pty",
+    "kimi": {"package": "@moonshot-ai/kimi-code", "version": "2.3.0", "bin": "kimi", "args": ["acp"],
              "name": "Kimi", "description": "Kimi Code CLI over ACP; uses the Kimi Code subscription login",
              "loginVariants": [
                  {"id": "global", "name": "Log in with kimi.ai", "description": "International account (kimi.ai)",
@@ -86,7 +89,8 @@ ACP_AGENTS = {
                  {"id": "cn", "name": "Log in with kimi.com", "description": "Mainland China account (kimi.com)",
                   "args": ["--region", "mainland-cn"]}]},
     # declares no ACP auth method; its login is `mcode acp login [--region global]`
-    "minimax": {"package": "@minimax-ai/code", "bin": "mcode", "args": ["acp"], "allow_scripts": "@minimax-ai/code",
+    "minimax": {"package": "@minimax-ai/code", "version": "0.6.12", "bin": "mcode", "args": ["acp"],
+                "allow_scripts": "@minimax-ai/code,better-sqlite3,@vscode/ripgrep",
                 "name": "MiniMax", "description": "MiniMax Code CLI over ACP; uses your MiniMax account",
                 "terminalLogin": {"id": "login", "name": "Log in", "args": ["login"]},
                 "loginVariants": [
@@ -95,8 +99,8 @@ ACP_AGENTS = {
                     {"id": "cn", "name": "Log in (China)", "description": "Mainland China account (minimaxi.com)",
                      "args": []}]},
     # signs in through the browser itself (ACP auth method grok.com); needs SuperGrok / X Premium+ or XAI_API_KEY
-    "grok": {"package": "@xai-official/grok", "bin": "grok", "args": ["--no-auto-update", "agent", "stdio"],
-             "allow_scripts": "@xai-official/grok", "name": "Grok",
+    "grok": {"package": "@xai-official/grok", "version": "1.0.67", "bin": "grok",
+             "args": ["--no-auto-update", "agent", "stdio"], "name": "Grok",
              "description": "xAI's Grok Build over ACP; SuperGrok or X Premium+ (beta)"},
 }
 
@@ -370,17 +374,24 @@ def remove_startup(p: Paths) -> None:
 
 # ---------- token, MCP, gateway ----------
 
+MIN_TOKEN = 32
+
+
 def ensure_token(p: Paths) -> str:
     p.cfg.mkdir(parents=True, exist_ok=True)
     os.chmod(p.cfg, 0o700)
-    if p.token.exists() and p.token.read_text().strip():
-        os.chmod(p.token, 0o600)
-        return p.token.read_text().strip()
+    if p.token.exists():
+        token = p.token.read_text().strip()
+        if len(token) >= MIN_TOKEN:
+            os.chmod(p.token, 0o600)
+            return token
+        if token:
+            say("  the MCP bearer is shorter than %d characters; replacing it (clients get the new one)" % MIN_TOKEN)
     token = ""
     env = p.cfg / "env"  # written by scripts/macos-host-bootstrap.sh; clients already hold this bearer
     if env.exists():
         m = re.search(r"^REAPER_MCP_BEARER=(\S+)", env.read_text(), re.M)
-        token = m.group(1) if m else ""
+        token = m.group(1) if m and len(m.group(1)) >= MIN_TOKEN else ""
     token = token or secrets.token_urlsafe(32)
     fd = os.open(str(p.token), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -508,7 +519,7 @@ def win_services_stop(p: Paths, forget: bool = False) -> bool:
     return bool(pid)
 
 
-def win_services_start(p: Paths) -> bool:
+def win_services_start(p: Paths, wait: bool = True) -> bool:
     p.logs.mkdir(parents=True, exist_ok=True)
     if no_services():
         return True
@@ -523,6 +534,8 @@ def win_services_start(p: Paths) -> bool:
         subprocess.Popen(cmd, creationflags=flags | subprocess.CREATE_BREAKAWAY_FROM_JOB, **io)
     except OSError:
         subprocess.Popen(cmd, creationflags=flags, **io)
+    if not wait:
+        return True
     ok = wait_http("http://127.0.0.1:%d/healthz" % port(), 20)
     say("  MCP on 127.0.0.1:%d: %s" % (port(), "up" if ok else "NOT answering, see %s" % (p.logs / "reaper-mcp.log")))
     gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT, 10)
@@ -761,8 +774,11 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
             cmd.append("--prefix=" + str(p.node))
         if a.get("allow_scripts"):
             cmd.append("--allow-scripts=" + a["allow_scripts"])
-        say("  npm install %s" % a["package"])
-        subprocess.run(cmd + [a["package"]], env=env, check=True)
+        else:
+            cmd.append("--ignore-scripts")
+        spec = "%s@%s" % (a["package"], a["version"])
+        say("  npm install %s" % spec)
+        subprocess.run(cmd + [spec], env=env, check=True)
         path = os.pathsep.join([str(bin_dir)] + [str(Path(x).expanduser()) for x in a.get("path_extra", [])]
                                + system_dirs)
         entry = {"slug": slug, "name": a["name"], "description": a["description"],
@@ -951,6 +967,197 @@ def cmd_uninstall(a) -> int:
     return 0
 
 
+# ---------- recover ----------
+
+PANEL_STREAM_AGENTS = ("HibikiPanel", "GamutChatPanel")  # the panel's SSE curl user agent, now and before the rename
+RECOVER_WAIT = 10.0
+
+
+def service_pid(label: str) -> int:
+    """PID launchd reports for a loaded job, or 0."""
+    try:
+        out = subprocess.run(["launchctl", "print", "%s/%s" % (domain(), label)], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    m = re.search(r"^\s*pid = (\d+)", out, re.M)
+    return int(m.group(1)) if m else 0
+
+
+def ps_table() -> dict:
+    """pid -> parent pid for every process."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="], capture_output=True, text=True,
+                             timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    table = {}
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) == 2 and f[0].isdigit() and f[1].isdigit():
+            table[int(f[0])] = int(f[1])
+    return table
+
+
+def child_pids(pid: int, table: dict | None = None) -> list:
+    """Every process below `pid` (the gateway's ACP agents and their MCP servers)."""
+    kids: dict = {}
+    for c, parent in (ps_table() if table is None else table).items():
+        kids.setdefault(parent, []).append(c)
+    found, todo = [], [pid]
+    while todo:
+        for c in kids.get(todo.pop(), []):
+            if c not in found:
+                found.append(c)
+                todo.append(c)
+    return found
+
+
+def kill_pids(pids: list) -> int:
+    import signal
+    n = 0
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+            n += 1
+        except OSError:
+            pass
+    return n
+
+
+def restart_services(p: Paths) -> tuple:
+    if WINDOWS:
+        win_services_start(p, wait=False)  # taskkill /T on the supervisor takes the gateway's agents with it
+        return True, "restarted the supervisor (MCP + gateway)"
+    if no_launchd():
+        return True, "no launchd here; nothing to restart"
+    jobs = {MCP_LABEL: [sys.executable, str(ROOT / "reaper_mcp/http_server.py")],
+            GW_LABEL: [sys.executable, str(ROOT / "gateway/agent_gateway.py")]}
+    old, notes, ok = [], [], True
+    for label, args in jobs.items():
+        pid = service_pid(label)
+        if pid:
+            old += child_pids(pid)
+        if p.plist(label).exists() and loaded(label):
+            try:
+                rc = subprocess.run(["launchctl", "kickstart", "-k", "%s/%s" % (domain(), label)],
+                                    capture_output=True, timeout=10).returncode
+            except (OSError, subprocess.SubprocessError):
+                rc = -1
+            notes.append("%s %s" % (label.split(".")[-1], "restarted" if rc == 0 else "restart failed (%s)" % rc))
+            ok = ok and rc == 0
+        else:
+            env = {"REAPER_MCP_PORT": str(port())} if label == MCP_LABEL else None
+            start_agent(p, label, args, env, KeepAlive=True, WorkingDirectory=str(ROOT))
+            notes.append("%s started" % label.split(".")[-1])
+    time.sleep(0.5)
+    table = ps_table()
+    current = set()
+    for label in jobs:
+        pid = service_pid(label)
+        if pid:
+            current.update([pid] + child_pids(pid, table))
+    killed = kill_pids([pid for pid in old if pid in table and pid not in current])
+    if killed:
+        notes.append("stopped %d leftover agent/MCP process%s" % (killed, "" if killed == 1 else "es"))
+    return ok, ", ".join(notes)
+
+
+def kill_panel_streams() -> tuple:
+    if WINDOWS:
+        filt = " -or ".join("$_.CommandLine -like '*-A %s*'" % ua for ua in PANEL_STREAM_AGENTS)
+        ps = ("$p = Get-CimInstance Win32_Process -Filter \"Name='curl.exe'\" | Where-Object { %s }; "
+              "$p | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
+              "@($p).Count" % filt)
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", ps], capture_output=True,
+                                 text=True, timeout=10).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as e:
+            return False, "could not list curl processes: %s" % e
+        n = int(out) if out.isdigit() else 0
+    else:
+        n = 0
+        for ua in PANEL_STREAM_AGENTS:
+            pattern = "curl -s -N -A %s" % ua
+            try:
+                found = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5).stdout.split()
+                if found:
+                    subprocess.run(["pkill", "-f", pattern], capture_output=True, timeout=5)
+            except (OSError, subprocess.SubprocessError):
+                found = []
+            n += len(found)
+    return True, "killed %d panel stream%s" % (n, "" if n == 1 else "s") if n else "none running"
+
+
+def repair_files(p: Paths) -> tuple:
+    fixed = []
+    if not (p.scripts / "reaper_mcp_bridge.lua").exists():
+        install_bridge(p)
+        fixed.append("bridge script")
+    if not (p.scripts / "Hibiki/Hibiki.lua").exists():
+        install_panel(p)
+        fixed.append("panel")
+    if not p.token.exists() or len(p.token.read_text().strip()) < MIN_TOKEN:
+        ensure_token(p)
+        fixed.append("token")
+    return True, "restored " + ", ".join(fixed) if fixed else "all present"
+
+
+def cmd_recover(a) -> int:
+    """The panel's Recover button: restart the services, drop stuck streams, report what answers. Never kills REAPER."""
+    import contextlib
+    import io
+    p = Paths(getattr(a, "resource_path", None))
+    steps = []
+
+    def step(name: str, fn) -> None:
+        try:
+            ok, detail = fn()
+        except BaseException as e:  # noqa: BLE001 - one failed step must not hide the others
+            ok, detail = False, str(e) or repr(e)
+        steps.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    def wait_services() -> tuple:
+        deadline = time.time() + RECOVER_WAIT
+        mcp = gw = False
+        while True:
+            mcp = mcp or wait_http("http://127.0.0.1:%d/healthz" % port(), 0)
+            gw = gw or wait_http("http://127.0.0.1:%d/health" % GW_PORT, 0)
+            if (mcp and gw) or time.time() > deadline:
+                break
+            time.sleep(0.5)
+        steps.append({"name": "MCP http", "ok": mcp, "detail": "127.0.0.1:%d %s" % (port(), "answers" if mcp else
+                      "no answer - see %s" % (p.logs / "reaper-mcp.log"))})
+        return gw, "127.0.0.1:%d %s" % (GW_PORT, "answers" if gw else "no answer - see %s" % (p.logs / "agent-gateway.log"))
+
+    def bridge() -> tuple:
+        hb = p.ipc / "heartbeat"
+        if not hb.exists():
+            return False, "bridge never seen: start REAPER"
+        age = time.time() - hb.stat().st_mtime
+        if age < 5:
+            return True, "bridge alive (heartbeat %.1fs old)" % age
+        return False, ("bridge stale (heartbeat %.0fs old): REAPER busy or hung; the watchdog restarts a hung REAPER"
+                       % age)
+
+    sink = sys.stderr if (a.json and sys.stderr) else (io.StringIO() if a.json else sys.stdout)
+    with contextlib.redirect_stdout(sink):
+        step("files", lambda: repair_files(p))
+        step("restart services", lambda: restart_services(p))
+        step("panel streams", kill_panel_streams)
+        step("agent gateway", wait_services)
+        step("REAPER bridge", bridge)
+    up = {s["name"]: s["ok"] for s in steps}
+    ok = up.get("MCP http", False) and up.get("agent gateway", False)
+    if a.json:
+        print(json.dumps({"ok": ok, "steps": steps}))
+    else:
+        for s_ in steps:
+            print("%-4s %-17s %s" % ("ok" if s_["ok"] else "FAIL", s_["name"], s_["detail"]))
+        print("recovered" if ok else "not recovered: see the FAIL lines")
+    return 0 if ok else 1
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hibiki", description="REAPER MCP, Hibiki panel and agent gateway.")
     sub = ap.add_subparsers(dest="cmd")
@@ -977,6 +1184,10 @@ def parser() -> argparse.ArgumentParser:
     g.add_argument("action", choices=["add"])
     g.add_argument("agents", nargs="+", metavar="|".join(ACP_AGENTS))
     g.set_defaults(fn=cmd_agents)
+    rc = sub.add_parser("recover", help="restart the MCP and gateway, drop stuck panel streams, report (REAPER untouched)")
+    rc.add_argument("--resource-path")
+    rc.add_argument("--json", action="store_true")
+    rc.set_defaults(fn=cmd_recover)
     u = sub.add_parser("uninstall", help="remove this user's install")
     u.add_argument("--resource-path")
     u.add_argument("--purge", action="store_true", help="also delete tokens, gateway config and ACP transcripts")

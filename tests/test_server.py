@@ -97,6 +97,79 @@ def check_batch_timeout():
     assert calls[2] == {"func": "save_project", "args": ["/tmp/song.RPP"]}, calls[2]
     return True
 
+FAKE_CHILD = r"""
+import json, sys, time
+for line in sys.stdin:
+    msg = json.loads(line)
+    if msg.get("method") == "hang":
+        time.sleep(60)
+    if msg.get("id") is None:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": "stray", "result": {}}) + "\n")
+    sys.stdout.write("not json\n")
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": {"echo": msg.get("method")}}) + "\n")
+    sys.stdout.flush()
+"""
+
+
+def check_http_front(env):
+    """The HTTP front's stdio client: matches replies by id, times out and restarts, answers tools/list unlocked."""
+    from reaper_mcp import http_server
+
+    results = {}
+    fake = http_server.StdioClient([sys.executable, "-c", FAKE_CHILD])
+    r = fake.rpc({"jsonrpc": "2.0", "id": 7, "method": "tools/call", "params": {"name": "status"}})
+    results["stray lines dropped, reply matched by id"] = r == {"jsonrpc": "2.0", "id": 7, "result": {"echo": "tools/call"}}
+    first = fake.proc
+    t0 = time.monotonic()
+    try:
+        fake.rpc({"jsonrpc": "2.0", "id": 8, "method": "hang"}, timeout=1.0)
+        results["hung child times out"] = False
+    except TimeoutError:
+        results["hung child times out"] = time.monotonic() - t0 < 5
+    results["hung child killed"] = first.poll() is not None
+    r = fake.rpc({"jsonrpc": "2.0", "id": 9, "method": "x"})
+    results["next call restarts the child"] = r["id"] == 9 and fake.proc is not first
+
+    def hang():
+        try:
+            fake.rpc({"jsonrpc": "2.0", "id": 10, "method": "hang"}, timeout=3.0)
+        except TimeoutError:
+            pass
+    hold = threading.Thread(target=hang, daemon=True)
+    hold.start()
+    time.sleep(0.3)
+    t0 = time.monotonic()
+    tl = fake.rpc({"jsonrpc": "2.0", "id": 11, "method": "tools/list"})
+    init = fake.rpc({"jsonrpc": "2.0", "id": 12, "method": "initialize", "params": {}})
+    results["tools/list + initialize answered while a call holds the lock"] = (
+        time.monotonic() - t0 < 1 and len(tl["result"]["tools"]) >= 8 and tl["id"] == 11
+        and init["result"]["serverInfo"]["name"] == "reaper-mcp")
+    results["notifications answered locally"] = fake.rpc({"jsonrpc": "2.0", "method": "notifications/initialized"}) is None
+    hold.join()
+    fake._kill()
+
+    old_env = dict(os.environ)
+    os.environ.update(env)
+    try:
+        real = http_server.StdioClient()
+        real.rpc({"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "status", "arguments": {}}})
+        real.rpc({"jsonrpc": "2.0", "method": "ping"})
+        r = real.rpc({"jsonrpc": "2.0", "id": "a1", "method": "tools/call", "params": {"name": "status", "arguments": {}}})
+        results["id-less calls then an id'd call: the right reply"] = r.get("id") == "a1" and "Drums" in r["result"]["content"][0]["text"]
+        r = real.rpc({"jsonrpc": "2.0", "id": "n1", "method": "notifications/cancelled"}, timeout=5)
+        results["notification carrying an id is answered, not hung"] = r == {"jsonrpc": "2.0", "id": "n1", "result": {}}
+        real._kill()
+    finally:
+        os.environ.clear()
+        os.environ.update(old_env)
+
+    import subprocess as sp
+    short = sp.run([sys.executable, os.path.join(ROOT, "reaper_mcp", "http_server.py")], capture_output=True, text=True,
+                   env=dict(os.environ, REAPER_MCP_BEARER="short", REAPER_MCP_PORT="0"), timeout=30)
+    results["short bearer refused at startup"] = short.returncode != 0 and "at least 32" in short.stderr
+    return results
+
 
 def fake_bridge(bridge_dir, stop):
     req = os.path.join(bridge_dir, "request.json")
@@ -288,6 +361,13 @@ def main():
         body = json.loads(r["result"]["content"][0]["text"])  # the fake bridge echoes funcs, it doesn't run Lua
         check("batch: a bad slot doesn't abort the rest", not r["result"].get("isError")
               and len(body) == 2 and body[0]["echo"] == "run_lua")
+
+        rpc(proc, {"jsonrpc": "2.0", "method": "ping"})
+        rpc(proc, {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "status", "arguments": {}}})
+        r = rpc(proc, {"jsonrpc": "2.0", "id": 13, "method": "ping"})
+        check("stdio: id-less messages get no reply line", r.get("id") == 13 and r.get("result") == {})
+        for label, ok in check_http_front(env).items():
+            check("http front: " + label, ok)
 
         proc.stdin.write("[1, 2]\n")
         proc.stdin.flush()

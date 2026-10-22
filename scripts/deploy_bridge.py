@@ -11,7 +11,7 @@ file on a timer so the request that triggered the swap still gets answered.
     python3 scripts/deploy_bridge.py restart  # bounce the HTTP front so it loads the new server.py
     python3 scripts/deploy_bridge.py verify   # confirm which build is live
 
-Needs REAPER_MCP_HOSTNAME / REAPER_MCP_BEARER (or -H / -T).
+Needs REAPER_MCP_HOSTNAME (or -H) and REAPER_MCP_BEARER in the environment.
 """
 
 from __future__ import annotations
@@ -240,8 +240,12 @@ def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("action", choices=["stage", "swap", "restart", "verify"])
     ap.add_argument("-H", "--hostname", default=os.environ.get("REAPER_MCP_HOSTNAME"))
-    ap.add_argument("-T", "--bearer", default=os.environ.get("REAPER_MCP_BEARER"))
+    ap.add_argument("-T", "--bearer", help="deprecated: argv is visible to other users via ps; use REAPER_MCP_BEARER")
     a = ap.parse_args()
+    if a.bearer:
+        print("warning: -T puts the bearer on the command line; set REAPER_MCP_BEARER instead", file=sys.stderr)
+    else:
+        a.bearer = os.environ.get("REAPER_MCP_BEARER")
     if not a.hostname or not a.bearer:
         raise SystemExit("set REAPER_MCP_HOSTNAME and REAPER_MCP_BEARER")
     fn = {"stage": stage, "swap": swap, "restart": restart, "verify": verify}[a.action]

@@ -1,7 +1,8 @@
 #!/bin/bash
 # Remote host: make REAPER on this Mac reachable from an agent elsewhere through a Cloudflare named tunnel.
 # Installs the suite from a clone (~/reaper-mcp) with the given bearer, then cloudflared as a LaunchAgent.
-# Needs REAPER_MCP_BEARER and CLOUDFLARE_TUNNEL_TOKEN (env or ~/.config/reaper-mcp/env). See docs/remote-host.md.
+# Needs CLOUDFLARE_TUNNEL_TOKEN (env or ~/.config/reaper-mcp/env). REAPER_MCP_BEARER (>= 32 characters) is kept if
+# given, otherwise generated. See docs/remote-host.md.
 set -euo pipefail
 mkdir -p "$HOME/Library/Logs"
 exec > >(tee -a "$HOME/Library/Logs/reaper-mcp-bootstrap.log") 2>&1
@@ -22,15 +23,32 @@ if [ -f "$CFG/env" ]; then
   . "$CFG/env"
   set +a
 fi
-: "${REAPER_MCP_BEARER:?set REAPER_MCP_BEARER}"
+if [ -z "${REAPER_MCP_BEARER:-}" ]; then
+  REAPER_MCP_BEARER=$(/usr/bin/python3 -c 'import secrets; print(secrets.token_urlsafe(32))')
+  echo "generated a new REAPER_MCP_BEARER (saved to $CFG/token)"
+fi
+if [ "${#REAPER_MCP_BEARER}" -lt 32 ]; then
+  echo "REAPER_MCP_BEARER must be at least 32 characters; unset it to have one generated" >&2
+  exit 1
+fi
 : "${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN}"
 REAPER_MCP_PORT="${REAPER_MCP_PORT:-8787}"
 
+CLOUDFLARED_VERSION=2026.10.3
 if [ ! -x "$BIN/cloudflared" ]; then
-  echo "installing cloudflared"
+  echo "installing cloudflared $CLOUDFLARED_VERSION"
   tmp=$(mktemp -d)
-  ARCH=$(uname -m); [ "$ARCH" = arm64 ] || ARCH=amd64
-  curl -fL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-darwin-$ARCH.tgz" -o "$tmp/cf.tgz"
+  if [ "$(uname -m)" = arm64 ]; then
+    ARCH=arm64; SHA=1165d14b6f6360a3b8c283d7d1100024d6ec7cd9bc9e32519e96150645f3ec55
+  else
+    ARCH=amd64; SHA=81b7b85f2376815c4f59b1aa323887b62e16ce8b67555c2e1577dc23f2a82000
+  fi
+  curl -fL "https://github.com/cloudflare/cloudflared/releases/download/$CLOUDFLARED_VERSION/cloudflared-darwin-$ARCH.tgz" -o "$tmp/cf.tgz"
+  if [ "$(shasum -a 256 "$tmp/cf.tgz" | awk '{print $1}')" != "$SHA" ]; then
+    echo "cloudflared download failed its sha256 check" >&2
+    rm -rf "$tmp"
+    exit 1
+  fi
   tar -xzf "$tmp/cf.tgz" -C "$tmp"
   cp "$(find "$tmp" -type f -name 'cloudflared*' | head -1)" "$BIN/cloudflared"
   chmod +x "$BIN/cloudflared"

@@ -19,13 +19,11 @@ case "$USER_NAME" in
     exit 0 ;;
 esac
 USER_ID=$(id -u "$USER_NAME")
-USER_HOME=$(dscl . -read "/Users/$USER_NAME" NFSHomeDirectory | awk '{print $2}')
-mkdir -p "$USER_HOME/Library/Logs" && chown "$USER_NAME" "$USER_HOME/Library/Logs"
-echo "setup for $USER_NAME ($USER_ID)"
-ULOG="$USER_HOME/Library/Logs/hibiki-install.log"
-launchctl asuser "$USER_ID" sudo -u "$USER_NAME" -H "$APP/bin/hibiki" setup > "$ULOG" 2>&1
+echo "setup for $USER_NAME ($USER_ID); log: ~$USER_NAME/Library/Logs/hibiki-install.log"
+# root never creates, writes or chowns anything in the user's home: the user-side shell opens its own log
+launchctl asuser "$USER_ID" sudo -u "$USER_NAME" -H /bin/sh -c \
+  'mkdir -p "$HOME/Library/Logs" && exec "$1" setup > "$HOME/Library/Logs/hibiki-install.log" 2>&1' \
+  sh "$APP/bin/hibiki"
 rc=$?
-chown "$USER_NAME" "$ULOG"
-cat "$ULOG"
 echo "setup exit $rc"
 exit $rc

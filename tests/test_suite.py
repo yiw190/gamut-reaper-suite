@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 STARTUP = (ROOT / "reaper" / "__startup.lua").read_text()
+OLD_BEARER = "old-bearer-0123456789abcdefghijklmnopqrstu"
 
 
 class FakeGamut(BaseHTTPRequestHandler):
@@ -107,7 +108,7 @@ def main():
     (scripts / "__startup.lua").write_text("-- my own thing\nreaper.ShowConsoleMsg('hi')\n\n" + STARTUP)
     (res / "UserPlugins/reaper_imgui-arm64.dylib").write_bytes(b"x")
     shim(res)
-    (home / ".config/reaper-mcp/env").write_text("REAPER_MCP_BEARER=oldbearer\nREAPER_MCP_PORT=8787\n")
+    (home / ".config/reaper-mcp/env").write_text("REAPER_MCP_BEARER=%s\nREAPER_MCP_PORT=8787\n" % OLD_BEARER)
     for old in ("com.yitian.reaper-mcp", "com.yitian.reaper-watchdog", "com.yitian.cloudflared-reaper"):
         with open(la / (old + ".plist"), "wb") as f:
             plistlib.dump({"Label": old, "ProgramArguments": ["/usr/bin/true"]}, f)
@@ -116,7 +117,7 @@ def main():
         "mcpServers": [{"name": "reaper", "command": "/usr/bin/python3", "args": ["/old/python/server.py"]},
                        {"name": "other", "command": "y"}]}))
     FakeGamut.servers = [{"id": "s0", "name": "reaper-mcp", "url": "http://localhost:8787/mcp",
-                          "authType": "bearer", "accessToken": "oldbearer"}]
+                          "authType": "bearer", "accessToken": OLD_BEARER}]
 
     rc, out = run(home, "setup", gamut=gamut)
     check("setup exits 0", rc == 0, out)
@@ -130,7 +131,7 @@ def main():
     check("startup: user's own lines kept", hook.startswith("-- my own thing\nreaper.ShowConsoleMsg('hi')\n"), hook)
     check("startup backup written", (scripts / "__startup.lua.bak").exists())
     tok = home / ".config/reaper-mcp/token"
-    check("token reuses the bearer clients already hold", tok.read_text().strip() == "oldbearer")
+    check("token reuses the bearer clients already hold", tok.read_text().strip() == OLD_BEARER)
     check("token is 0600", tok.stat().st_mode & 0o777 == 0o600)
     check("legacy MCP + watchdog LaunchAgents removed",
           not (la / "com.yitian.reaper-mcp.plist").exists() and not (la / "com.yitian.reaper-watchdog.plist").exists())
@@ -138,7 +139,7 @@ def main():
     mcp = plistlib.loads((la / "com.hibiki.reaper-mcp.plist").read_bytes())
     check("MCP LaunchAgent runs reaper_mcp/http_server.py with this python",
           mcp["ProgramArguments"] == [sys.executable, str(ROOT / "reaper_mcp/http_server.py")], str(mcp))
-    check("no secret in the MCP plist", "oldbearer" not in (la / "com.hibiki.reaper-mcp.plist").read_text())
+    check("no secret in the MCP plist", OLD_BEARER not in (la / "com.hibiki.reaper-mcp.plist").read_text())
     check("gateway LaunchAgent written", (la / "com.hibiki.agent-gateway.plist").exists())
     check("watchdog kept on (it was on before)", (la / "com.hibiki.reaper-watchdog.plist").exists())
     gw = json.loads((home / ".config/agent-gateway/config.json").read_text())
@@ -146,7 +147,7 @@ def main():
           gw["mcpServers"][0]["args"] == [str(ROOT / "reaper_mcp/server.py")]
           and [s["name"] for s in gw["mcpServers"]] == ["reaper", "other"] and gw["acp"][0]["slug"] == "codex", str(gw))
     check("Gamut: existing registration updated, not duplicated",
-          len(FakeGamut.servers) == 1 and FakeGamut.servers[0]["accessToken"] == "oldbearer", str(FakeGamut.servers))
+          len(FakeGamut.servers) == 1 and FakeGamut.servers[0]["accessToken"] == OLD_BEARER, str(FakeGamut.servers))
     cd = json.loads((home / "Library/Application Support/Claude/claude_desktop_config.json").read_text())
     check("Claude Desktop registered (stdio)", cd["mcpServers"]["reaper"]["args"] == [str(ROOT / "reaper_mcp/server.py")])
     check("Cursor registered", "reaper" in json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"])
@@ -196,6 +197,10 @@ def main():
     t = (fresh / ".config/reaper-mcp/token").read_text().strip()
     check("fresh Mac: new random token, hook created", rc == 0 and len(t) >= 40
           and "-- >>> hibiki" in (fresh / "Library/Application Support/REAPER/Scripts/__startup.lua").read_text(), out)
+    (fresh / ".config/reaper-mcp/token").write_text("short\n")
+    rc, out = run(fresh, "setup", "--no-connect")
+    t2 = (fresh / ".config/reaper-mcp/token").read_text().strip()
+    check("a bearer under 32 characters is replaced", rc == 0 and len(t2) >= 40 and t2 != "short", out)
     check("fresh Mac: watchdog stays off", not (fresh / "Library/LaunchAgents/com.hibiki.reaper-watchdog.plist").exists())
 
     # the Mac before the Hibiki rename: the suite's own LaunchAgents under its old name, the hand-copied v0.3 hook
@@ -227,11 +232,115 @@ def main():
     check("rename: old panel folder gone, new one installed",
           not (ores / "Scripts/GamutChat").exists() and (ores / "Scripts/Hibiki/Hibiki.lua").exists(), out)
 
+    import re
+    check("ACP agents: every npm package pinned to an exact version",
+          all(re.match(r"^\d+\.\d+\.\d+$", a.get("version", "")) for a in suite.ACP_AGENTS.values()), str(suite.ACP_AGENTS))
+    calls = []
+    real_run, real_node, real_write = suite.subprocess.run, suite.ensure_node, suite.write_json
+    suite.subprocess.run = lambda cmd, **kw: calls.append(cmd)
+    suite.ensure_node = lambda p_: Path("/nonexistent/node/bin")
+    suite.write_json = lambda *a, **kw: None
+    try:
+        suite.agents_add(suite.Paths(), ["codex", "minimax"], restart=False)
+    finally:
+        suite.subprocess.run, suite.ensure_node, suite.write_json = real_run, real_node, real_write
+    check("ACP agents: npm installs the pinned spec, scripts off unless the package needs them",
+          len(calls) == 2 and calls[0][-1] == "@agentclientprotocol/codex-acp@2.2.2" and "--ignore-scripts" in calls[0]
+          and calls[1][-1].startswith("@minimax-ai/code@") and "--ignore-scripts" not in calls[1], str(calls))
+
+    check_recover(check, suite)
+
     httpd.shutdown()
     if failures:
         print("FAILED", failures)
         sys.exit(1)
     print("all passed")
+
+
+def check_recover(check, suite):
+    """`hibiki recover --json` with launchctl, ps, pkill and the HTTP checks faked."""
+    import contextlib
+    import io
+    home = Path(tempfile.mkdtemp(prefix="grs_recover_"))
+    res = home / "Library/Application Support/REAPER"
+    (res / "Scripts").mkdir(parents=True)
+    (home / "Library/LaunchAgents").mkdir(parents=True)
+    for label in (suite.MCP_LABEL, suite.GW_LABEL):
+        (home / "Library/LaunchAgents" / (label + ".plist")).write_bytes(b"x")
+    ipc = home / "ipc"
+    ipc.mkdir()
+    (ipc / "heartbeat").write_text("1")
+    os.utime(ipc / "heartbeat", (1, 1))
+    calls, killed = [], []
+    restarted = {"done": False}
+    gw_pid = {suite.MCP_LABEL: "100", suite.GW_LABEL: "200"}
+
+    class R:
+        def __init__(self, out="", rc=0):
+            self.stdout, self.returncode = out, rc
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if cmd[:2] == ["launchctl", "print"]:
+            label = cmd[2].split("/")[-1]
+            pid = gw_pid[label] if not restarted["done"] else str(int(gw_pid[label]) + 1000)
+            return R("state = running\n\tpid = %s\n" % pid)
+        if cmd[:3] == ["launchctl", "kickstart", "-k"]:
+            if cmd[3].endswith(suite.GW_LABEL):
+                restarted["done"] = True
+            return R()
+        if cmd[0] == "ps":
+            if not restarted["done"]:
+                return R(" 100 1\n 101 100\n 200 1\n 201 200\n 202 201\n")
+            return R(" 1100 1\n 1101 1100\n 1200 1\n 201 1\n 202 201\n")
+        if cmd[0] == "pgrep":
+            return R("555\n" if "HibikiPanel" in cmd[-1] else "")
+        return R()
+
+    saved = {k: getattr(suite, k) for k in ("no_launchd", "domain", "wait_http", "kill_pids", "WINDOWS", "loaded")}
+    real_run = suite.subprocess.run
+    env_saved = {k: os.environ.get(k) for k in ("HOME", "REAPER_MCP_IPC_DIR")}
+    os.environ["HOME"], os.environ["REAPER_MCP_IPC_DIR"] = str(home), str(ipc)
+    suite.no_launchd, suite.domain, suite.WINDOWS = (lambda: False), (lambda: "gui/501"), False
+    suite.loaded = lambda label: True
+    suite.wait_http = lambda url, seconds=10: True
+    suite.kill_pids = lambda pids: killed.extend(pids) or len(pids)
+    suite.subprocess.run = fake_run
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc = suite.main(["recover", "--json"])
+    finally:
+        suite.subprocess.run = real_run
+        for k, v in saved.items():
+            setattr(suite, k, v)
+        for k, v in env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    try:
+        r = json.loads(out.getvalue())
+    except ValueError:
+        r = {}
+    steps = {x["name"]: x for x in r.get("steps", [])}
+    check("recover --json: stdout is one JSON object with ok + steps", r.get("ok") is True and rc == 0
+          and all(set(x) == {"name", "ok", "detail"} for x in r.get("steps", [])), out.getvalue())
+    check("recover: kickstart -k for the MCP and the gateway",
+          ["launchctl", "kickstart", "-k", "gui/501/" + suite.MCP_LABEL] in calls
+          and ["launchctl", "kickstart", "-k", "gui/501/" + suite.GW_LABEL] in calls, str(calls))
+    check("recover: the old gateway's orphaned agents are killed, the new ones kept",
+          sorted(killed) == [201, 202], str(killed))
+    check("recover: panel stream curls killed for both user agents",
+          ["pkill", "-f", "curl -s -N -A HibikiPanel"] in calls and ["pgrep", "-f", "curl -s -N -A GamutChatPanel"] in calls
+          and steps.get("panel streams", {}).get("detail") == "killed 1 panel stream", str(steps))
+    check("recover: missing bridge / panel / token restored",
+          (res / "Scripts/reaper_mcp_bridge.lua").exists() and (res / "Scripts/Hibiki/Hibiki.lua").exists()
+          and (home / ".config/reaper-mcp/token").exists() and "bridge script" in steps.get("files", {}).get("detail", ""))
+    check("recover: stale bridge reported, REAPER left alone",
+          steps.get("REAPER bridge", {}).get("ok") is False and "stale" in steps["REAPER bridge"]["detail"]
+          and not any("REAPER" in " ".join(c) and ("kill" in c[0]) for c in calls))
+    check("recover: MCP + gateway up -> ok", steps.get("MCP http", {}).get("ok") and steps.get("agent gateway", {}).get("ok"))
 
 
 def main_windows():

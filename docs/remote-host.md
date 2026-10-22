@@ -9,7 +9,7 @@ makes the connection itself and allows loopback MCP URLs, so it works whether it
 or anything else.
 
 `scripts/macos-host-bootstrap.sh` clones this repo to `~/reaper-mcp`, runs `setup` from it with your bearer
-(`REAPER_MCP_BEARER` becomes `~/.config/reaper-mcp/token`), turns the watchdog on and adds cloudflared as the LaunchAgent
+(`REAPER_MCP_BEARER`, at least 32 characters, becomes `~/.config/reaper-mcp/token`; left unset, one is generated), turns the watchdog on and adds cloudflared (a pinned release, sha256-checked) as the LaunchAgent
 `com.hibiki.cloudflared` (tunnel token in its environment, not on the command line). Secrets come from
 `~/.config/reaper-mcp/env` and never touch the repo.
 

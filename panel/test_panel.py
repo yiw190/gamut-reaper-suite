@@ -21,7 +21,8 @@ GATEWAY = "http://127.0.0.1:47892"
 GAMUT = "http://127.0.0.1:47891"
 
 FAKES = r"""
-EXT_STATE, CMDS, UI = {}, {}, {}
+EXT_STATE, CMDS, UI, RET = {}, {}, {}, {}
+RECORD = true
 OS_NAME = OS_NAME or 'macOS-arm64'
 NOW = 1000.0
 HIBIKI_TEST = {
@@ -67,12 +68,53 @@ ImGui = setmetatable({}, { __index = function(t, k)
   if k:find('_') and not k:find('^DrawList_') and not k:find('^Function_') then
     v = flag; flag = flag * 2 -- an enum value; distinct bits so OR-ed flags stay readable
   else
-    v = function(...) UI[#UI + 1] = { name = k, args = table.pack(...) } end
+    v = function(...)
+      if RECORD then UI[#UI + 1] = { name = k, args = table.pack(...) } end
+      local r = RET[k]
+      if r then return r(...) end
+    end
   end
   rawset(t, k, v)
   return v
 end })
 package.preload.imgui = function() return function() return ImGui end end
+-- fonts are distinct objects; text is 7 px per character
+RET.CreateFont = function(name, flags) return { font = name, flags = flags } end
+RET.CalcTextSize = function(_, s) return 7 * (utf8.len(s) or #s), 14 end
+RET.GetFontSize = function() return 14 end
+
+-- a log child 400 px wide: items advance the cursor by their height + 6 px item spacing, like ImGui
+function LAYOUT(width, height)
+  local L = { y = 0, scroll = 0, w = width or 400, h = height or 600 }
+  local function adv(h) L.y = L.y + h + 6 end
+  RET.GetCursorPosY = function() return L.y end
+  RET.GetCursorScreenPos = function() return 0, L.y - L.scroll end
+  RET.GetContentRegionAvail = function() return L.w, L.h end
+  RET.GetScrollY = function() return L.scroll end
+  RET.GetWindowHeight = function() return L.h end
+  RET.GetWindowPos = function() return 0, 0 end
+  RET.GetWindowSize = function() return L.w, L.h end
+  RET.GetTextLineHeight = function() return 14 end
+  RET.GetMousePos = function() return -1, -1 end
+  RET.GetStyleVar = function() return 8, 6 end
+  RET.Dummy = function(_, w, h) adv(h) end
+  RET.InvisibleButton = function(_, id, w, h) adv(h) end
+  RET.Spacing = function() adv(0) end
+  RET.Text = function() adv(14) end
+  RET.TextColored = RET.Text
+  RET.TextDisabled = RET.Text
+  return L
+end
+
+function OPS_EQUAL(a, b)
+  if #a ~= #b then return false, 'op count ' .. #a .. ' vs ' .. #b end
+  for i = 1, #a do
+    local x, y = a[i], b[i]
+    for k = 1, 7 do if x[k] ~= y[k] then return false, ('op %d field %d: %s vs %s'):format(i, k, tostring(x[k]), tostring(y[k])) end end
+    if (x.nl or false) ~= (y.nl or false) then return false, 'op ' .. i .. ' nl' end
+  end
+  return true, ''
+end
 """
 
 failures: list[str] = []
@@ -110,12 +152,17 @@ class Request:
 class Panel:
     """One fresh panel run. ext: saved ExtState (Hibiki/<key>); token: the gateway token file's content."""
 
-    def __init__(self, ext=None, token=None):
+    def __init__(self, ext=None, token=None, env=None):
         import lupa
 
         self.tmp = Path(tempfile.mkdtemp())
-        for k in ("TMPDIR", "TEMP", "HOME", "USERPROFILE"):
+        for k in ("TMPDIR", "TEMP", "TMP", "HOME", "USERPROFILE"):
             os.environ[k] = str(self.tmp)
+        for k, v in (env or {}).items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
         (self.tmp / "hibiki").mkdir()
         if token is not None:
             (self.tmp / ".config/agent-gateway").mkdir(parents=True)
@@ -319,6 +366,10 @@ def test_one_click_install():
     p.reply(agents, 200, [{"slug": "g1", "name": "Music", "backend": "gamut"}, {"slug": "acp-kimi", "name": "Kimi", "backend": "acp"}])
     onb.tick()
     check("install done: Kimi selected and settings opened for the login", p.S.agent == "acp-kimi" and p.S.cfgwin is True)
+    urls = [r.url for r in p.requests()]
+    check("install done: the new agent is started with ?probe=<slug> (probe=1 is only a cheap check)",
+          GATEWAY + "/api/agents/acp-kimi/status?probe=acp-kimi" in urls
+          and not any(u.endswith("/status?probe=1") for u in urls), urls)
 
 
 def test_enable_reaper_in_gamut():
@@ -357,9 +408,241 @@ def test_windows_commands():
     kill = [c for c in cmds if "powershell.exe" in c]
     import base64
     script = base64.b64decode(kill[-1].split("-EncodedCommand ")[1]).decode("utf-16-le") if kill else ""
-    check("win: the stream kill is an encoded PowerShell script that spares the new stream",
-          "Stop-Process" in script and "-notlike '*stream-" in script and "HibikiPanel" in script, script)
+    check("win: the stream kill is an encoded PowerShell script that spares streams started after it",
+          "Stop-Process" in script and "-match 'HibikiPanel/" in script and "-gt 0" in script, script)
+    check("win: every stream start has its own user agent",
+          any(re.search(r" -s -N -A HibikiPanel/\d+\.1 ", c) for c in curl), curl)
     check("win: no write-out % on the cmd line (format read from a file)", not any("%{" in c for c in curl))
+
+
+MD_TEXTS = [
+    "# Title\n\nFirst paragraph with **bold**, *italic* and `code`.\n\nSecond one\nwith a hard break.\n\n## Sub\n\n- a\n- b\n  - nested\n1. one\n2. two\n\n> quote\n\n---\n\ntail",
+    "Intro\n\n```lua\nlocal x = 1\n\nlocal y = 2\n\n\nprint(x)\n```\n\nafter the fence\n\n```\nunclosed\n\nstill code\n",
+    "| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n| c |\n|:-|\n| x |\n\ntext\n\n# Heading after a blank\n\nend",
+    "\n\nleading blanks\n\n\n\n### h3\n\n中文段落，没有空格也要按字换行。中文段落，没有空格也要按字换行。\n\n[link](http://x.y) words",
+    "Windows\r\nline ends\r\n\r\n- item\r\n\r\n```\r\ncode\r\n\r\n```\r\n\r\nlast",
+    "```\nfence at the start\n\n```\n|not a table\n\n| h |\n|--|\n| r |\n",
+]
+
+
+def test_md_incremental_matches_full():
+    p = Panel()
+    m, lua = p.m, p.lua
+    eq = lua.globals().OPS_EQUAL
+    bad = []
+    for t_i, text in enumerate(MD_TEXTS):
+        for width in (300, 120):
+            L = None
+            steps = sorted(set(list(range(1, len(text) + 1, 3)) + [len(text)]))
+            for n in steps:
+                t = text[:n]
+                L = m.md_layout(L, t, width)
+                ops, h = m.layout_md(t, width, 14)
+                ok, why = eq(L.ops, ops)
+                if not ok or L.h != h:
+                    bad.append((t_i, width, n, why, L.h, h))
+                    break
+            fresh = m.md_layout(None, text, width)  # one-shot (completed message) path
+            ok, why = eq(fresh.ops, m.layout_md(text, width, 14)[0])
+            if not ok:
+                bad.append((t_i, width, "fresh", why))
+    check("H1: incremental layout = full layout at every streamed length (fences, tables, lists, CRLF)", not bad, bad[:3])
+    L = None
+    big = "".join("Paragraph %d with some words in it.\n\n" % i for i in range(400))
+    for n in (len(big) // 2, len(big)):
+        L = m.md_layout(L, big[:n], 300)
+    check("H1: a long reply keeps its prefix (only the tail is laid out again)", L.cut > len(big) - 80, L.cut)
+
+
+def _chat(p, n):
+    msgs = []
+    for i in range(n):
+        msgs.append({"type": "user", "id": "u%d" % i, "content": {"text": "question %d" % i}})
+        msgs.append({"type": "assistant", "id": "a%d" % i, "content": {"text": "answer %d\n\nwith **two** paragraphs" % i},
+                     "toolCalls": [{"name": "mcp__reaper__status"}, {"name": "Bash"}] if i % 2 else []})
+    return msgs
+
+
+def test_offscreen_messages_are_dummies():
+    p = Panel(SESSION)
+    p.boot()
+    p.sse({"type": "connected", "isActive": False})
+    (req,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    p.reply(req, 200, _chat(p, 60))
+    g, ui = p.lua.globals(), p.lua.globals().UI
+    lay = g.LAYOUT(400, 600)
+    p.m.draw_log()
+    total = lay.y
+    lay.y, lay.scroll = 0, total / 2
+    g.UI = p.lua.table()
+    p.m.draw_log()
+    calls = [g.UI[i] for i in range(1, len(g.UI) + 1)]
+    texts = [c for c in calls if c.name == "DrawList_AddTextEx"]
+    ys = [c.args[5] for c in texts]
+    check("H2: content height unchanged when off-screen messages are skipped", lay.y == total, (lay.y, total))
+    check("H2: only messages near the visible window draw text",
+          texts and all(-260 <= y <= 600 + 260 for y in ys), (len(texts), min(ys or [0]), max(ys or [0])))
+    dummies = [c for c in calls if c.name == "Dummy"]
+    check("H2: off-screen messages emit a Dummy and nothing else",
+          len(dummies) > 100 and len(calls) < 6 * len(dummies) + 400, (len(dummies), len(calls)))
+    lay.w, lay.y = 300, 0  # width change: every height is measured again
+    p.m.draw_log()
+    widths = {(m._h.w if m._h else None) for m in p.lua_list(p.S.msgs)}
+    check("H2: a width change re-measures every message", widths == {300}, widths)
+    h300 = lay.y
+    lay.y = 0
+    p.m.draw_log()
+    check("H2: and then culls again with the new heights", lay.y == h300, (lay.y, h300))
+
+
+def test_truncate_binary_search():
+    p = Panel()
+    tr = p.m.truncate
+    check("truncate: fits unchanged", tr("short", 100) == "short")
+    out = tr("abcdefghijklmnopqrstuvwxyz", 70)  # 7 px per char: 9 chars + "…" = 70
+    check("truncate: longest prefix + ellipsis that fits", out == "abcdefghi…", out)
+    out = tr("中文标题很长很长", 30)
+    check("truncate: cuts on UTF-8 character boundaries", out == "中文标…", out)
+
+
+def test_sse_backlog_crlf():
+    p = Panel(SESSION)
+    p.boot()
+    p.sse({"type": "connected", "isActive": True})
+    events = "".join("event: message\r\ndata: " + json.dumps({"type": "stream_delta", "text": "%d," % i}) + "\r\n\r\n"
+                     for i in range(1000))
+    cut = events.index("\r\n\r\n", len(events) // 3) + 1  # the chunk ends between \r and \n
+    with open(p.S.stream.file, "ab") as f:
+        f.write(events[:cut].encode())
+    p.m.poll_stream()
+    with open(p.S.stream.file, "ab") as f:
+        f.write(events[cut:].encode())
+    first = p.S.live[1].text.count(",") if len(p.S.live) else 0
+    for _ in range(10):
+        p.m.poll_stream()
+    want = "".join("%d," % i for i in range(1000))
+    check("M4: at most 400 events per frame", 0 < first <= 400, first)
+    check("M4: a 1000-event CRLF backlog split mid-\\r\\n parses completely and in order",
+          len(p.S.live) == 1 and p.S.live[1].text == want, p.S.live[1].text[-40:] if len(p.S.live) else None)
+
+
+def test_incremental_transcript():
+    p = Panel(SESSION)
+    p.boot()
+    p.sse({"type": "connected", "isActive": False})
+    (req,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    check("M5: reconnect fetches the full transcript", "?" not in req.url, req.url)
+    p.reply(req, 200, _chat(p, 2))
+    first = p.S.msgs[1]
+    first.marker = "kept"
+    p.type_and_send("third question")
+    p.sse({"type": "session_idle"})
+    (req,) = find(p.requests(), "GET", "/messages?after=u1")
+    check("M5: turn end asks only for messages after the one before the last reply", req is not None)
+    p.reply(req, 200, {"after": "u1", "messages": [
+        {"type": "assistant", "id": "a1", "content": {"text": "answer 1 (final)"}},
+        {"type": "user", "id": "u2", "content": {"text": "third question"}},
+        {"type": "assistant", "id": "a2", "content": {"text": "third answer"}}]})
+    texts = [m.text for m in p.lua_list(p.S.msgs)]
+    check("M5: merge keeps earlier messages (and their caches) and replaces the tail",
+          texts == ["question 0", "answer 0\n\nwith **two** paragraphs", "question 1", "answer 1 (final)",
+                    "third question", "third answer"] and p.S.msgs[1].marker == "kept", texts)
+    p.sse({"type": "session_idle"})
+    (req,) = find(p.requests(), "GET", "/messages?after=u2")
+    p.reply(req, 200, _chat(p, 1))  # Gamut's own API: plain array = the whole transcript
+    texts = [m.text for m in p.lua_list(p.S.msgs)]
+    check("M5: an array answer replaces everything", len(texts) == 2 and p.S.msgs[1].marker is None, texts)
+    p.sse({"type": "session_idle"})
+    (req,) = find(p.requests(), "GET", "/messages?after=u0")
+    p.reply(req, 200, {"full": True, "messages": _chat(p, 3)})
+    check("M5: {full: true} replaces everything", len(p.S.msgs) == 6)
+    p.sse({"type": "session_idle"})
+    (req,) = find(p.requests(), "GET", "/messages?after=u2")
+    p.S.msgs = p.lua.table()  # the anchor vanished locally (session switch race): fall back to a full fetch
+    p.reply(req, 200, {"after": "u2", "messages": []})
+    check("M5: unknown local anchor refetches in full", find(p.requests(), "GET", "/sessions/s1/messages"))
+
+
+def test_private_dir():
+    home = tempfile.mkdtemp()
+    if OS_NAME.startswith("Win"):
+        p = Panel(env={"TEMP": None, "TMP": None, "LOCALAPPDATA": home})
+        check("#4 win: no TEMP -> %LOCALAPPDATA%\\Hibiki", p.m.DIR == home + "\\Hibiki\\", p.m.DIR)
+        check("#4 win: q() closes % out of the quotes and refuses a double quote",
+              p.m.q("a%PATH%b") == '"a"%"PATH"%"b"' and p.lua.eval("pcall")(p.m.q, 'x"y')[0] is False)
+        return
+    for tmp in (None, "/tmp", "/tmp/"):
+        p = Panel(env={"TMPDIR": tmp})
+        check("#4: TMPDIR=%r -> ~/Library/Caches/Hibiki, never /tmp" % tmp,
+              p.m.DIR == str(p.tmp) + "/Library/Caches/Hibiki/", p.m.DIR)
+    cmds = p.lua_list(p.lua.globals().CMDS)
+    check("#4: the dir is created mode 700", any("mkdir -p -m 700" in c and "chmod 700" in c for c in cmds), cmds[:2])
+    p = Panel(token="secret")
+    cmds = p.lua_list(p.lua.globals().CMDS)
+    i = next((n for n, c in enumerate(cmds) if "umask 077" in c and "chmod 600" in c and "gateway-auth" in c), None)
+    j = next((n for n, c in enumerate(cmds) if "/usr/bin/curl" in c), None)
+    check("#4: the auth header file is made 600 before the token is written", i is not None and j is not None and i < j)
+
+
+def test_ids_validated():
+    p = Panel({"agent": "acp-fake", "agent_name": "Fake", "session_acp-fake": "../../etc"})
+    check("#9: a bad saved session id is dropped", p.S.sid == "")
+    p.boot([{"slug": "ok-1", "name": "A", "backend": "acp"}, {"slug": "x;rm -rf ~", "name": "B", "backend": "acp"},
+            {"slug": "..", "name": "C", "backend": "acp"}])
+    check("#9: agents with unsafe slugs are ignored", [a.slug for a in p.lua_list(p.S.agents)] == ["ok-1"])
+    p.S.agent, p.S.sid = "a b", "s1"  # set behind the validation: the URL still gets an encoded segment
+    p.m.refresh_messages(True)
+    cmds = [r.cmd.replace('"%"', "%") for r in p.requests()]
+    check("#9: an unsafe slug never reaches a URL raw", cmds and all("a b" not in c for c in cmds)
+          and any("/api/agents/a%20b/sessions/s1/messages" in c for c in cmds), cmds)
+
+
+def _recover_job(p):
+    cmds = p.lua_list(p.lua.globals().CMDS)
+    job = [c for c in cmds if "recover --json" in c]
+    out = re.search(r"""> ['"]([^'"]+recover[^'"]+)\.out['"]""", job[-1]).group(1) if job else None
+    return job, out
+
+
+def test_recover():
+    for case in ("ok", "bad", "missing"):
+        p = Panel(SESSION)
+        p.boot()
+        p.sse({"type": "connected", "isActive": True}, {"type": "stream_delta", "text": "stuck"})
+        p.requests()
+        p.lua.execute("HIBIKI_TEST.sh('noop')")
+        p.m.REC.start()
+        job, base = _recover_job(p)
+        reqs = p.requests()
+        check("recover(%s): interrupts the running turn and starts the CLI in the background" % case,
+              job and find(reqs, "POST", "/sessions/s1/interrupt") and p.m.REC.running is True
+              and (job[-1].endswith("&") or "cmd.exe" in job[-1]), job)
+        if not base:
+            continue
+        if case == "ok":
+            body, code = json.dumps({"ok": True, "steps": [{"name": "gateway", "ok": True, "detail": "restarted"},
+                                                          {"name": "bridge", "ok": False, "detail": "REAPER not running"}]}), 0
+        elif case == "bad":
+            body, code = "Traceback: boom", 1
+        else:
+            body, code = "", 127
+        Path(base + ".out").write_text(body)
+        Path(base + ".done").write_text(str(code))
+        p.m.poll_http()
+        lines = [l.text for l in p.lua_list(p.m.REC.lines)] if p.m.REC.lines else []
+        if case == "ok":
+            check("recover(ok): one line per step", lines == ["✓ gateway — restarted", "✗ bridge — REAPER not running"], lines)
+        else:
+            check("recover(%s): says to run hibiki recover in Terminal" % case,
+                  len(lines) == 1 and "hibiki recover" in lines[0] and "Terminal" in lines[0], lines)
+        check("recover(%s): not running any more" % case, p.m.REC.running is False)
+        reqs = p.requests()
+        (agents,) = [r for r in reqs if r.url.endswith("/api/agents")]
+        p.reply(agents, 200, [{"slug": "acp-fake", "name": "Fake", "backend": "acp"}])
+        reqs = p.requests()
+        check("recover(%s): hosts re-resolved, chat reloaded in full and the stream restarted" % case,
+              any(r.stream and r.url.endswith("/sessions/s1/stream") for r in reqs)
+              and find(reqs, "GET", "/sessions/s1/messages"), reqs)
 
 
 def main():

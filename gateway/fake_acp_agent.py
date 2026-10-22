@@ -2,7 +2,7 @@
 """Minimal ACP agent over stdio for gateway tests: config options, streamed chunks, a tool call that asks for
 permission, cancel, an auth-required mode (FAKE_ACP_AUTH=1 until `authenticate` is called; FAKE_ACP_AUTH=terminal
 until `fake_acp_agent.py login` has written FAKE_ACP_MARK, as a terminal login does), stray non-object
-stdout lines (FAKE_ACP_NOISE=1) and a prompt containing "crash" that kills the process mid-turn (after the permission answer if it also says "tool")."""
+stdout lines (FAKE_ACP_NOISE=1), a child process per session whose pid goes to FAKE_ACP_CHILD, and a prompt containing "crash" that kills the process mid-turn (after the permission answer if it also says "tool")."""
 
 import json
 import os
@@ -112,6 +112,11 @@ for line in sys.stdin:
             send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": "Authentication required"}})
         else:
             assert p["mcpServers"][0]["name"] == "reaper", p
+            if os.environ.get("FAKE_ACP_CHILD"):  # stands in for the MCP server an agent spawns per session
+                import subprocess
+                child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"])
+                with open(os.environ["FAKE_ACP_CHILD"], "a") as f:
+                    f.write("%d %d\n" % (os.getpid(), child.pid))
             send({"jsonrpc": "2.0", "id": rid, "result": {"sessionId": "s" + str(rid), "configOptions": config()}})
     elif m == "session/set_config_option":
         model["v"] = p["value"]

@@ -12,7 +12,7 @@ BIN="$HOME/.local/bin"
 CFG="$HOME/.config/reaper-mcp"
 LAUNCH="$HOME/Library/LaunchAgents"
 REPO="${REAPER_MCP_REPO:-$HOME/reaper-mcp}"
-LABEL=com.gamut-reaper-suite.cloudflared
+LABEL=com.hibiki.cloudflared
 mkdir -p "$BIN" "$CFG" "$LAUNCH"
 export PATH="$BIN:$PATH"
 
@@ -39,7 +39,7 @@ fi
 "$BIN/cloudflared" --version
 
 if [ ! -d "$REPO/.git" ]; then
-  git clone https://github.com/yiw190/gamut-reaper-suite.git "$REPO"
+  git clone https://github.com/yiw190/hibiki.git "$REPO"
 else
   git -C "$REPO" pull --ff-only || echo "WARNING: could not fast-forward $REPO; running the checked-out version" >&2
 fi

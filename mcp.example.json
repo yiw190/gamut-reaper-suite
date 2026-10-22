@@ -2,7 +2,7 @@
   "mcpServers": {
     "reaper": {
       "command": "python3",
-      "args": ["/absolute/path/to/gamut-reaper-suite/reaper_mcp/server.py"]
+      "args": ["/absolute/path/to/hibiki/reaper_mcp/server.py"]
     }
   }
 }

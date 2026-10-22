@@ -436,7 +436,7 @@ class AcpAgent:
             res = self.request("initialize", {
                 "protocolVersion": 1,
                 "clientCapabilities": {"fs": {"readTextFile": False, "writeTextFile": False}, "terminal": False},
-                "clientInfo": {"name": "gamut-reaper-gateway", "title": "Gamut REAPER gateway", "version": "0.1.0"},
+                "clientInfo": {"name": "hibiki-gateway", "title": "Hibiki gateway", "version": "0.1.0"},
             }, timeout=120)
             if res.get("protocolVersion") != 1:
                 raise AcpError(-1, "%s speaks ACP protocol %s, gateway speaks 1" % (self.name, res.get("protocolVersion")))

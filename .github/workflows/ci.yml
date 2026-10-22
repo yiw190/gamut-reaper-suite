@@ -36,6 +36,6 @@ jobs:
       - name: bridge.lua against a fake ReaScript API
         run: python tests/test_bridge_lua.py
       - name: chat panel against fake reaper/ImGui
-        run: python gamut-chat/test_panel.py
+        run: python panel/test_panel.py
       - name: every .lua compiles (Lua 5.4), every .sh parses
         run: python scripts/check_syntax.py

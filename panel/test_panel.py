@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Headless tests for gamut-chat/GamutChat.lua: the real panel code with fake reaper/ImGui APIs.
+"""Headless tests for panel/Hibiki.lua: the real panel code with fake reaper/ImGui APIs.
 
 curl never runs: the panel's shell calls are recorded, and the test answers a request by writing the .out/.done
 files the panel polls, or appends SSE text to the stream file, the same way the background curl would.
 
-    uv run --with lupa python gamut-chat/test_panel.py
+    uv run --with lupa python panel/test_panel.py
 """
 
 from __future__ import annotations
@@ -16,14 +16,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-PANEL = Path(__file__).resolve().parent / "GamutChat.lua"
+PANEL = Path(__file__).resolve().parent / "Hibiki.lua"
 GATEWAY = "http://127.0.0.1:47892"
 GAMUT = "http://127.0.0.1:47891"
 
 FAKES = r"""
 EXT_STATE, CMDS, UI = {}, {}, {}
 NOW = 1000.0
-GAMUTCHAT_TEST = {
+HIBIKI_TEST = {
   sh = function(cmd)
     CMDS[#CMDS + 1] = cmd
     if cmd:find('curl -s -N', 1, true) then return '4242\n' end
@@ -101,7 +101,7 @@ class Request:
 
 
 class Panel:
-    """One fresh panel run. ext: saved ExtState (GamutChat/<key>); token: the gateway token file's content."""
+    """One fresh panel run. ext: saved ExtState (Hibiki/<key>); token: the gateway token file's content."""
 
     def __init__(self, ext=None, token=None):
         import lupa
@@ -109,7 +109,7 @@ class Panel:
         self.tmp = Path(tempfile.mkdtemp())
         os.environ["TMPDIR"] = str(self.tmp)
         os.environ["HOME"] = str(self.tmp)
-        (self.tmp / "gamutchat").mkdir()
+        (self.tmp / "hibiki").mkdir()
         if token is not None:
             (self.tmp / ".config/agent-gateway").mkdir(parents=True)
             (self.tmp / ".config/agent-gateway/token").write_text(token + "\n")
@@ -117,7 +117,7 @@ class Panel:
         self.lua.execute(FAKES)
         state = self.lua.globals().EXT_STATE
         for k, v in {"ctx_level": "0", **(ext or {})}.items():
-            state["GamutChat/" + k] = v
+            state["Hibiki/" + k] = v
         self.m = self.lua.execute(PANEL.read_text(encoding="utf-8"))
         self.S = self.m.S
         self.seen = 0
@@ -292,7 +292,7 @@ def main():
     try:
         import lupa  # noqa: F401
     except ImportError:
-        raise SystemExit("needs lupa: uv run --with lupa python gamut-chat/test_panel.py")
+        raise SystemExit("needs lupa: uv run --with lupa python panel/test_panel.py")
     for name, fn in list(globals().items()):
         if name.startswith("test_"):
             print(name)

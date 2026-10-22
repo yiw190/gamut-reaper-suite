@@ -4,10 +4,10 @@ local id = reaper.NamedCommandLookup("_RS70b9b9e08b3a1b47bef354e4c40290516371e9f
 if id == 0 then id = reaper.AddRemoveReaScript(true, 0, path, true) end
 if id ~= 0 then reaper.Main_OnCommand(id, 0) end
 
--- Gamut Chat panel: open on launch (2026-10-18). Toggle check so a second run never closes it.
+-- Hibiki panel: open on launch. Registered by path (re-adding a known script returns its id); the toggle check
+-- keeps a second run from closing it.
 do
-  local gpath = reaper.GetResourcePath() .. "/Scripts/GamutChat/GamutChat.lua"
-  local gid = reaper.NamedCommandLookup("_RS24f59c095963d6e7a1cf187e50fff047f87d7381")
-  if gid == 0 then gid = reaper.AddRemoveReaScript(true, 0, gpath, true) end
-  if gid ~= 0 and reaper.GetToggleCommandState(gid) ~= 1 then reaper.Main_OnCommand(gid, 0) end
+  local ppath = reaper.GetResourcePath() .. "/Scripts/Hibiki/Hibiki.lua"
+  local pid = reaper.file_exists(ppath) and reaper.AddRemoveReaScript(true, 0, ppath, true) or 0
+  if pid ~= 0 and reaper.GetToggleCommandState(pid) ~= 1 then reaper.Main_OnCommand(pid, 0) end
 end

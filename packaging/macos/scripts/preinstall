@@ -1,6 +1,6 @@
 #!/bin/sh
 # Clear the previous version's files so an upgrade never keeps modules the new version dropped.
 # Running services keep their loaded code until postinstall's setup restarts them.
-APP="/Library/Application Support/GamutReaperSuite"
+APP="/Library/Application Support/Hibiki"
 rm -rf "$APP/app" "$APP/python" "$APP"/python-*
 exit 0

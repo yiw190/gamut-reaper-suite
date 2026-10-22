@@ -1,20 +1,21 @@
-# gamut-reaper-suite
+# Hibiki
 
 <img src="icons/reaper-mcp.svg" alt="" width="96" height="96" align="left" hspace="12" vspace="4">
 
-[REAPER](https://reaper.fm) tooling for AI agents, built around [Gamut](https://github.com/SkillfulAgents/SuperAgent):
-an MCP server that drives REAPER, a chat panel docked inside REAPER, and a local gateway so the panel can talk to
-Gamut, Codex or any other ACP agent.
+**Hibiki (響, "resonance")** puts AI agents inside [REAPER](https://reaper.fm): an MCP server that drives REAPER, the
+Hibiki panel docked in REAPER for chatting with an agent about what you have selected, and a local gateway so the
+panel can talk to [Gamut](https://github.com/SkillfulAgents/SuperAgent) agents, Codex, Claude Code, Kimi or any other
+ACP agent.
 
 | Path | What |
 | --- | --- |
 | `reaper_mcp/` | MCP server (`server.py` stdio, `http_server.py` bearer HTTP) + `bridge.lua`, the Lua bridge that runs inside REAPER |
-| `gamut-chat/` | Gamut Chat — chat panel docked in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
+| `panel/` | Hibiki — chat panel docked in REAPER (ReaImGui) for Gamut, Codex and other ACP agents |
 | `reaper/__startup.lua` | Starts the bridge and the chat panel whenever REAPER launches |
 | `gateway/` | Agent gateway: one local API for the panel in front of Gamut and ACP agents (Codex, …) |
 | `scripts/` | Remote-host bootstrap (Cloudflare Tunnel) and hot-swap deploy of the bridge — see `docs/remote-host.md` |
 
-[![ci](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/gamut-reaper-suite/actions/workflows/ci.yml)
+[![ci](https://github.com/yiw190/hibiki/actions/workflows/ci.yml/badge.svg)](https://github.com/yiw190/hibiki/actions/workflows/ci.yml)
 
 ```
 MCP client  --stdio JSON-RPC-->  reaper_mcp/server.py  --JSON mailbox-->  reaper_mcp/bridge.lua (inside REAPER)
@@ -24,37 +25,37 @@ Fourteen grouped tools. Multi-step edits go through `batch`; anything else throu
 
 ## Install (macOS)
 
-You need REAPER. Download `GamutReaperSuite-<version>.pkg` from
-[Releases](https://github.com/yiw190/gamut-reaper-suite/releases), open it, then restart REAPER. The package brings its
+You need REAPER. Download `Hibiki-<version>.pkg` from
+[Releases](https://github.com/yiw190/hibiki/releases), open it, then restart REAPER. The package brings its
 own Python, so it doesn't need the Xcode command line tools. To upgrade, install a newer package.
 
 The package isn't signed yet. If macOS says it can't verify the developer, open **System Settings → Privacy & Security**
 and click **Open Anyway**.
 
-What it sets up for the logged-in user (`gamut-reaper-suite setup` runs the same steps; safe to re-run):
+What it sets up for the logged-in user (`hibiki setup` runs the same steps; safe to re-run):
 
 | Piece | Where |
 | --- | --- |
-| Lua bridge, Gamut Chat panel | `<REAPER resource path>/Scripts/reaper_mcp_bridge.lua`, `Scripts/GamutChat/` |
+| Lua bridge, Hibiki panel | `<REAPER resource path>/Scripts/reaper_mcp_bridge.lua`, `Scripts/Hibiki/` |
 | ReaImGui (if missing, pinned + sha256-checked) | `<REAPER resource path>/UserPlugins/` |
 | Startup hook: starts both with REAPER | a marked block in `Scripts/__startup.lua`; your own lines stay |
-| MCP over HTTP on `127.0.0.1:8787` (bearer in `~/.config/reaper-mcp/token`, 0600) | LaunchAgent `com.gamut-reaper-suite.reaper-mcp` |
-| Agent gateway on `127.0.0.1:47892` | LaunchAgent `com.gamut-reaper-suite.agent-gateway` |
+| MCP over HTTP on `127.0.0.1:8787` (bearer in `~/.config/reaper-mcp/token`, 0600) | LaunchAgent `com.hibiki.reaper-mcp` |
+| Agent gateway on `127.0.0.1:47892` | LaunchAgent `com.hibiki.agent-gateway` |
 | MCP registration | Gamut (as **REAPER**), plus Claude Desktop, Claude Code and Cursor when they're installed |
 
 ```bash
-gamut-reaper-suite doctor                         # what's installed, what's running, what's wrong
-gamut-reaper-suite connect gamut|claude-desktop|claude-code|cursor [--remove]
-gamut-reaper-suite agents add codex claude kimi   # ACP agents for the panel (Node goes in ~/.local/node)
-gamut-reaper-suite watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
-gamut-reaper-suite uninstall [--purge]            # --purge also deletes tokens and gateway config
+hibiki doctor                         # what's installed, what's running, what's wrong
+hibiki connect gamut|claude-desktop|claude-code|cursor [--remove]
+hibiki agents add codex claude kimi   # ACP agents for the panel (Node goes in ~/.local/node)
+hibiki watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
+hibiki uninstall [--purge]            # --purge also deletes tokens and gateway config
 ```
 
 From a clone instead (the LaunchAgents then run from the clone, so keep it; re-run after `git pull`):
 
 ```bash
-git clone https://github.com/yiw190/gamut-reaper-suite.git ~/gamut-reaper-suite
-sh ~/gamut-reaper-suite/install.sh                # WITH_AGENTS=1 also adds Codex, Claude Code and Kimi
+git clone https://github.com/yiw190/hibiki.git ~/hibiki
+sh ~/hibiki/install.sh                # WITH_AGENTS=1 also adds Codex, Claude Code and Kimi
 ```
 
 ## Manual setup (any MCP client, any OS)
@@ -72,7 +73,7 @@ MCP client config (any client that runs stdio servers):
   "mcpServers": {
     "reaper": {
       "command": "python3",
-      "args": ["/absolute/path/to/gamut-reaper-suite/reaper_mcp/server.py"]
+      "args": ["/absolute/path/to/hibiki/reaper_mcp/server.py"]
     }
   }
 }
@@ -89,22 +90,27 @@ REAPER_MCP_DEBUG=1     Lua request log
 Mailbox: `~/Library/Application Support/reaper-mcp/ipc` on macOS, `%APPDATA%/reaper-mcp/ipc` on Windows,
 `$XDG_DATA_HOME/reaper-mcp/ipc` on Linux. Time is **beats**. Indices are 0-based.
 
-## Gamut Chat panel (macOS)
+## Hibiki panel (macOS)
 
 Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and the Gamut desktop app running on the same Mac — the
 panel uses the app's local REST + SSE API (`127.0.0.1:47891`), the same one Gamut's own UI uses.
 
-The installer puts it in place. By hand: 1. Copy `gamut-chat/GamutChat.lua` to `<REAPER resource path>/Scripts/GamutChat/`, then **Actions → Load ReaScript** and run it.
-2. Optional: run `gamut-chat/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
+The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua` to `<REAPER resource path>/Scripts/Hibiki/`, then **Actions → Load ReaScript** and run it.
+2. Optional: run `panel/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
    binds **Cmd+L** to toggle it, and relaunches REAPER.
 
-What it does: pick an agent and a session, streamed replies with a markdown renderer, every message carries a
-`[REAPER context]` block (project, tempo, cursor, region, selection, MIDI editor notes, focused FX). Enter sends,
-Shift+Enter is a newline. Drag to select message text and Cmd+C to copy. Attach files with **+ File** or by
-dropping them on the panel: they're uploaded to the agent (Gamut's `upload-file`; for ACP agents the gateway stores
-them and sends images as image blocks) and listed in the message as `[Attached files:]`. Latin text uses the REAPER
-theme's UI font. When the agent asks a question or needs an approval, the panel jumps to that session in
-Gamut (`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
+What it does: the header shows the agent and the model in effect (Gamut, Claude Code, Kimi, …); click it for
+**Agent settings**, a Routing-style window with the provider, the Gamut agent, model / effort / mode, the context
+switch and the live REAPER selections; the clock lists recent chats, `+` starts one. For Claude Code and Kimi,
+**Open in …** reopens the chat in the agent's own CLI in Terminal. Replies stream with a markdown renderer; tool calls
+collapse into one line per run. Every message carries a `[REAPER context]` block: project, tempo, cursor and nearby
+markers, then each selection kind — time selection, razor areas, tracks, items, MIDI notes, envelope, FX — with how
+long ago it was set and, for time/razor ranges, the chord markers and what plays there. Pills above the input show
+the same selections, newest first. Enter sends, Shift+Enter is a newline. Drag to select message text and Cmd+C to
+copy. Attach files with **+ File** or by dropping them on the panel: they're uploaded to the agent (Gamut's
+`upload-file`; for ACP agents the gateway stores them and sends images as image blocks) and listed in the message as
+`[Attached files:]`. When a Gamut agent asks a question or needs an approval, the panel jumps to that chat in Gamut
+(`superagent://agent/<slug>/sessions/<id>`). Scrolling follows Gamut's own follow engine. Chinese/Japanese IME:
 ReaImGui passes keys to both the IME and ImGui, so the panel undoes ImGui's half of Backspace / arrows / Esc / Enter
 while a composition is open and shows the pending pinyin under the input.
 
@@ -133,7 +139,7 @@ with mode 0600 on first start; the panel reads it). Docker and Lima forward `hos
 `host.lima.internal` to the Mac's loopback, so without the token any container on the Mac could start a host agent.
 
 ```bash
-gamut-reaper-suite agents add codex claude kimi   # Node (~/.local/node) + the ACP adapters, restarts the gateway
+hibiki agents add codex claude kimi   # Node (~/.local/node) + the ACP adapters, restarts the gateway
 python3 gateway/test_gateway.py                   # fake Gamut + fake ACP agent, no network
 ```
 
@@ -152,7 +158,7 @@ else and need to reach REAPER over the internet? See [docs/remote-host.md](docs/
 ```
 python3 tests/test_server.py                         # MCP server + fake bridge, versions in step
 uv run --with lupa python tests/test_bridge_lua.py   # bridge.lua against a fake ReaScript API
-uv run --with lupa python gamut-chat/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
+uv run --with lupa python panel/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
 python3 tests/test_suite.py                          # setup / doctor / connect / uninstall on a fake HOME
 uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses

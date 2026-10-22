@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""gamut-reaper-suite setup / doctor / connect / uninstall against a fake HOME, a fake Gamut and no launchd."""
+"""hibiki setup / doctor / connect / uninstall against a fake HOME, a fake Gamut and no launchd."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ class FakeGamut(BaseHTTPRequestHandler):
 
 
 def run(home, *args, gamut=""):
-    env = dict(os.environ, HOME=str(home), GRS_NO_LAUNCHCTL="1", GAMUT_URL=gamut or "http://127.0.0.1:9",
+    env = dict(os.environ, HOME=str(home), HIBIKI_NO_LAUNCHCTL="1", GAMUT_URL=gamut or "http://127.0.0.1:9",
                PATH="/usr/bin:/bin")
     env.pop("REAPER_RESOURCE_PATH", None)
     r = subprocess.run([sys.executable, "-m", "reaper_mcp", *args], cwd=str(ROOT), env=env,
@@ -101,11 +101,11 @@ def main():
     check("setup exits 0", rc == 0, out)
     bridge = (scripts / "reaper_mcp_bridge.lua").read_text()
     check("bridge installed", bridge == (ROOT / "reaper_mcp/bridge.lua").read_text())
-    check("panel installed", (scripts / "GamutChat/GamutChat.lua").exists())
+    check("panel installed", (scripts / "Hibiki/Hibiki.lua").exists())
     check("ReaImGui already present: no download", "already installed" in out, out)
     hook = (scripts / "__startup.lua").read_text()
     check("startup: hand-copied hook adopted into the managed block, not duplicated",
-          hook.count("reaper_mcp_bridge.lua") == 1 and "-- >>> gamut-reaper-suite" in hook, hook)
+          hook.count("reaper_mcp_bridge.lua") == 1 and "-- >>> hibiki" in hook, hook)
     check("startup: user's own lines kept", hook.startswith("-- my own thing\nreaper.ShowConsoleMsg('hi')\n"), hook)
     check("startup backup written", (scripts / "__startup.lua.bak").exists())
     tok = home / ".config/reaper-mcp/token"
@@ -114,12 +114,12 @@ def main():
     check("legacy MCP + watchdog LaunchAgents removed",
           not (la / "com.yitian.reaper-mcp.plist").exists() and not (la / "com.yitian.reaper-watchdog.plist").exists())
     check("cloudflared LaunchAgent untouched", (la / "com.yitian.cloudflared-reaper.plist").exists())
-    mcp = plistlib.loads((la / "com.gamut-reaper-suite.reaper-mcp.plist").read_bytes())
+    mcp = plistlib.loads((la / "com.hibiki.reaper-mcp.plist").read_bytes())
     check("MCP LaunchAgent runs reaper_mcp/http_server.py with this python",
           mcp["ProgramArguments"] == [sys.executable, str(ROOT / "reaper_mcp/http_server.py")], str(mcp))
-    check("no secret in the MCP plist", "oldbearer" not in (la / "com.gamut-reaper-suite.reaper-mcp.plist").read_text())
-    check("gateway LaunchAgent written", (la / "com.gamut-reaper-suite.agent-gateway.plist").exists())
-    check("watchdog kept on (it was on before)", (la / "com.gamut-reaper-suite.reaper-watchdog.plist").exists())
+    check("no secret in the MCP plist", "oldbearer" not in (la / "com.hibiki.reaper-mcp.plist").read_text())
+    check("gateway LaunchAgent written", (la / "com.hibiki.agent-gateway.plist").exists())
+    check("watchdog kept on (it was on before)", (la / "com.hibiki.reaper-watchdog.plist").exists())
     gw = json.loads((home / ".config/agent-gateway/config.json").read_text())
     check("gateway config: reaper entry repointed, others kept",
           gw["mcpServers"][0]["args"] == [str(ROOT / "reaper_mcp/server.py")]
@@ -147,8 +147,8 @@ def main():
     rc, out = run(home, "uninstall", gamut=gamut)
     hook3 = (scripts / "__startup.lua").read_text()
     check("uninstall: services, scripts, managed hook gone; user lines stay",
-          rc == 0 and not list(la.glob("com.gamut-reaper-suite.*")) and not (scripts / "reaper_mcp_bridge.lua").exists()
-          and not (scripts / "GamutChat").exists() and "reaper_mcp_bridge" not in hook3 and "my own thing" in hook3, out)
+          rc == 0 and not list(la.glob("com.hibiki.*")) and not (scripts / "reaper_mcp_bridge.lua").exists()
+          and not (scripts / "Hibiki").exists() and "reaper_mcp_bridge" not in hook3 and "my own thing" in hook3, out)
     check("uninstall: Gamut registration removed", FakeGamut.servers == [], str(FakeGamut.servers))
     check("uninstall keeps the token without --purge", tok.exists())
 
@@ -158,8 +158,36 @@ def main():
     rc, out = run(fresh, "setup", "--no-connect")
     t = (fresh / ".config/reaper-mcp/token").read_text().strip()
     check("fresh Mac: new random token, hook created", rc == 0 and len(t) >= 40
-          and "-- >>> gamut-reaper-suite" in (fresh / "Library/Application Support/REAPER/Scripts/__startup.lua").read_text(), out)
-    check("fresh Mac: watchdog stays off", not (fresh / "Library/LaunchAgents/com.gamut-reaper-suite.reaper-watchdog.plist").exists())
+          and "-- >>> hibiki" in (fresh / "Library/Application Support/REAPER/Scripts/__startup.lua").read_text(), out)
+    check("fresh Mac: watchdog stays off", not (fresh / "Library/LaunchAgents/com.hibiki.reaper-watchdog.plist").exists())
+
+    # the Mac before the Hibiki rename: the suite's own LaunchAgents under its old name, the hand-copied v0.3 hook
+    # (it launches Scripts/GamutChat/GamutChat.lua), the old panel folder
+    old = Path(tempfile.mkdtemp(prefix="grs_renamed_"))
+    ores = old / "Library/Application Support/REAPER"
+    ola = old / "Library/LaunchAgents"
+    for d in (ores / "Scripts/GamutChat", ores / "UserPlugins", ola):
+        d.mkdir(parents=True)
+    (ores / "UserPlugins/reaper_imgui-arm64.dylib").write_bytes(b"x")
+    (ores / "Scripts/GamutChat/GamutChat.lua").write_text("-- old panel")
+    sys.path.insert(0, str(ROOT))
+    from reaper_mcp import suite
+    (ores / "Scripts/__startup.lua").write_text(suite.LEGACY_HOOKS[0] + "\n")
+    for lab in ("com.gamut-reaper-suite.reaper-mcp", "com.gamut-reaper-suite.agent-gateway",
+                "com.gamut-reaper-suite.reaper-watchdog"):
+        with open(ola / (lab + ".plist"), "wb") as f:
+            plistlib.dump({"Label": lab, "ProgramArguments": ["/usr/bin/true"]}, f)
+    rc, out = run(old, "setup", "--no-connect")
+    hook = (ores / "Scripts/__startup.lua").read_text()
+    check("rename: old suite LaunchAgents replaced by com.hibiki.*",
+          rc == 0 and not list(ola.glob("com.gamut-reaper-suite.*"))
+          and {p_.name for p_ in ola.glob("com.hibiki.*")} == {"com.hibiki.reaper-mcp.plist", "com.hibiki.agent-gateway.plist",
+                                                              "com.hibiki.reaper-watchdog.plist"}, out)
+    check("rename: hand-copied hook swapped for the managed one",
+          "GamutChat" not in hook and hook.count("reaper_mcp_bridge.lua") == 1 and "-- >>> hibiki" in hook
+          and "Scripts/Hibiki/Hibiki.lua" in hook, hook)
+    check("rename: old panel folder gone, new one installed",
+          not (ores / "Scripts/GamutChat").exists() and (ores / "Scripts/Hibiki/Hibiki.lua").exists(), out)
 
     httpd.shutdown()
     if failures:

@@ -10,12 +10,12 @@ keywords = ["reaper", "mcp", "daw", "reascript"]
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/yiw190/gamut-reaper-suite"
-Repository = "https://github.com/yiw190/gamut-reaper-suite"
+Homepage = "https://github.com/yiw190/hibiki"
+Repository = "https://github.com/yiw190/hibiki"
 
 [project.scripts]
 reaper-mcp = "reaper_mcp.cli:main"
-gamut-reaper-suite = "reaper_mcp.cli:main"
+hibiki = "reaper_mcp.cli:main"
 
 [build-system]
 requires = ["hatchling"]

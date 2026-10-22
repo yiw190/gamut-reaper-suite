@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <installer-gui-script minSpecVersion="2">
-  <title>Gamut REAPER Suite @VERSION@</title>
+  <title>Hibiki @VERSION@</title>
   <welcome file="welcome.html" mime-type="text/html"/>
   <license file="LICENSE.txt"/>
   <conclusion file="conclusion.html" mime-type="text/html"/>
@@ -12,7 +12,7 @@
   <choices-outline>
     <line choice="core"/>
   </choices-outline>
-  <choice id="core" visible="false" title="Gamut REAPER Suite">
+  <choice id="core" visible="false" title="Hibiki">
     <pkg-ref id="@ID@"/>
   </choice>
   <pkg-ref id="@ID@" version="@VERSION@" onConclusion="none">core.pkg</pkg-ref>

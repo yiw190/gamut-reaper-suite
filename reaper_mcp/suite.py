@@ -1,6 +1,6 @@
-"""gamut-reaper-suite: per-user install, health check, client registration and removal on macOS.
+"""hibiki: per-user install, health check, client registration and removal on macOS.
 
-Everything runs from ROOT, the folder that holds reaper_mcp/, gateway/, gamut-chat/, reaper/ and scripts/ — the .pkg
+Everything runs from ROOT, the folder that holds reaper_mcp/, gateway/, panel/, reaper/ and scripts/ — the .pkg
 payload or a git clone — with the Python that runs this module, so LaunchAgents point at whichever of the two ran
 `setup`. Stdlib only (3.9+).
 """
@@ -28,12 +28,15 @@ from pathlib import Path
 from reaper_mcp import __version__
 
 ROOT = Path(__file__).resolve().parents[1]
-PKG_ID = "io.github.yiw190.gamut-reaper-suite"
-PKG_ROOT = Path("/Library/Application Support/GamutReaperSuite")
-LABEL = "com.gamut-reaper-suite."
+PKG_ID = "io.github.yiw190.hibiki"
+PKG_ROOT = Path("/Library/Application Support/Hibiki")
+LABEL = "com.hibiki."
 MCP_LABEL, GW_LABEL, WD_LABEL = LABEL + "reaper-mcp", LABEL + "agent-gateway", LABEL + "reaper-watchdog"
-# hand-made LaunchAgents from before the suite: same jobs, replaced on setup
-LEGACY_LABELS = {"com.yitian.reaper-mcp": MCP_LABEL, "com.yitian.reaper-watchdog": WD_LABEL}
+# LaunchAgents from before: hand-made ones, then the suite's own under its old name (gamut-reaper-suite, renamed
+# Hibiki 2026-10-21); same jobs, replaced on setup
+LEGACY_LABELS = {"com.yitian.reaper-mcp": MCP_LABEL, "com.yitian.reaper-watchdog": WD_LABEL,
+                 "com.gamut-reaper-suite.reaper-mcp": MCP_LABEL, "com.gamut-reaper-suite.agent-gateway": GW_LABEL,
+                 "com.gamut-reaper-suite.reaper-watchdog": WD_LABEL}
 GW_PORT = 47892
 
 IMGUI_VERSION = "0.10.0.5"
@@ -41,9 +44,24 @@ IMGUI_SHA256 = {
     "arm64": "1f90cf004c0bbada45358609c943f601b2cb0e625ecf7739ae5df8708ab705ae",
     "x86_64": "2209fec3eae03f22fe94b9d2681b04e21f41c7d4587cb0d69e4eb72e39a64e65",
 }
-STARTUP_BEGIN = "-- >>> gamut-reaper-suite (managed by gamut-reaper-suite setup; edits inside are overwritten)"
-STARTUP_END = "-- <<< gamut-reaper-suite"
-LEGACY_STARTUP_BEGIN = "-- >>> gamut-reaper-suite (managed by install.sh)"
+STARTUP_BEGIN = "-- >>> hibiki (managed by hibiki setup; edits inside are overwritten)"
+STARTUP_END = "-- <<< hibiki"
+LEGACY_STARTUP = (("-- >>> gamut-reaper-suite", "-- <<< gamut-reaper-suite"),)  # (begin prefix, end prefix)
+# hand-copied hooks shipped before the managed block existed; setup swaps an exact copy for the managed block
+LEGACY_HOOKS = ("""-- reaper-mcp: start the MCP bridge automatically every time REAPER launches (installed 2026-10-18).
+local path = reaper.GetResourcePath() .. "/Scripts/reaper_mcp_bridge.lua"
+local id = reaper.NamedCommandLookup("_RS70b9b9e08b3a1b47bef354e4c40290516371e9f9")
+if id == 0 then id = reaper.AddRemoveReaScript(true, 0, path, true) end
+if id ~= 0 then reaper.Main_OnCommand(id, 0) end
+
+-- Gamut Chat panel: open on launch (2026-10-18). Toggle check so a second run never closes it.
+do
+  local gpath = reaper.GetResourcePath() .. "/Scripts/GamutChat/GamutChat.lua"
+  local gid = reaper.NamedCommandLookup("_RS24f59c095963d6e7a1cf187e50fff047f87d7381")
+  if gid == 0 then gid = reaper.AddRemoveReaScript(true, 0, gpath, true) end
+  if gid ~= 0 and reaper.GetToggleCommandState(gid) ~= 1 then reaper.Main_OnCommand(gid, 0) end
+end""",)
+LEGACY_PANEL_DIRS = ("GamutChat",)
 
 ACP_AGENTS = {
     "codex": {"package": "@agentclientprotocol/codex-acp", "bin": "codex-acp", "args": [],
@@ -109,7 +127,7 @@ def need(path: Path) -> Path:
 # ---------- launchd ----------
 
 def launchctl(*args: str) -> int:
-    if os.environ.get("GRS_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
         return 0
     return subprocess.run(["launchctl", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode
 
@@ -119,7 +137,7 @@ def domain() -> str:
 
 
 def loaded(label: str) -> bool:
-    if os.environ.get("GRS_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
         return False
     return launchctl("print", "%s/%s" % (domain(), label)) == 0
 
@@ -180,7 +198,11 @@ def install_bridge(p: Paths) -> None:
 
 
 def install_panel(p: Paths) -> None:
-    say("  panel: " + copy_if_changed(need(ROOT / "gamut-chat/GamutChat.lua"), p.scripts / "GamutChat/GamutChat.lua"))
+    say("  panel: " + copy_if_changed(need(ROOT / "panel/Hibiki.lua"), p.scripts / "Hibiki/Hibiki.lua"))
+    for old in LEGACY_PANEL_DIRS:
+        if (p.scripts / old).exists():
+            shutil.rmtree(p.scripts / old, ignore_errors=True)
+            say("  removed the old panel folder Scripts/%s" % old)
 
 
 def imgui_installed(p: Paths) -> bool:
@@ -206,15 +228,22 @@ def install_imgui(p: Paths) -> None:
 
 
 def strip_managed(text: str) -> str:
-    out, skip = [], False
+    out, end = [], None
     for line in text.splitlines(keepends=True):
-        if line.startswith(STARTUP_BEGIN) or line.startswith(LEGACY_STARTUP_BEGIN):
-            skip = True
-        if not skip:
+        if end is None:
+            if line.startswith(STARTUP_BEGIN):
+                end = STARTUP_END
+            for b, e in LEGACY_STARTUP:
+                if line.startswith(b):
+                    end = e
+        if end is None:
             out.append(line)
-        if line.startswith(STARTUP_END):
-            skip = False
-    return "".join(out)
+        elif line.startswith(end):
+            end = None
+    text = "".join(out)
+    for old in LEGACY_HOOKS:
+        text = text.replace(old, "")
+    return text
 
 
 def install_startup(p: Paths) -> None:
@@ -284,7 +313,7 @@ def migrate_legacy(p: Paths) -> set:
 def start_mcp(p: Paths) -> bool:
     start_agent(p, MCP_LABEL, [sys.executable, str(ROOT / "reaper_mcp/http_server.py")],
                 {"REAPER_MCP_PORT": str(port())}, KeepAlive=True, WorkingDirectory=str(ROOT))
-    if os.environ.get("GRS_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
         return True
     ok = wait_http("http://127.0.0.1:%d/healthz" % port())
     say("  MCP on 127.0.0.1:%d: %s" % (port(), "up" if ok else "NOT answering, see %s" % (p.logs / "reaper-mcp.log")))
@@ -319,7 +348,7 @@ def gateway_config(p: Paths) -> None:
 def start_gateway(p: Paths) -> None:
     start_agent(p, GW_LABEL, [sys.executable, str(need(ROOT / "gateway/agent_gateway.py"))],
                 KeepAlive=True, WorkingDirectory=str(ROOT))
-    if os.environ.get("GRS_NO_LAUNCHCTL") or sys.platform != "darwin":
+    if os.environ.get("HIBIKI_NO_LAUNCHCTL") or sys.platform != "darwin":
         return
     ok = wait_http("http://127.0.0.1:%d/health" % GW_PORT)
     say("  agent gateway on 127.0.0.1:%d: %s" % (GW_PORT, "up" if ok else "NOT answering, see %s" % (p.logs / "agent-gateway.log")))
@@ -365,7 +394,7 @@ def connect_gamut(p: Paths, remove: bool = False) -> str:
     except urllib.error.HTTPError as e:
         return "Gamut refused (%s): %s" % (e.code, e.read(300).decode(errors="replace"))
     except (OSError, ValueError):
-        return "Gamut isn't running at %s; run `gamut-reaper-suite connect gamut` once it is" % gamut_url()
+        return "Gamut isn't running at %s; run `hibiki connect gamut` once it is" % gamut_url()
 
 
 def json_client(path: Path, key: str, remove: bool) -> str:
@@ -481,10 +510,10 @@ def agents_add(p: Paths, slugs: list) -> None:
 # ---------- commands ----------
 
 def cmd_setup(a) -> int:
-    if sys.platform != "darwin" and not os.environ.get("GRS_NO_LAUNCHCTL"):
+    if sys.platform != "darwin" and not os.environ.get("HIBIKI_NO_LAUNCHCTL"):
         raise SystemExit("setup is macOS only; elsewhere use `reaper-mcp install-bridge` and a stdio MCP config")
     p = Paths(a.resource_path)
-    say("gamut-reaper-suite %s from %s (python %s)" % (__version__, ROOT, sys.executable))
+    say("hibiki %s from %s (python %s)" % (__version__, ROOT, sys.executable))
     say("REAPER")
     install_bridge(p)
     install_panel(p)
@@ -503,7 +532,7 @@ def cmd_setup(a) -> int:
         say("MCP clients")
         connect_detected(p)
     say("")
-    say("Done. Restart REAPER: the bridge and the Gamut Chat panel start with it. Check with `gamut-reaper-suite doctor`.")
+    say("Done. Restart REAPER: the bridge and the Hibiki panel start with it. Check with `hibiki doctor`.")
     return 0 if ok else 1
 
 
@@ -527,8 +556,8 @@ def cmd_doctor(a) -> int:
     bv = bridge_version(p.scripts / "reaper_mcp_bridge.lua")
     row("ok" if bv == __version__ else "FAIL", "bridge script",
         "%s (suite %s)" % (bv or "missing", __version__) + ("" if bv == __version__ else " - run setup"))
-    panel = p.scripts / "GamutChat/GamutChat.lua"
-    shipped = ROOT / "gamut-chat/GamutChat.lua"
+    panel = p.scripts / "Hibiki/Hibiki.lua"
+    shipped = ROOT / "panel/Hibiki.lua"
     same = panel.exists() and shipped.exists() and panel.read_bytes() == shipped.read_bytes()
     row("ok" if same else "warn", "chat panel", "%s%s" % (panel, "" if same else " (missing or differs from this suite)"))
     row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p) else "missing: the panel needs it")
@@ -560,7 +589,7 @@ def cmd_doctor(a) -> int:
         servers = gamut_call("GET", "/api/remote-mcps").get("servers", [])
         reg = next((s for s in servers if s.get("url") == mcp_url()), None)
         row("ok" if reg else "warn", "Gamut", "registered as '%s'" % reg.get("name") if reg else
-            "running, MCP not registered - `gamut-reaper-suite connect gamut`")
+            "running, MCP not registered - `hibiki connect gamut`")
     except (OSError, ValueError):
         row("warn", "Gamut", "not running at %s" % gamut_url())
     if a.json:
@@ -603,7 +632,8 @@ def cmd_uninstall(a) -> int:
               p.scripts / "reaper_mcp_bridge.lua.new"):
         if f.exists():
             f.unlink()
-    shutil.rmtree(p.scripts / "GamutChat", ignore_errors=True)
+    for d in ("Hibiki",) + LEGACY_PANEL_DIRS:
+        shutil.rmtree(p.scripts / d, ignore_errors=True)
     say("removed the bridge, the panel and the startup hook (ReaImGui stays: other scripts use it)")
     connect_detected(p, remove=True)
     if a.purge:
@@ -611,13 +641,13 @@ def cmd_uninstall(a) -> int:
             shutil.rmtree(d, ignore_errors=True)
         say("removed %s and %s" % (p.cfg, p.gw_cfg.parent))
     if PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
-        say("App files: sudo rm -rf '%s' /usr/local/bin/gamut-reaper-suite && sudo pkgutil --forget %s"
+        say("App files: sudo rm -rf '%s' /usr/local/bin/hibiki && sudo pkgutil --forget %s"
             % (PKG_ROOT, PKG_ID))
     return 0
 
 
 def parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="gamut-reaper-suite", description="REAPER MCP, Gamut Chat panel and agent gateway.")
+    ap = argparse.ArgumentParser(prog="hibiki", description="REAPER MCP, Hibiki panel and agent gateway.")
     sub = ap.add_subparsers(dest="cmd")
     s = sub.add_parser("setup", help="install or upgrade everything for this macOS user (safe to re-run)")
     s.add_argument("--resource-path", help="REAPER resource path (default: ~/Library/Application Support/REAPER)")

@@ -12,19 +12,19 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/cache@v4
         with:
-          path: ~/.cache/gamut-reaper-suite
+          path: ~/.cache/hibiki
           key: python-${{ hashFiles('packaging/macos/python.lock') }}
       - name: build
         run: packaging/macos/build_pkg.sh dist
       - name: tag matches the version
         if: startsWith(github.ref, 'refs/tags/v')
-        run: test -f "dist/GamutReaperSuite-${GITHUB_REF_NAME#v}.pkg"
+        run: test -f "dist/Hibiki-${GITHUB_REF_NAME#v}.pkg"
       - name: install
         run: |
-          sudo installer -pkg dist/GamutReaperSuite-*.pkg -target / || { sudo cat /var/log/gamut-reaper-suite-install.log; exit 1; }
-          sudo cat /var/log/gamut-reaper-suite-install.log
+          sudo installer -pkg dist/Hibiki-*.pkg -target / || { sudo cat /var/log/hibiki-install.log; exit 1; }
+          sudo cat /var/log/hibiki-install.log
       - name: doctor
-        run: gamut-reaper-suite doctor
+        run: hibiki doctor
       - name: MCP answers over HTTP with the bundled Python
         run: |
           t=$(cat ~/.config/reaper-mcp/token)
@@ -32,13 +32,13 @@ jobs:
             -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' http://127.0.0.1:8787/mcp)
           echo "$r" | python3 -c 'import json,sys; t=[x["name"] for x in json.load(sys.stdin)["result"]["tools"]]; print(t); assert len(t)==14'
           curl -fsS http://127.0.0.1:47892/health
-          ps -o command= -p "$(pgrep -f reaper_mcp/http_server.py | head -1)" | grep -q 'GamutReaperSuite/python'
+          ps -o command= -p "$(pgrep -f reaper_mcp/http_server.py | head -1)" | grep -q 'Hibiki/python'
       - name: re-install over itself (upgrade path)
-        run: sudo installer -pkg dist/GamutReaperSuite-*.pkg -target / && gamut-reaper-suite doctor
+        run: sudo installer -pkg dist/Hibiki-*.pkg -target / && hibiki doctor
       - name: uninstall
         run: |
-          gamut-reaper-suite uninstall
-          ! ls ~/Library/LaunchAgents/com.gamut-reaper-suite.* 2>/dev/null
+          hibiki uninstall
+          ! ls ~/Library/LaunchAgents/com.hibiki.* 2>/dev/null
           ! curl -fsS http://127.0.0.1:8787/healthz
       - uses: actions/upload-artifact@v4
         with:

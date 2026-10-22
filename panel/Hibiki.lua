@@ -1,12 +1,13 @@
--- Gamut Chat: a chat panel docked inside REAPER, talking to Gamut and ACP agents through the
+-- Hibiki: a chat panel docked inside REAPER, talking to Gamut and ACP agents through the
 -- local agent gateway (127.0.0.1:47892) or the Gamut desktop API (127.0.0.1:47891). Needs ReaImGui >= 0.10.
 -- agent gateway (gateway/agent_gateway.py: Gamut + ACP agents, model selectors) first, Gamut's own API as fallback
 local HOSTS = { 'http://127.0.0.1:47892', 'http://127.0.0.1:47891' }
 local HOST = HOSTS[1]
-local EXT = 'GamutChat'
+local EXT = 'Hibiki'
+local OLD_EXT = 'GamutChat' -- the panel's name before 2026-10-21; its saved state moves over once
 
 if not reaper.ImGui_GetBuiltinPath then
-  reaper.MB('ReaImGui is not installed.', 'Gamut Chat', 0)
+  reaper.MB('ReaImGui is not installed.', 'Hibiki', 0)
   return
 end
 package.path = reaper.ImGui_GetBuiltinPath() .. '/?.lua;' .. package.path
@@ -18,10 +19,37 @@ local function sh(cmd)
   if not p then return '' end
   local o = p:read('*a'); p:close(); return o or ''
 end
-if GAMUTCHAT_TEST then sh = GAMUTCHAT_TEST.sh end -- headless tests record the curl commands instead of running them
+if HIBIKI_TEST then sh = HIBIKI_TEST.sh end -- headless tests record the curl commands instead of running them
+-- one-time move of the saved state (agent, chats per agent, model picks, context switch) from OLD_EXT: key names come
+-- from reaper-extstate.ini, values from REAPER's live copy when it has one (the ini lags until REAPER saves it)
+if reaper.GetExtState(EXT, 'migrated') ~= '1' then
+  local f = io.open(reaper.GetResourcePath() .. '/reaper-extstate.ini', 'r')
+  local keys = { agent = '', agent_name = '', ctx_level = '', gamut_agent = '' }
+  if f then
+    local inside = false
+    for line in f:lines() do
+      local sec = line:match('^%[(.-)%]%s*$')
+      if sec then inside = sec == OLD_EXT
+      elseif inside then
+        local k, v = line:match('^([^=]+)=(.*)$')
+        if k then keys[k] = v end
+      end
+    end
+    f:close()
+  end
+  for k, v in pairs(keys) do
+    local live = reaper.GetExtState(OLD_EXT, k)
+    if live ~= '' then v = live end
+    if v ~= '' and k ~= 'action' and not k:find('^docked') and reaper.GetExtState(EXT, k) == '' then
+      reaper.SetExtState(EXT, k, v, true)
+    end
+  end
+  reaper.SetExtState(EXT, 'migrated', '1', true)
+end
+
 local function q(s) return "'" .. tostring(s):gsub("'", "'\\''") .. "'" end
 
-local DIR = (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'gamutchat/'
+local DIR = (os.getenv('TMPDIR') or '/tmp/'):gsub('/?$', '/') .. 'hibiki/'
 sh('mkdir -p ' .. q(DIR))
 
 local function u8(cp)
@@ -254,7 +282,7 @@ end
 -- curl carries a fixed user agent so every panel stream can be found by name, including orphans whose
 -- panel died without atexit (REAPER crash / watchdog kill): they kept appending to the same file and
 -- every delta showed up 2-3 times. "[c]url" keeps pkill from matching the sh -c running it.
-local STREAM_UA = 'GamutChatPanel'
+local STREAM_UA = 'HibikiPanel'
 local RUN = tostring(os.time())
 
 local function stream_stop()
@@ -992,7 +1020,7 @@ local function chip_text()
   return chip_cache
 end
 
-local CTX_OPEN = '[REAPER context — auto-attached by the Gamut Chat panel in REAPER; #N = REAPER track number, MCP index = N-1]'
+local CTX_OPEN = '[REAPER context — auto-attached by the Hibiki panel in REAPER; #N = REAPER track number, MCP index = N-1]'
 local CTX_CLOSE = '[/REAPER context]'
 -- first line of the block; CTX_OPEN itself stays fixed so older messages still fold
 local CTX_NOTE = 'note: REAPER keeps every selection until it is changed, so stale ones linger; "set … ago" says what the user touched last. Read the request first, then the newest selection.'
@@ -1324,7 +1352,7 @@ local function choose_agent(slug, name)
 end
 
 ---------------------------------------------------------------- UI setup
-local ctx = ImGui.CreateContext('Gamut Chat')
+local ctx = ImGui.CreateContext('Hibiki') -- the panel's name (docker tab)
 local function font_file(path, index)
   local f = io.open(path, 'rb')
   if not f then return nil end
@@ -2284,7 +2312,7 @@ end
 -- grey group boxes with labelled rows, white fields, light buttons, LED toggles
 local SMALL = 12
 local function cfg_window()
-  -- other scripts (the agent via MCP) can pop the window open: SetExtState('GamutChat', 'open', 'settings')
+  -- other scripts (the agent via MCP) can pop the window open: SetExtState('Hibiki', 'open', 'settings')
   if reaper.GetExtState(EXT, 'open') == 'settings' then reaper.DeleteExtState(EXT, 'open', false); S.cfgwin = true end
   if not S.cfgwin then return end
   local model, effort, mode
@@ -2321,7 +2349,7 @@ local function cfg_window()
   ImGui.PushFont(ctx, F.reg, SMALL)
   if at then ImGui.SetNextWindowPos(ctx, at[1], at[2], ImGui.Cond_Appearing, 1, 1) end
   local name = S.agent_name ~= '' and S.agent_name or S.agent
-  local visible, open = ImGui.Begin(ctx, 'Agent settings###gamut_cfg', true,
+  local visible, open = ImGui.Begin(ctx, 'Agent settings###hibiki_cfg', true,
     ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_AlwaysAutoResize | ImGui.WindowFlags_NoTitleBar
     | (ImGui.WindowFlags_NoDocking or 0))
   if visible then
@@ -2905,7 +2933,7 @@ local function card(c)
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
-local DOCK_FLAG = 'docked_v2'
+local DOCK_FLAG = 'docked_v4' -- bumped when the context name changes: ReaImGui forgets the dock with it
 
 -- Port of Gamut's follow engine (SuperAgent use-message-list-scroll.ts): following pins the live edge as content
 -- grows; an upward wheel escapes at once; coming back within ATTACH_PX re-engages. Motion is a time-based
@@ -3000,7 +3028,7 @@ local function frame()
     reaper.SetExtState(EXT, DOCK_FLAG, '1', true)
   end
   ImGui.SetNextWindowSize(ctx, 420, 680, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Gamut', true, ImGui.WindowFlags_NoCollapse)
+  local visible, open = ImGui.Begin(ctx, 'Hibiki', true, ImGui.WindowFlags_NoCollapse)
   if visible then
     local px, py = ImGui.GetWindowPos(ctx)
     local pw, ph = ImGui.GetWindowSize(ctx)
@@ -3167,7 +3195,7 @@ local function frame()
   perf_tick(t0)
   if open then reaper.defer(safe_frame) end
 end
--- a crash leaves its traceback in ExtState GamutChat/error (read it via MCP) before REAPER shows the error
+-- a crash leaves its traceback in ExtState Hibiki/error (read it via MCP) before REAPER shows the error
 safe_frame = function()
   local ok, err = xpcall(frame, debug.traceback)
   if not ok then
@@ -3176,7 +3204,7 @@ safe_frame = function()
   end
 end
 
--- remember our own action id so gamut-chat/restart_apply.sh can bind Cmd+L on any machine
+-- remember our own action id so panel/restart_apply.sh can bind Cmd+L on any machine
 do
   local _, _, _, cmd = reaper.get_action_context()
   local named = reaper.ReverseNamedCommandLookup(cmd)
@@ -3190,7 +3218,7 @@ end)
 if S.agent ~= '' then cfg_load() end
 S.boot = true
 load_agents()
-if GAMUTCHAT_TEST then -- gamut-chat/test_panel.py drives the panel from here, without a window
+if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL }
 end

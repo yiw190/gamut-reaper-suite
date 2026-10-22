@@ -152,7 +152,11 @@ def terminal_auth(method, spec):
 
 
 def login_variants(methods, spec):
-    """Split each terminal login into the config's loginVariants (e.g. Kimi: one button per region)."""
+    """Split each terminal login into the config's loginVariants (e.g. Kimi: one button per region).
+    An agent that declares no auth method but wants a CLI login first (MiniMax: `mcode acp login`) gets the
+    config's terminalLogin as one."""
+    if not methods and spec.get("terminalLogin"):
+        methods = [dict(spec["terminalLogin"], type="terminal")]
     variants = spec.get("loginVariants") or []
     out = []
     for m in methods:

@@ -85,6 +85,19 @@ ACP_AGENTS = {
                   "args": ["--region", "global"]},
                  {"id": "cn", "name": "Log in with kimi.com", "description": "Mainland China account (kimi.com)",
                   "args": ["--region", "mainland-cn"]}]},
+    # declares no ACP auth method; its login is `mcode acp login [--region global]`
+    "minimax": {"package": "@minimax-ai/code", "bin": "mcode", "args": ["acp"], "allow_scripts": "@minimax-ai/code",
+                "name": "MiniMax", "description": "MiniMax Code CLI over ACP; uses your MiniMax account",
+                "terminalLogin": {"id": "login", "name": "Log in", "args": ["login"]},
+                "loginVariants": [
+                    {"id": "global", "name": "Log in (global)", "description": "Global account (minimax.io)",
+                     "args": ["--region", "global"]},
+                    {"id": "cn", "name": "Log in (China)", "description": "Mainland China account (minimaxi.com)",
+                     "args": []}]},
+    # signs in through the browser itself (ACP auth method grok.com); needs SuperGrok / X Premium+ or XAI_API_KEY
+    "grok": {"package": "@xai-official/grok", "bin": "grok", "args": ["--no-auto-update", "agent", "stdio"],
+             "allow_scripts": "@xai-official/grok", "name": "Grok",
+             "description": "xAI's Grok Build over ACP; SuperGrok or X Premium+ (beta)"},
 }
 
 
@@ -755,8 +768,9 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
         entry = {"slug": slug, "name": a["name"], "description": a["description"],
                  "command": [str(bin_dir / (a["bin"] + (".cmd" if WINDOWS else "")))] + a["args"], "env": {"PATH": path},
                  "cwd": "~/Documents/REAPER Media"}
-        if a.get("loginVariants"):
-            entry["loginVariants"] = a["loginVariants"]
+        for k in ("loginVariants", "terminalLogin"):
+            if a.get(k):
+                entry[k] = a[k]
         cfg["acp"] = [x for x in cfg.get("acp", []) if x.get("slug") != slug] + [entry]
     write_json(p.gw_cfg, cfg)
     if not restart:  # the gateway itself installing (panel button): it loads the new agents in place

@@ -225,6 +225,20 @@ def unit():
           line == 'cd /d "C:\\Users\\x\\My Songs" && set "PATH=C:\\n;%PATH%" && set "K=v w" && "C:\\n\\kimi.cmd" "--session" "s_1"' or print(line))
 
 
+def unit_terminal_login():
+    sys.path.insert(0, str(HERE))
+    import agent_gateway as ag
+    spec = {"command": ["mcode", "acp"], "terminalLogin": {"id": "login", "name": "Log in", "args": ["login"]},
+            "loginVariants": [{"id": "global", "name": "Log in (global)", "args": ["--region", "global"]},
+                              {"id": "cn", "name": "Log in (China)", "args": []}]}
+    ms = ag.login_variants([], spec)
+    check("no declared auth method: terminalLogin becomes one button per region",
+          [m["id"] for m in ms] == ["login:global", "login:cn"])
+    check("terminal login argv = command + login + region", ag.terminal_auth(ms[0], spec)[0] == ["mcode", "acp", "login", "--region", "global"]
+          and ag.terminal_auth(ms[1], spec)[0] == ["mcode", "acp", "login"])
+    check("declared methods win over terminalLogin", ag.login_variants([{"id": "grok.com"}], spec) == [{"id": "grok.com"}])
+
+
 def unit_install():
     sys.path.insert(0, str(HERE))
     import agent_gateway as ag
@@ -264,6 +278,7 @@ def unit_install():
 
 def main():
     unit()
+    unit_terminal_login()
     unit_install()
     gsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeGamut)
     threading.Thread(target=gsrv.serve_forever, daemon=True).start()
@@ -289,8 +304,8 @@ def main():
 
         # Windows has no mode bits (NTFS ACLs; the file sits in the user's profile)
         inst = g.get("/api/hibiki/installable")
-        check("hibiki: installable lists codex, claude, kimi (none installed here)",
-              [x["key"] for x in inst] == ["codex", "claude", "kimi"] and not any(x["installed"] for x in inst))
+        check("hibiki: installable lists codex, claude, kimi, minimax, grok (none installed here)",
+              [x["key"] for x in inst] == ["codex", "claude", "kimi", "minimax", "grok"] and not any(x["installed"] for x in inst))
         st = g.get("/api/hibiki/gamut-reaper?agent=g1")
         check("hibiki: REAPER registered in Gamut, not yet enabled for g1", st == {"registered": True, "enabled": False})
         code, r = g.post("/api/hibiki/gamut-reaper", {"agent": "g1"})

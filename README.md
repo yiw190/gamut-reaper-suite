@@ -94,19 +94,26 @@ panel's **Agent settings → Provider**.
    [Windows](https://updates.gamutagents.com/download/win) · [all releases](https://github.com/SkillfulAgents/SuperAgent/releases/latest)
    ([source](https://github.com/SkillfulAgents/SuperAgent), [gamut.so](https://www.gamut.so)).
 3. Open it, add the API key, create an agent.
-4. If Gamut wasn't running when you installed Hibiki, register the MCP now: `hibiki connect gamut` (it appears in Gamut
-   as **REAPER**).
-5. In Gamut, enable the **REAPER** MCP for the agent you want to use from REAPER (remote MCPs are assigned per agent).
-6. Restart the Hibiki panel: the provider list shows **Gamut**; pick the agent under **Agent details**.
+4. In the Hibiki panel pick **Gamut** and the agent under **Agent details**. Gamut gives MCP servers to agents one by
+   one, so the panel offers **Enable REAPER for <agent>** until that agent has it (one click; it also registers the
+   MCP in Gamut if setup ran before Gamut was installed). From a terminal instead:
+   `hibiki connect gamut --agent "<name>"` (or `--all-agents`, or no flag to pick from a list).
 
-**Route B — a coding-agent CLI** (Claude Code, Kimi, Codex; uses that product's own login / subscription):
+**Route B — a coding-agent CLI** (each uses its own login / subscription): click **Install** next to it on the panel's
+"Connect an agent" card or in **Agent settings → Provider** — it installs Node and the CLI into `~/.local/node` (no admin
+rights) and loads it without a restart — then **Connect** to log in once. The REAPER MCP is wired in automatically.
 
-```bash
-hibiki agents add claude kimi      # or: codex. Installs Node into ~/.local/node, no admin rights
-```
+| Agent | Package | Login |
+| --- | --- | --- |
+| Claude Code | `@agentclientprotocol/claude-agent-acp` | your Claude login |
+| Codex | `@agentclientprotocol/codex-acp` | ChatGPT / OpenAI |
+| Kimi | `@moonshot-ai/kimi-code` | kimi.ai or kimi.com (one button each) |
+| MiniMax | `@minimax-ai/code` | global or mainland account (one button each) |
+| Grok | `@xai-official/grok` | browser sign-in; SuperGrok or X Premium+ (beta) |
 
-Then in the panel pick the provider and click **Connect**: a browser or terminal login opens once. The REAPER MCP is
-wired into these agents automatically.
+Same from a terminal: `hibiki agents add claude kimi minimax grok codex`. Not one-click yet: Qwen Code (ACP only offers
+an OpenAI-compatible API key set through environment variables) and DeepSeek (its harness's ACP server is
+automation-only; DeepSeek models work through an ACP agent such as OpenCode with an API key).
 
 ## Manual setup (any MCP client, any OS)
 

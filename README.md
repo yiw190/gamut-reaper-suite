@@ -5,6 +5,9 @@
 **Hibiki is the agent inside your music editor, built for professionals.** Talk to it about what you're working on, let it edit, arrange
 and mix alongside you, and bring the AI agents you already use. It runs in [REAPER](https://reaper.fm) today.
 
+<p align="center"><img src="docs/demo/hibiki-demo.webp" alt="Hibiki in REAPER: asking the agent to brighten the pizzicato from bar 51 and put it in the kick sidechain" width="960"></p>
+<p align="center"><sub>A real request and the agent's real replies, replayed over a recreated REAPER window. <a href="docs/demo/hibiki-demo.mp4">Full video (MP4)</a></sub></p>
+
 | Path | What |
 | --- | --- |
 | `reaper_mcp/` | MCP server (`server.py` stdio, `http_server.py` bearer HTTP) + `bridge.lua`, the Lua bridge that runs inside REAPER |

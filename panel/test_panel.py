@@ -625,6 +625,21 @@ def test_demo_typing():
           and "Hibiki/demo_type" not in dict(p.lua.globals().EXT_STATE), (len(set(typed)), len(sent)))
 
 
+def test_title_follows_gamut_rename():
+    p = Panel({"agent": "ag1", "agent_name": "Music", "session_ag1": "s1", "title_ag1": "Make the pizz brighter"})
+    p.boot([{"slug": "ag1", "name": "Music"}])
+    p.requests()
+    p.sse({"type": "session_updated"})
+    p.m.frame()
+    lists = [r for r in p.requests() if r.method == "GET" and r.url.endswith("/sessions")]
+    if lists:
+        p.reply(lists[-1], 200, [{"id": "s1", "name": "Brighter pizz in the kick sidechain"}, {"id": "s2", "name": "Other"}])
+    check("title: Gamut's session_updated refetches the list and the header takes the new name (and persists it)",
+          len(lists) == 1 and p.S.title == "Brighter pizz in the kick sidechain"
+          and dict(p.lua.globals().EXT_STATE).get("Hibiki/title_ag1") == "Brighter pizz in the kick sidechain",
+          (len(lists), p.S.title))
+
+
 def test_recover():
     for case in ("ok", "bad", "missing"):
         p = Panel(SESSION)

@@ -578,6 +578,10 @@ local function on_event(d)
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
     refresh_messages()
+    local now = reaper.time_precise()
+    S.title_checks = { now + 2, now + 12 } -- Gamut names a chat in the background after its first turn
+  elseif t == 'session_updated' then
+    S.title_checks = { reaper.time_precise() }
   elseif t == 'session_error' then
     S.active, S.perms = false, {}
     if d.apiErrorCode == 'auth_required' and is_acp() then S.auth = S.auth or { methods = {} } end
@@ -1408,6 +1412,10 @@ local function load_sessions()
         out[#out + 1] = { id = x.id, name = type(x.name) == 'string' and x.name or x.id:sub(1, 8),
           age = iso_age(x.lastActivityAt), active = x.isActive == true,
           resume = type(x.resume) == 'string' and x.resume or nil }
+        if x.id == S.sid and type(x.name) == 'string' and x.name ~= '' and x.name ~= S.title then
+          S.title = x.name
+          save_agent_session()
+        end
       end
     end
     S.sessions = out
@@ -2702,10 +2710,12 @@ local function history_popup()
     local dl = ImGui.GetWindowDrawList(ctx)
     for _, x in ipairs(S.sessions) do
       local aw = ImGui.CalcTextSize(ctx, x.age)
-      local label = truncate((x.active and '● ' or '') .. x.name, ImGui.GetContentRegionAvail(ctx) - aw - 16)
-      if ImGui.Selectable(ctx, label .. '##' .. x.id, x.id == S.sid) then switch_session(x.id, x.name) end
-      local _, sy1 = ImGui.GetItemRectMin(ctx)
-      local sx2 = ImGui.GetItemRectMax(ctx)
+      local label = truncate(x.name, ImGui.GetContentRegionAvail(ctx) - aw - 30)
+      if ImGui.Selectable(ctx, '     ' .. label .. '##' .. x.id, x.id == S.sid) then switch_session(x.id, x.name) end
+      local sx1, sy1 = ImGui.GetItemRectMin(ctx)
+      local sx2, sy2 = ImGui.GetItemRectMax(ctx)
+      local my = (sy1 + sy2) / 2
+      ImGui.DrawList_AddRectFilled(dl, sx1 + 4, my - 5, sx1 + 8, my + 5, x.active and C.led or C.led_off, 2)
       ImGui.DrawList_AddText(dl, sx2 - aw - 4, sy1, C.muted, x.age)
     end
     if #S.sessions == 0 then ImGui.TextDisabled(ctx, 'No chats yet') end
@@ -3719,6 +3729,10 @@ local function frame()
   poll_http()
   poll_stream()
   demo_tick(t0)
+  if S.title_checks and S.title_checks[1] and t0 >= S.title_checks[1] then
+    table.remove(S.title_checks, 1)
+    if S.sid ~= '' then load_sessions() end
+  end
   ImGui.PushFont(ctx, F.reg, FONT_SIZE)
   for _, c in ipairs(COLORS) do ImGui.PushStyleColor(ctx, c[1], c[2]) end
   for _, v in ipairs(VARS) do ImGui.PushStyleVar(ctx, v[1], v[2], v[3]) end

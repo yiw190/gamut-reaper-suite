@@ -1308,7 +1308,7 @@ def test_changes_window():
     p.m.studio.windows()
     begins = [c.args[2] for c in p.lua_list(p.lua.globals().UI) if c.name == "Begin"]
     check("changes window: Settings > Open draws its own window, with the empty-state text",
-          begins == ["Agent changes##hibiki_changes"] and any(c.name == "TextColored" for c in p.lua_list(p.lua.globals().UI)), begins)
+          begins == ["Version history##hibiki_changes"] and any(c.name == "TextColored" for c in p.lua_list(p.lua.globals().UI)), begins)
     p.lua.execute("RET.Begin = function() return true, false end")
     p.m.studio.windows()
     check("changes window: its close box closes it", p.m.studio._H.win is False)

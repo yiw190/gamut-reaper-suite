@@ -789,13 +789,13 @@ local function history_body(list)
   end
 end
 
--- the Agent changes window: opened from the composer's Changes chip or Agent settings > Studio > Agent changes
+-- the Version history window: opened from the composer's Versions chip or Agent settings > Studio > Version history
 function M.windows()
   if not H.win then return end
   local rect = S.panel_rect
   if rect then ImGui.SetNextWindowPos(ctx, rect[1] - 470, rect[2] + 40, ImGui.Cond_Appearing) end
   ImGui.SetNextWindowSize(ctx, 450, 480, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Agent changes##hibiki_changes', true, ImGui.WindowFlags_NoCollapse)
+  local visible, open = ImGui.Begin(ctx, 'Version history##hibiki_changes', true, ImGui.WindowFlags_NoCollapse)
   if visible then
     history_body(project_receipts())
     if ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
@@ -811,7 +811,7 @@ function M.changes_chip()
   local list = project_receipts()
   if #list == 0 and not H.last and #SV.list() == 0 then return end
   ImGui.SameLine(ctx, 0, 2)
-  if P.chip('changes', 'Changes', C.muted, false) then H.win, H.confirm = not H.win, nil end
+  if P.chip('changes', 'Versions', C.muted, false) then H.win, H.confirm = not H.win, nil end
   if ImGui.IsItemHovered(ctx) then
     P.show_tip('What agents changed in this project: go back to before any reply, or open a saved version.')
   end
@@ -891,12 +891,12 @@ function M.settings(A)
     end
     if ImGui.IsItemHovered(ctx) then
       P.show_tip('After a reply that changed the project, a copy of it goes to .hibiki/history next to the .RPP\n'
-        .. '(about 40 KB, no audio; the newest 200 are kept). Open them from Changes.')
+        .. '(about 40 KB, no audio; the newest 200 are kept). Open them from Version history.')
     end
     row()
     ImGui.AlignTextToFramePadding(ctx)
     local info = BR.info
-    ImGui.Text(ctx, info and ('Agent rules (' .. (tonumber(info.count) or 0) .. ')') or 'Agent rules')
+    ImGui.Text(ctx, info and ('Rules for agents · ' .. plural(tonumber(info.count) or 0, 'rule')) or 'Rules for agents')
     if ImGui.IsItemHovered(ctx) then
       P.show_tip('One rules file for every agent on this Mac (Codex, Claude Code, Kimi, Gemini...). '
         .. 'Type  /remember <rule>  in the chat to add one.' .. (info and info.path and ('\n' .. info.path) or ''))
@@ -904,8 +904,11 @@ function M.settings(A)
     if right_btn('brainedit', 'Edit', info == false) then brain_edit() end
     row()
     ImGui.AlignTextToFramePadding(ctx)
-    ImGui.Text(ctx, 'Agent changes')
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Every reply that changed this project; go back to before any of them.') end
+    ImGui.Text(ctx, 'Version history')
+    if ImGui.IsItemHovered(ctx) then
+      P.show_tip('Every agent reply that changed this project: go back to before any of them,\n'
+        .. 'or open a version saved after a reply (kept after a restart).')
+    end
     if right_btn('history', 'Open', false) then H.win, H.confirm = true, nil end
   end)
 end

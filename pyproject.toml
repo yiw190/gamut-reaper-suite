@@ -23,3 +23,6 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["reaper_mcp"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"brain/defaults.md" = "reaper_mcp/brain_defaults.md"

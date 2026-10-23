@@ -50,6 +50,17 @@ INSTRUCTIONS = (
 )
 
 
+def instructions() -> str:
+    """INSTRUCTIONS plus the rules for agents (Hibiki's conventions and the user's rules.md), read at each
+    initialize so an edited rules.md reaches the next session without a restart. Any trouble: the base text."""
+    try:
+        from reaper_mcp import brain
+        rules = brain.compose()
+    except Exception:  # noqa: BLE001 - instructions must never break initialize
+        return INSTRUCTIONS
+    return INSTRUCTIONS + ("\n\n" + rules if rules else "")
+
+
 def default_ipc_dir() -> str:
     env = os.environ.get("REAPER_MCP_IPC_DIR")
     if env:
@@ -704,7 +715,7 @@ def handle_request(bridge, msg):
             "protocolVersion": PROTOCOL_VERSION,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "instructions": INSTRUCTIONS,
+            "instructions": instructions(),
         })
     if method == "ping":
         return make_result(rid, {})

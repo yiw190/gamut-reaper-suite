@@ -308,6 +308,105 @@ def fake_bridge(bridge_dir, stop):
         time.sleep(0.005)
 
 
+def check_brain():
+    """The rules composer: defaults parse, off, override, missing files, the cap; the server's fallback."""
+    from reaper_mcp import brain, server
+    ok = {}
+    d = tempfile.mkdtemp(prefix="hibiki_brain_")
+    dfile = os.path.join(d, "defaults.md")
+    with open(dfile, "w", encoding="utf-8") as f:
+        f.write("# Title\n<!-- - [hidden] not a rule -->\n- [alpha] First rule\n  continues here.\n"
+                "- [beta] Second rule.\n\nfree text\n  not a continuation\n- [gamma] Third.\n")
+    ok["defaults parse"] = brain.defaults(path=dfile) == [("alpha", "First rule continues here."),
+                                                     ("beta", "Second rule."), ("gamma", "Third.")]
+    shipped = brain.ids(path=brain.package_defaults_path())
+    ok["shipped defaults have ids"] = len(shipped) >= 8 and {"single-dls", "rack-audible", "render-new-name"} <= set(shipped)
+    ok["shipped defaults stay short"] = len(open(brain.package_defaults_path(), encoding="utf-8").read().splitlines()) <= 60
+    udir = os.path.join(d, "user")
+    ok["no rules.md: defaults only"] = brain.compose(udir, dfile) == (
+        "## Hibiki conventions\n- [alpha] First rule continues here.\n- [beta] Second rule.\n- [gamma] Third.")
+    ok["no files at all: empty"] = brain.compose(udir, os.path.join(d, "missing.md")) == ""
+    brain.ensure(udir)
+    ok["template alone adds no rules"] = "Your rules" not in brain.compose(udir, dfile)
+    with open(brain.rules_path(udir), "a", encoding="utf-8") as f:
+        f.write("- off: beta\noff: nope\n- [gamma] My own third.\n- [delta] not a default, kept\n- Example rule.\n")
+    text = brain.compose(udir, dfile)
+    e = brain.effective(udir, dfile)
+    ok["off drops a default"] = "Second rule" not in text and e["off"] == ["beta"]
+    ok["[id] overrides a default in place"] = "- [gamma] My own third." in text and "Third." not in text \
+        and text.index("[alpha]") < text.index("[gamma]") < text.index("## Your rules")
+    ok["your rules without off/override lines"] = text.endswith(
+        "## Your rules\n- [delta] not a default, kept\n- Example rule.") and e["count"] == 2 and e["unknown"] == ["nope"]
+    ok["header comment not sent"] = "off: <id>" not in text and "Rules for agents" not in text
+    with open(brain.rules_path(udir), "a", encoding="utf-8") as f:
+        f.write("".join("- Example rule number %d with some padding text.\n" % i for i in range(400)))
+    capped = brain.compose(udir, dfile, limit=1000)
+    ok["cap"] = len(capped) <= 1000 and capped.endswith("characters)") and "[alpha]" in capped
+    ok["default cap"] = len(brain.compose(udir, dfile)) <= brain.BRAIN_MAX
+    try:
+        brain.add("off: nope", udir, dfile)
+        ok["off: unknown id refused"] = False
+    except ValueError:
+        ok["off: unknown id refused"] = True
+    ok["set_off on/off"] = brain.set_off("alpha", True, udir, dfile) and brain.set_off("alpha", True, udir, dfile) is False \
+        and brain.effective(udir, dfile)["off"] == ["alpha", "beta"] and brain.set_off("alpha", False, udir, dfile) \
+        and brain.effective(udir, dfile)["off"] == ["beta"]
+    ok.update(check_brain_seed_upgrade(brain, d))
+    real = brain.compose
+    brain.compose = lambda *a, **k: 1 / 0
+    try:
+        ok["server falls back to the base text"] = server.instructions() == server.INSTRUCTIONS
+    finally:
+        brain.compose = real
+    return ok
+
+
+def check_brain_seed_upgrade(brain, tmp):
+    """The user's copy of defaults.md: seeded, read by compose, merged per id on upgrade, reset."""
+    ok = {}
+    pkg = os.path.join(tmp, "pkg.md")
+
+    def ship(text):
+        with open(pkg, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    u = os.path.join(tmp, "seeded")
+    ship("# Shipped\n- [one] One v1.\n- [two] Two v1\n  wrapped.\n- [three] Three v1.\n")
+    r = brain.upgrade(u, pkg)
+    copy = brain.defaults_file(u)
+    ok["seed on first setup"] = r["seeded"] and open(copy, encoding="utf-8").read() == open(pkg, encoding="utf-8").read() \
+        and os.path.exists(brain.state_path(u))
+    with open(copy, "w", encoding="utf-8") as f:  # the user edits: one untouched, two reworded, three deleted, own line
+        f.write("# Shipped\n- [one] One v1.\n- [two] My wording of two.\nmy own note line\n")
+    ok["compose reads the user copy"] = brain.compose(u).startswith(
+        "## Hibiki conventions\n- [one] One v1.\n- [two] My wording of two.") and "Three" not in brain.compose(u)
+    ship("# Shipped v2\n- [one] One v2\n  wrapped.\n- [two] Two v2.\n- [three] Three v2.\n- [four] Four v2.\n")
+    r = brain.upgrade(u, pkg)
+    text = open(copy, encoding="utf-8").read()
+    ok["upgrade: unmodified default gets the new text"] = r["updated"] == ["one"] and "- [one] One v2\n  wrapped.\n" in text
+    ok["upgrade: modified default kept"] = r["kept"] == ["two"] and "My wording of two." in text and "Two v2" not in text
+    ok["upgrade: deleted default not re-added"] = "three" not in text
+    ok["upgrade: new id appended, own lines untouched"] = r["added"] == ["four"] and text == (
+        "# Shipped\n- [one] One v2\n  wrapped.\n- [two] My wording of two.\nmy own note line\n- [four] Four v2.\n")
+    r = brain.upgrade(u, pkg)
+    ok["upgrade twice: nothing changes"] = r["updated"] == r["added"] == [] and open(copy, encoding="utf-8").read() == text
+    brain.reset(["two"], u, pkg)
+    text = open(copy, encoding="utf-8").read()
+    ok["reset <id>: shipped text back in place"] = "- [two] Two v2.\nmy own note line" in text
+    try:
+        brain.reset(["nope"], u, pkg)
+        ok["reset: unknown id refused"] = False
+    except ValueError:
+        ok["reset: unknown id refused"] = True
+    brain.reset(None, u, pkg)
+    ok["reset --all: deleted ids back too"] = [i for i, _ in brain.defaults(u)] == ["one", "two", "four", "three"] \
+        and "my own note line" in open(copy, encoding="utf-8").read()
+    os.remove(copy)
+    ok["missing user copy is seeded again"] = brain.ids(u) == brain.ids(path=brain.package_defaults_path()) \
+        and os.path.exists(copy)
+    return ok
+
+
 def rpc(proc, msg):
     proc.stdin.write(json.dumps(msg) + "\n")
     proc.stdin.flush()
@@ -321,8 +420,11 @@ def main():
     stop = threading.Event()
     threading.Thread(target=fake_bridge, args=(bridge_dir, stop), daemon=True).start()
 
+    brain_dir = tempfile.mkdtemp(prefix="hibiki_brain_")
+    os.environ["HIBIKI_BRAIN"] = brain_dir  # in-process calls (the HTTP front answers initialize itself) stay out of ~
     env = dict(
         os.environ,
+        HIBIKI_BRAIN=brain_dir,
         REAPER_MCP_IPC_DIR=bridge_dir,
         REAPER_MCP_TIMEOUT="5",
         REAPER_MCP_HEARTBEAT_STALE="0.2",
@@ -365,7 +467,17 @@ def main():
         check("instructions present", "beats" in r["result"].get("instructions", ""))
         check("instructions ask for detail on new projects",
               "detail=true" in r["result"].get("instructions", ""))
+        text = r["result"].get("instructions", "")
+        check("instructions carry the shipped conventions", "## Hibiki conventions" in text and "[single-dls]" in text
+              and "## Your rules" not in text)
+        with open(os.path.join(brain_dir, "rules.md"), "w", encoding="utf-8") as f:
+            f.write("- Example rule for the test.\n- off: rack-audible\n")
+        text = rpc(proc, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})["result"]["instructions"]
+        check("an edited rules.md reaches the next initialize, no restart",
+              "## Your rules\n- Example rule for the test." in text and "[rack-audible]" not in text and "beats" in text)
         rpc(proc, {"jsonrpc": "2.0", "method": "notifications/initialized"})
+        for label, ok in check_brain().items():
+            check("brain: " + label, ok)
 
         r = rpc(proc, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         names = {t["name"] for t in r["result"]["tools"]}

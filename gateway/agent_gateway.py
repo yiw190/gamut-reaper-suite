@@ -23,9 +23,12 @@ Gemini CLI, ...) run as stdio subprocesses and are served under the same routes,
   POST /api/agents/<slug>/sessions/<id>/interrupt
   POST /api/agents/<slug>/sessions/<id>/permission {requestId, optionId|null}
   POST /api/agents/<slug>[/sessions/<id>]/upload-file   multipart "file" -> {success, path, filename, size}
-  GET  /api/hibiki/brain                             {path, exists, count, chars, max, folders}: the shared rules file
-  POST /api/hibiki/brain           {add} | {ensure}  append one rule line (and rewrite the agents' instruction files),
-                                                     or create rules.md from the template so it can be opened
+  GET  /api/hibiki/brain                             {path, exists, count, defaults, off, ids, defaults_path, dir,
+                                                     chars, max, folders}: the rules for agents (count = rules.md's,
+                                                     defaults = the user's copy of defaults.md)
+  POST /api/hibiki/brain           {add} | {ensure}  append one rule line (and rewrite the agents' instruction files;
+                                                     "off: <id>" must name a default, else 400), or create rules.md
+                                                     and defaults.md (seeded) so they can be opened
 
 Attachments use Gamut's convention: the message ends with "[Attached files:]" and "- <path>" lines. For ACP agents
 the gateway also sends each file as a prompt block (an image block when the agent accepts images, otherwise a
@@ -82,34 +85,20 @@ IDLE_CHECK = float(os.environ.get("AGENT_GATEWAY_IDLE_CHECK", "30"))
 MAX_REQUESTS = int(os.environ.get("AGENT_GATEWAY_MAX_REQUESTS", "32"))
 MAX_STREAMS = int(os.environ.get("AGENT_GATEWAY_MAX_STREAMS", "64"))
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
-# Hibiki brain: the user's standing rules, shared by every ACP agent. The gateway copies rules.md into the agents'
-# working folder as a marked block in the instruction file each CLI reads by itself (Codex / Kimi / Copilot
+# Hibiki brain: rules for agents = the user's defaults.md (seeded from the package's brain/defaults.md) + rules.md,
+# composed by reaper_mcp/brain.py (the MCP server sends the same text as its instructions). The gateway writes it into
+# the agents' working folder as a marked block in the instruction file each CLI reads by itself (Codex / Kimi / Copilot
 # AGENTS.md, Claude Code CLAUDE.md, Gemini GEMINI.md), before each new or reloaded session.
-BRAIN = Path(os.environ.get("HIBIKI_BRAIN", "~/.config/hibiki/brain")).expanduser()
+if str(Path(__file__).resolve().parents[1]) not in sys.path:  # the clone or installed app this file sits in
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from reaper_mcp import brain as hibiki_brain  # noqa: E402 - stdlib only, from the same tree as this file
+
+BRAIN = hibiki_brain.user_dir()
 BRAIN_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
-BRAIN_BEGIN = "<!-- hibiki rules: begin. Written by the Hibiki gateway from %s; edit that file, not this block -->"
+BRAIN_BEGIN = ("<!-- hibiki rules: begin. Written by the Hibiki gateway from defaults.md + rules.md in %s; edit those, "
+               "not this block -->")
 BRAIN_END = "<!-- hibiki rules: end -->"
-BRAIN_MAX = 12000  # characters (~3k tokens): every session of every agent pays for it
-# what every agent in the panel should know about the panel itself; written above the user's rules
-BRAIN_CONVENTIONS = """## Hibiki panel conventions
-- A reply of yours that changes REAPER becomes an entry in the panel's Version history, titled with the reply's first
-  sentence: open such a reply with one line saying what you changed. Start run_lua code with a "-- <what it does>"
-  comment (it titles the change); prefer the MCP verbs (track / fx / send / item / envelope / midi) over run_lua.
-- Audition rack, for audible alternatives (sounds, parts, arrangements, effects); not for level or balance (a few
-  dB is hard to hear by switching: set the level and say which fader to ride). Preferred: one track in fixed lanes
-  (I_FREEMODE 2, I_NUMFIXEDLANES n), one variant per lane (I_FIXEDLANE, P_LANENAME:k), only lane 0 playing
-  (C_LANEPLAYS:k = 1 for it, 0 for the rest), tagged P_EXT:hibiki_lanes = "<group>". Also understood: variant tracks
-  tagged P_EXT:hibiki_var = "<group>/<n>", or FX lines in P_EXT:hibiki_fxvar = "<group>/<n><TAB><fx GUID>". Set the
-  time selection to the section where the variants differ: a number button switches and loops it. The panel's Keep
-  deletes the other variants itself. Match the variants' loudness first.
-- "meter" lines in the REAPER context are measured on the master during the user's last playback (Hibiki Meter).
-- Files named ears-*.wav/.png/.md are the user's selection rendered from the master and measured for you."""
-BRAIN_TEMPLATE = """# Rules for agents working in REAPER
-
-Every Hibiki agent on this Mac (Codex, Claude Code, Kimi, Gemini, ...) reads these rules at the start of a chat.
-Write one rule per line. `/remember <rule>` in the Hibiki panel adds a line here.
-
-"""
+BRAIN_MAX = hibiki_brain.BRAIN_MAX
 ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -359,43 +348,38 @@ RESUME = {"claude": ["claude", "--resume", "{id}"], "kimi": ["kimi", "--session"
 
 
 def brain_path():
-    return BRAIN / "rules.md"
+    return hibiki_brain.rules_path(BRAIN)
 
 
 def brain_rules():
-    """rules.md without the template's header comment, or '' when there are no rules yet."""
-    try:
-        text = brain_path().read_text(encoding="utf-8")
-    except OSError:
-        return ""
-    return text.strip()[:BRAIN_MAX]
+    """The user's own rules from rules.md (no header comment, no off / [id] override lines), or ''."""
+    return hibiki_brain.effective(BRAIN)["rules"]
 
 
 def brain_count(text):
-    return sum(1 for line in text.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", line))
+    return hibiki_brain.count(text)
 
 
 def brain_add(rule):
-    rule = " ".join(str(rule or "").split())
-    if not rule or len(rule) > 500:
-        raise ValueError("a rule is one line of 1-500 characters")
-    path = brain_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    old = path.read_text(encoding="utf-8") if path.exists() else BRAIN_TEMPLATE
-    if any(line.strip().lstrip("-* ").strip() == rule for line in old.splitlines()):
-        return False
-    path.write_text(old.rstrip("\n") + "\n- " + rule + "\n", encoding="utf-8")
-    return True
+    """Append one line to rules.md; `off: <id>` must name a shipped default (ValueError otherwise)."""
+    return hibiki_brain.add(rule, BRAIN)
+
+
+def brain_info():
+    e = hibiki_brain.effective(BRAIN)
+    return {"path": e["path"], "exists": e["exists"], "count": e["count"], "defaults": len(e["defaults"]),
+            "off": e["off"], "ids": [r["id"] for r in e["defaults"]], "defaults_path": e["defaults_path"],
+            "dir": str(BRAIN)}
 
 
 def brain_sync(cwd):
-    """Put the panel conventions and rules.md into cwd's AGENTS.md / CLAUDE.md / GEMINI.md as a marked block; text
+    """Put the composed rules (Hibiki conventions + rules.md) into cwd's AGENTS.md / CLAUDE.md / GEMINI.md as a marked block; text
     outside the block is the user's and stays."""
     cwd = os.path.abspath(cwd)
     if cwd in (os.path.abspath(os.path.expanduser("~")), os.path.abspath(os.sep)):
         return []  # a block in ~/CLAUDE.md would reach every project under the home folder
-    rules = brain_rules()
-    begin = BRAIN_BEGIN % brain_path()
+    rules = hibiki_brain.compose(BRAIN)
+    begin = BRAIN_BEGIN % BRAIN
     changed = []
     for name in BRAIN_FILES:
         path = Path(cwd) / name
@@ -409,7 +393,7 @@ def brain_sync(cwd):
             outside = (old[:i].rstrip("\n"), old[j + len(BRAIN_END):].lstrip("\n"))
         else:
             outside = (old.rstrip("\n"), "")
-        block = begin + "\n" + BRAIN_CONVENTIONS + ("\n\n" + rules if rules else "") + "\n" + BRAIN_END
+        block = begin + ("\n" + rules if rules else "") + "\n" + BRAIN_END
         new = "\n\n".join(x for x in (outside[0], block, outside[1]) if x) + "\n"
         if new == old:
             continue
@@ -1426,10 +1410,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.reply(200, {"status": s.gamut_enable(s.Paths(), self.json["agent"])})
         if rest == ["brain"]:
             if method == "POST" and self.json.get("ensure") is True:
-                if not brain_path().exists():
-                    brain_path().parent.mkdir(parents=True, exist_ok=True)
-                    brain_path().write_text(BRAIN_TEMPLATE, encoding="utf-8")
-                return self.reply(200, {"path": str(brain_path()), "count": brain_count(brain_rules())})
+                hibiki_brain.ensure(BRAIN)
+                return self.reply(200, brain_info())
             if method == "POST":
                 try:
                     added = brain_add(self.json.get("add"))
@@ -1437,13 +1419,10 @@ class Handler(BaseHTTPRequestHandler):
                     return self.reply(400, {"error": str(e)})
                 for a in GW.acp.values():
                     brain_sync(a.cwd)
-                text = brain_rules()
-                return self.reply(200, {"added": added, "path": str(brain_path()), "count": brain_count(text)})
+                return self.reply(200, dict(brain_info(), added=added))
             if method == "GET":
-                text = brain_rules()
-                return self.reply(200, {"path": str(brain_path()), "exists": brain_path().exists(),
-                                        "count": brain_count(text), "chars": len(text), "max": BRAIN_MAX,
-                                        "folders": sorted({a.cwd for a in GW.acp.values()})})
+                return self.reply(200, dict(brain_info(), chars=len(hibiki_brain.compose(BRAIN)), max=BRAIN_MAX,
+                                            folders=sorted({a.cwd for a in GW.acp.values()})))
         return self.reply(404, {"error": "unknown hibiki route"})
 
     def acp_route(self, method, a, rest):

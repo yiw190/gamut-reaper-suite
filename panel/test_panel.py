@@ -1216,6 +1216,26 @@ def test_remember_command():
           and not find(reqs, "POST", "/sessions/s1/messages") and p.S.input == "")
     p.reply(brain[0], 200, {"added": True, "count": 3, "path": "/x/rules.md"})
     check("remember: confirms in the hint line", "(3)" in (p.m.studio.hint() or ""), p.m.studio.hint())
+    reqs = p.type_and_send("/remember off: no-such-rule")
+    brain = find(reqs, "POST", "/api/hibiki/brain")
+    p.reply(brain[0], 400, {"error": "no default rule 'no-such-rule'"})
+    check("remember: the gateway's refusal is shown", "no default rule" in (p.m.studio.hint() or ""), p.m.studio.hint())
+    t = p.lua.table_from
+    line = p.m.studio.rules_line
+    check("rules line: defaults, off and yours", line(t({"count": 3, "defaults": 10, "off": t(["a"])}))
+          == "10 defaults (1 off) \u00b7 3 yours", line(t({"count": 3, "defaults": 10, "off": t(["a"])})))
+    check("rules line: none off", line(t({"count": 0, "defaults": 10, "off": t([])})) == "10 defaults \u00b7 0 yours")
+    check("rules line: an older gateway (count only)", line(t({"count": 2})) == "2 yours")
+    p.requests()
+    p.m.studio.rules_edit()
+    ens = find(p.requests(), "POST", "/api/hibiki/brain")
+    check("rules Edit: asks the gateway to create the files", len(ens) == 1 and ens[0].body == {"ensure": True})
+    p.reply(ens[0], 200, {"path": "/x/brain/rules.md", "defaults_path": "/x/brain/defaults.md", "count": 0})
+    cmds = p.lua_list(p.lua.globals().CMDS)
+    opened = [c for c in cmds if "notepad" in c or "open -t" in c]
+    check("rules Edit: opens defaults.md and rules.md",
+          (len(opened) == 2 and "defaults.md" in opened[0] and "rules.md" in opened[1]) if OS_NAME == "Win64"
+          else (len(opened) == 1 and "defaults.md" in opened[0] and "rules.md" in opened[0]), opened)
 
 
 def test_ears_render_and_attach():

@@ -6,8 +6,8 @@ import sys
 if not __package__:  # run by path (the .pkg's bin/hibiki): make the package importable
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "recover", "stop", "start", "update", "uninstall", "use", "run"}  # run = the Windows supervisor
-USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | recover | stop | start | update | uninstall | use | ears]
+SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "recover", "stop", "start", "update", "uninstall", "use", "rules", "run"}  # run = the Windows supervisor
+USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | recover | stop | start | update | uninstall | use | rules | ears]
 
   serve            stdio MCP server (the default when stdin isn't a terminal)
   http             bearer-protected HTTP front on 127.0.0.1:$REAPER_MCP_PORT (default 8787)
@@ -15,6 +15,7 @@ USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | 
   version          print the version
   setup ...        macOS / Windows: install / upgrade the whole suite for this user (see `setup -h`)
   use dev|release  run the whole install from a git checkout, or back from the installed package
+  rules            the rules every agent gets (your defaults.md + rules.md); `rules edit`, `rules reset <id>`
   ears <wav>       measure a short excerpt (spectrum, tilt, stereo, level) into <wav>.png / .md for an agent
 """
 

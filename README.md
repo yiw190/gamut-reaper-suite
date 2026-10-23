@@ -240,10 +240,34 @@ while a composition is open and shows the pending pinyin under the input.
   panel's private folder, your render settings restored afterwards), reads REAPER's LUFS-I / LUFS-S max / true peak,
   runs `hibiki ears` (stdlib spectrum: 1/3-octave mid and side, tilt, bands over/under the tilt, stereo, level over
   time → `.png` + `.md`) and attaches the picture, the summary and the audio to your next message.
-- **Agent rules.** `/remember <rule>` saves a line to `~/.config/hibiki/brain/rules.md`. The gateway writes those
-  rules, after a short block of panel conventions, into `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` in the ACP agents'
-  working folder (a marked block; your own text in those files stays) before each new chat, so Codex, Claude Code,
-  Kimi and Gemini start with the same rules. Agent settings → Context → Agent rules shows the count and opens the file.
+- **Agent rules.** `/remember <rule>` saves a line to your `rules.md` (`/remember off: <id>` switches a
+  convention off). Agent settings → Context → Agent rules shows `N defaults (M off) · K yours`; Edit opens
+  `defaults.md` and `rules.md`.
+  See [Rules for agents](#rules-for-agents).
+
+## Rules for agents
+
+Every agent gets one text: **Hibiki conventions** from your `defaults.md` followed by **your rules** from
+`rules.md`, both in `~/.config/hibiki/brain/` (`HIBIKI_BRAIN` overrides the folder; the same path on Windows, under
+your profile).
+
+- `defaults.md` starts as a copy of the shipped `brain/defaults.md` (general know-how such as one DLSMusicDevice per
+  project, never rendering onto an existing file), made by `hibiki setup` or the first read. It is yours: rewrite or
+  delete any rule. Rules are bullets with a stable id, `- [single-dls] ...`.
+- On every install or upgrade, `hibiki setup` merges the new shipped file in per id: a rule you left untouched gets
+  the new text, one you edited keeps your wording, one you deleted stays deleted, a new id is added at the end;
+  lines without an id are never touched (`brain/.defaults-state.json` remembers what was last shipped).
+  `hibiki rules reset <id>` (or `--all`) brings the shipped text back.
+- `rules.md` is free text, one rule per line (`/remember <rule>` in the panel adds one). It also understands
+  `off: <id>` (leave a default out) and `[<id>] <text>` (replace its text), but editing `defaults.md` is simpler.
+  `<!-- comments -->` are not sent.
+- Delivered two ways: the MCP server appends the composed text to its `initialize` instructions (read at every
+  session start, so edits apply to the next chat without a restart; Gamut agents and any MCP client see it), and the
+  gateway writes it into `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` in the ACP agents' working folder (a marked block;
+  your own text in those files stays) before each new chat. Capped at 12,000 characters.
+- `hibiki rules` prints what agents get, `hibiki rules --path` the rules.md path, `hibiki rules edit [defaults|mine]`
+  opens both files (or one), `hibiki rules off <id>` / `on <id>` toggle a default from rules.md. The panel's
+  Agent rules → Edit opens both files.
 
 ## Start with REAPER
 

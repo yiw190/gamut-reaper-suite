@@ -80,6 +80,7 @@ def run(home, *args, gamut=""):
                HIBIKI_SYSTEM_APPLICATIONS=str(home / "no-system-apps"),  # this Mac's own REAPER must not count
                PATH="/usr/bin:/bin")
     env.pop("REAPER_RESOURCE_PATH", None)
+    env.pop("HIBIKI_BRAIN", None)
     r = subprocess.run([sys.executable, "-m", "reaper_mcp", *args], cwd=str(ROOT), env=env,
                        capture_output=True, text=True, timeout=60)
     return r.returncode, r.stdout + r.stderr
@@ -157,7 +158,11 @@ def main():
     check("Claude Desktop registered (stdio)", cd["mcpServers"]["reaper"]["args"] == [str(ROOT / "reaper_mcp/server.py")])
     check("Cursor registered", "reaper" in json.loads((home / ".cursor/mcp.json").read_text())["mcpServers"])
 
+    seeded = home / ".config/hibiki/brain/defaults.md"
+    check("setup seeds the user's defaults.md from the package", seeded.exists()
+          and seeded.read_text() == (ROOT / "brain/defaults.md").read_text() and "agent rules:" in out, out)
     rc, out2 = run(home, "setup", gamut=gamut)
+    check("second setup: agent rules up to date", "agent rules: up to date" in out2, out2)
     hook2 = (scripts / "__startup.lua").read_text()
     check("second setup: idempotent", rc == 0 and hook2 == hook and "bridge: up to date" in out2
           and "startup hook: up to date" in out2 and len(FakeGamut.servers) == 1, out2)
@@ -273,6 +278,7 @@ def main():
           len(calls) == 2 and calls[0][-1] == "@agentclientprotocol/codex-acp@2.2.2" and "--ignore-scripts" in calls[0]
           and calls[1][-1].startswith("@minimax-ai/code@") and "--ignore-scripts" not in calls[1], str(calls))
 
+    check_rules(check)
     check_recover(check, suite)
     check_stop_start(check, suite)
     check_update(check, suite)
@@ -283,6 +289,53 @@ def main():
         print("FAILED", failures)
         sys.exit(1)
     print("all passed")
+
+
+def check_rules(check):
+    """hibiki rules / --path / edit / off / on against a fake HOME (edit opens nothing under HIBIKI_NO_SERVICES)."""
+    home = Path(tempfile.mkdtemp(prefix="hb_rules_"))
+    rules = home / ".config/hibiki/brain/rules.md"
+    rc, out = run(home, "rules")
+    check("rules: defaults printed with no rules.md", rc == 0 and out.startswith("## Hibiki conventions")
+          and "[single-dls]" in out and "## Your rules" not in out, out)
+    rc, out = run(home, "rules", "--path")
+    check("rules --path", rc == 0 and out.strip() == str(rules), out)
+    copy = rules.parent / "defaults.md"
+    check("rules: the first read seeds defaults.md", copy.exists())
+    rc, out = run(home, "rules", "edit")
+    text = rules.read_text() if rules.exists() else ""
+    check("rules edit: both files, rules.md from the template", rc == 0 and "created from the template" in out
+          and str(copy) in out and "off: <id>" in text and "defaults.md" in text, out + text)
+    rc, out = run(home, "rules", "edit", "mine")
+    check("rules edit mine: only rules.md", rc == 0 and out.strip() == str(rules), out)
+    shipped = copy.read_text()
+    copy.write_text(shipped.replace("- [ears-files] Files named", "- [ears-files] Example rewording. Files named"))
+    rc, out = run(home, "rules")
+    check("rules: a rewritten default is what agents get", "[ears-files] Example rewording." in out, out)
+    rc, out = run(home, "rules", "reset", "ears-files")
+    check("rules reset <id>", rc == 0 and copy.read_text() == shipped, out)
+    rc, out = run(home, "rules", "reset", "no-such-rule")
+    check("rules reset: unknown id refused", rc == 1 and "no shipped rule" in out, out)
+    copy.write_text("- [ears-files] only this one, the rest deleted\n")
+    rc, out = run(home, "rules", "reset", "--all")
+    check("rules reset --all", rc == 0 and [ln for ln in copy.read_text().splitlines() if ln.startswith("- [")][-1]
+          .startswith("- [restore-point]") and "[ears-files] Files named" in copy.read_text(), out)
+    rc, out = run(home, "rules", "off", "no-such-rule")
+    check("rules off: unknown id refused", rc == 1 and "no default rule" in out, out)
+    rc, out = run(home, "rules", "off", "rack-audible")
+    rc2, shown = run(home, "rules")
+    check("rules off <id>", rc == 0 and "- off: rack-audible" in rules.read_text() and "[rack-audible]" not in shown
+          and "## Your rules" not in shown, out + shown)
+    with open(rules, "a", encoding="utf-8") as f:
+        f.write("- Example rule for the test.\n")
+    rc, out = run(home, "rules", "on", "rack-audible")
+    rc2, shown = run(home, "rules")
+    check("rules on <id>; your rules follow the conventions", rc == 0 and "off:" not in rules.read_text().split("-->")[-1]
+          and "[rack-audible]" in shown and shown.rstrip().endswith("## Your rules\n- Example rule for the test."),
+          out + shown)
+    rc, out = run(home, "rules", "--json")
+    info = json.loads(out) if rc == 0 else {}
+    check("rules --json", info.get("count") == 1 and info.get("off") == [] and len(info.get("defaults", [])) >= 8, out)
 
 
 def check_recover(check, suite):

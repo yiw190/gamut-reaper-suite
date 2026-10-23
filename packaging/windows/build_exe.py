@@ -23,7 +23,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
-SUITE = ["reaper_mcp", "gateway", "panel", "reaper", "LICENSE", "README.md"]
+SUITE = ["reaper_mcp", "brain", "gateway", "panel", "reaper", "LICENSE", "README.md"]
 # nothing in the suite uses these; ~30 MB less
 PRUNE = ["tcl", "include", "libs", "Scripts", "Lib/test", "Lib/idlelib", "Lib/turtledemo", "Lib/tkinter",
          "Lib/ensurepip", "Lib/lib2to3", "Lib/site-packages/pip"]

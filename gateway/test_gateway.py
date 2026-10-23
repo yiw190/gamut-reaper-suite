@@ -271,9 +271,11 @@ def unit_brain():
     ag.BRAIN = tmp / "brain"
     work = tmp / "work"
     work.mkdir()
-    check("brain: no rules yet, the panel conventions still go in",
+    check("brain: no rules yet, the shipped conventions still go in",
           sorted(ag.brain_sync(str(work))) == ["AGENTS.md", "CLAUDE.md", "GEMINI.md"]
-          and "P_EXT:hibiki_var" in (work / "CLAUDE.md").read_text())
+          and "P_EXT:hibiki_var" in (work / "CLAUDE.md").read_text() and "[single-dls]" in (work / "CLAUDE.md").read_text())
+    check("brain: the block is the composer's text",
+          ag.hibiki_brain.compose(ag.BRAIN) in (work / "AGENTS.md").read_text())
     for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
         (work / name).unlink()
     check("brain: add a rule", ag.brain_add("Example rule one") is True)
@@ -295,7 +297,20 @@ def unit_brain():
     ag.brain_sync(str(work))
     agents = (work / "AGENTS.md").read_text()
     check("brain: emptied rules leave only the conventions, the user's text stays",
-          agents.startswith("# my notes\nkeep me\n") and "Save the project" not in agents and "hibiki_var" in agents)
+          agents.startswith("# my notes\nkeep me\n") and "Example rule" not in agents and "hibiki_var" in agents)
+    check("brain: off: <id> needs a shipped id", ag.brain_add("off: rack-audible") is True)
+    try:
+        ag.brain_add("off: no-such-rule")
+        check("brain: off: unknown id refused", False)
+    except ValueError:
+        check("brain: off: unknown id refused", True)
+    ag.brain_add("[prefer-verbs] Example override text.")
+    ag.brain_sync(str(work))
+    agents = (work / "AGENTS.md").read_text()
+    check("brain: off and [id] override reach the agents' files",
+          "hibiki_var" not in agents and "- [prefer-verbs] Example override text." in agents
+          and "off: rack-audible" not in agents and ag.brain_count(ag.brain_rules()) == 0
+          and ag.brain_info()["off"] == ["rack-audible"])
     check("brain: never writes into the home folder", ag.brain_sync(os.path.expanduser("~")) == [])
     try:
         ag.brain_add("x" * 600)
@@ -372,6 +387,21 @@ def main():
         check("brain route: add + info", r[0] == 200 and info["count"] == 1 and info["folders"] == [os.path.abspath(tmp)])
         check("brain route: the agents' folder gets the rule at once",
               "Example rule three" in (Path(tmp) / "AGENTS.md").read_text())
+        check("brain route: info counts defaults and off ids",
+              info["defaults"] >= 8 and info["off"] == [] and "single-dls" in info["ids"])
+        code, err = g.post("/api/hibiki/brain", {"add": "off: no-such-rule"})
+        check("brain route: off with an unknown id is a 400", code == 400 and "no-such-rule" in err.get("error", ""))
+        copy = Path(info["defaults_path"])
+        check("brain route: defaults come from the user's seeded copy",
+              copy == Path(tmp) / "brain" / "defaults.md" and copy.exists())
+        copy.write_text("\n".join(ln for ln in copy.read_text().splitlines() if "[meter-context]" not in ln
+                                  and "(Hibiki Meter)" not in ln) + "\n")
+        info2 = g.get("/api/hibiki/brain")
+        check("brain route: an edited copy changes the info", info2["defaults"] == info["defaults"] - 1
+              and "meter-context" not in info2["ids"])
+        code, r = g.post("/api/hibiki/brain", {"add": "off: rack-audible"})
+        check("brain route: off with a shipped id", code == 200 and r["added"] is True and r["off"] == ["rack-audible"]
+              and r["count"] == 1 and "hibiki_var" not in (Path(tmp) / "AGENTS.md").read_text())
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 

@@ -643,10 +643,20 @@ function M.command(text)
       BR.at = -math.huge
     else
       if S.input == '' then S.input = text end -- hand the rule back, like a failed send
-      M.note(code == 0 and 'Rule not saved: gateway not answering' or ('Rule not saved: gateway answered ' .. tostring(code)))
+      M.note(code == 0 and 'Rule not saved: gateway not answering'
+        or (type(r) == 'table' and type(r.error) == 'string' and ('Rule not saved: ' .. r.error))
+        or ('Rule not saved: gateway answered ' .. tostring(code)))
     end
   end)
   return true
+end
+-- "10 defaults (1 off) · 3 yours"; a gateway without shipped defaults (before 0.6) only has the count
+function M.rules_line(info)
+  local yours = (tonumber(info.count) or 0) .. ' yours'
+  local n = tonumber(info.defaults)
+  if not n then return yours end
+  local off = type(info.off) == 'table' and #info.off or 0
+  return n .. ' defaults' .. (off > 0 and (' (' .. off .. ' off)') or '') .. ' · ' .. yours
 end
 local function brain_info()
   if now() - BR.at < 10 then return end
@@ -660,11 +670,19 @@ local function brain_edit()
   P.http_url('POST', P.gateway .. '/api/hibiki/brain', '{"ensure":true}', function(code, body)
     local r = P.decode(body)
     if code ~= 200 or type(r) ~= 'table' or type(r.path) ~= 'string' then BR.info, BR.at = false, now(); return end -- the Agent rules row says it, in the window where Edit was clicked
-    if P.WIN then P.win_bg('start "" notepad ' .. P.q(r.path))
-    else P.sh('/usr/bin/open -t ' .. P.q(r.path) .. ' >/dev/null 2>&1 &') end
+    local files = { r.path } -- rules.md; a gateway from 0.6 also has the user's defaults.md
+    if type(r.defaults_path) == 'string' then table.insert(files, 1, r.defaults_path) end
+    if P.WIN then
+      for _, f in ipairs(files) do P.win_bg('start "" notepad ' .. P.q(f)) end
+    else
+      local qs = {}
+      for _, f in ipairs(files) do qs[#qs + 1] = P.q(f) end
+      P.sh('/usr/bin/open -t ' .. table.concat(qs, ' ') .. ' >/dev/null 2>&1 &')
+    end
     BR.at = -math.huge
   end)
 end
+M.rules_edit = brain_edit
 
 ---------------------------------------------------------------- saved versions (survive a REAPER restart)
 -- After a reply that changed the project, a copy of the project as it is (saved or not) goes to
@@ -878,7 +896,7 @@ function M.settings_context(A)
     row()
     ImGui.AlignTextToFramePadding(ctx)
     local info = BR.info
-    ImGui.Text(ctx, info and ('Agent rules: ' .. (tonumber(info.count) or 0))
+    ImGui.Text(ctx, info and ('Agent rules: ' .. M.rules_line(info))
       or (info == false and 'Agent rules: gateway not answering' or 'Agent rules'))
     if ImGui.IsItemHovered(ctx) and info and info.path then P.show_tip(info.path) end
     if right_btn('brainedit', 'Edit', info == false) then brain_edit() end

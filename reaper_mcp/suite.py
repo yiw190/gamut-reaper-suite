@@ -1,6 +1,6 @@
 """hibiki: per-user install, health check, client registration and removal on macOS.
 
-Everything runs from ROOT, the folder that holds reaper_mcp/, gateway/, panel/, reaper/ and scripts/ — the .pkg
+Everything runs from ROOT, the folder that holds reaper_mcp/, brain/, gateway/, panel/, reaper/ and scripts/ — the .pkg
 payload or a git clone — with the Python that runs this module, so LaunchAgents point at whichever of the two ran
 `setup`. Stdlib only (3.9+).
 """
@@ -1072,6 +1072,7 @@ def cmd_setup(a) -> int:
     say("hibiki %s from %s (python %s)" % (__version__, ROOT, sys.executable))
     say("REAPER")
     install_bridge(p)
+    install_brain()
     if a.mcp_only:
         return setup_mcp_only(p, a)
     install_panel(p)
@@ -1762,6 +1763,93 @@ def cmd_update(a) -> int:
     return 0
 
 
+def open_text_file(path: Path) -> list:
+    """Open a text file in the user's editor without waiting; returns the command (none under HIBIKI_NO_SERVICES)."""
+    if no_services():
+        return []
+    if WINDOWS:
+        cmd = ["notepad", str(path)]
+    elif sys.platform == "darwin":
+        cmd = ["/usr/bin/open", "-t", str(path)]
+    else:
+        cmd = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "xdg-open") + [str(path)]
+    subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return cmd
+
+
+def install_brain() -> None:
+    """Seed the user's defaults.md from the package, or merge a newer package file into it (see reaper_mcp/brain)."""
+    from reaper_mcp import brain
+    try:
+        r = brain.upgrade()
+    except OSError as e:
+        say("  agent rules: cannot write %s (%s)" % (brain.user_dir(), e))
+        return
+    if r["seeded"]:
+        say("  agent rules: %s created" % brain.defaults_file())
+    elif r["updated"] or r["added"]:
+        say("  agent rules: %s%s%s" % ("updated " + ", ".join(r["updated"]) if r["updated"] else "",
+                                       "; " if r["updated"] and r["added"] else "",
+                                       "added " + ", ".join(r["added"]) if r["added"] else ""))
+    else:
+        say("  agent rules: up to date")
+    if r["kept"]:
+        say("  agent rules: kept your wording of %s (`hibiki rules reset <id>` takes the new text)" % ", ".join(r["kept"]))
+
+
+def cmd_rules(a) -> int:
+    """hibiki rules [edit [defaults|mine] | off <id> | on <id> | reset <id>|--all] [--path] [--json]"""
+    from reaper_mcp import brain
+    path = brain.rules_path()
+    if a.path:
+        say(str(path))
+        return 0
+    if a.action in ("off", "on"):
+        if not a.id:
+            say("usage: hibiki rules %s <id>   (ids: %s)" % (a.action, ", ".join(brain.ids())))
+            return 2
+        try:
+            changed = brain.set_off(a.id, a.action == "off")
+        except ValueError as e:
+            say("error: %s" % e)
+            return 1
+        state = "off" if a.action == "off" else "on"
+        say("%s: %s%s (%s); new agent sessions get it" % (a.id, state, "" if changed else ", already", path))
+        return 0
+    if a.action == "reset":
+        if bool(a.id) == bool(a.all):
+            say("usage: hibiki rules reset <id> | --all")
+            return 2
+        try:
+            done = brain.reset(None if a.all else [a.id])
+        except ValueError as e:
+            say("error: %s" % e)
+            return 1
+        say("shipped text back for %s in %s" % (", ".join(done), brain.defaults_file()))
+        return 0
+    if a.action == "edit":
+        if a.id not in (None, "defaults", "mine"):
+            say("usage: hibiki rules edit [defaults | mine]")
+            return 2
+        made = not path.exists()
+        brain.ensure()
+        files = [p for k, p in (("defaults", brain.defaults_file()), ("mine", path)) if a.id in (None, k)]
+        for f in files:
+            open_text_file(f)
+            say("%s%s" % (f, " (created from the template)" if f == path and made else ""))
+        return 0
+    if a.id or a.all:
+        say("usage: hibiki rules [edit [defaults|mine] | off <id> | on <id> | reset <id>|--all] [--path]")
+        return 2
+    e = brain.effective()
+    if a.json:
+        print(json.dumps(dict(e, text=brain.compose())))
+        return 0
+    text = brain.compose()
+    say(text or "(no rules: %s and %s are empty)" % (brain.defaults_file(), path))
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hibiki", description="REAPER MCP, Hibiki panel and agent gateway.")
     sub = ap.add_subparsers(dest="cmd")
@@ -1819,6 +1907,15 @@ def parser() -> argparse.ArgumentParser:
     us.add_argument("--resource-path")
     us.add_argument("--json", action="store_true")
     us.set_defaults(fn=cmd_use)
+    ru = sub.add_parser("rules", help="the rules every agent gets: your defaults.md (Hibiki's conventions, edit "
+                                      "freely) + rules.md; `edit [defaults|mine]` opens them, `reset <id>|--all` "
+                                      "brings shipped text back, `off <id>` / `on <id>` switch a convention")
+    ru.add_argument("action", nargs="?", choices=["show", "edit", "off", "on", "reset"])
+    ru.add_argument("id", nargs="?", help="a rule id (edit: defaults | mine)")
+    ru.add_argument("--all", action="store_true", help="reset: every shipped rule")
+    ru.add_argument("--path", action="store_true", help="print the path of your rules.md")
+    ru.add_argument("--json", action="store_true")
+    ru.set_defaults(fn=cmd_rules)
     r = sub.add_parser("run", help=argparse.SUPPRESS)  # the Windows supervisor (started by setup and at logon)
     r.add_argument("--port", type=int, default=port())
     r.set_defaults(fn=cmd_run)

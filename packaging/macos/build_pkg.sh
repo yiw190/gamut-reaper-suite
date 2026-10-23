@@ -48,7 +48,7 @@ done
 
 # --- the suite ---
 ( cd "$REPO" && tar -cf - --exclude '__pycache__' --exclude '*.pyc' --exclude 'test_*.py' --exclude 'fake_*' \
-    reaper_mcp gateway panel reaper scripts/reaper-watchdog.sh LICENSE README.md ) | tar -xf - -C "$APP/app"
+    reaper_mcp brain gateway panel reaper scripts/reaper-watchdog.sh LICENSE README.md ) | tar -xf - -C "$APP/app"
 host_py="$APP/python-$( [ "$(uname -m)" = arm64 ] && echo arm64 || echo x86_64 )/bin/python3"
 "$host_py" -m compileall -q "$APP/app"  # the payload is read-only for users: ship the bytecode
 echo "$VERSION" > "$APP/VERSION"

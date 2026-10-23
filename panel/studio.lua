@@ -954,13 +954,13 @@ function M.settings_changes(A)
     end
     if H.err then
       row()
-      ImGui.PushTextWrapPos(ctx, x0 + w)
+      ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
       ImGui.TextColored(ctx, C.razor, H.err)
       ImGui.PopTextWrapPos(ctx)
     end
     if #rows == 0 then
       row()
-      ImGui.PushTextWrapPos(ctx, x0 + w)
+      ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
       ImGui.TextColored(ctx, A.dim, 'No agent changes to this project yet')
       ImGui.PopTextWrapPos(ctx)
     end
@@ -991,7 +991,7 @@ function M.settings_changes(A)
       end
       if armed then
         row()
-        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
         ImGui.TextColored(ctx, C.razor, 'Your own edits since ' .. os.date('%H:%M', x.at) .. ' go too · Redo all restores everything')
         ImGui.PopTextWrapPos(ctx)
       end

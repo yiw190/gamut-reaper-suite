@@ -3033,7 +3033,7 @@ local function cfg_window()
     end
     local function kv(k, v, x0, w, col)
       label(k, x0)
-      ImGui.PushTextWrapPos(ctx, x0 + w)
+      ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
       if col then ImGui.TextColored(ctx, col, v) else ImGui.Text(ctx, v) end
       ImGui.PopTextWrapPos(ctx)
     end
@@ -3120,7 +3120,7 @@ local function cfg_window()
         ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
         if light_btn('install', bt, bw, false, busy or ONB.installing ~= nil) then ONB.install(pending.key) end
         ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
         ImGui.TextDisabled(ctx, pending.description)
         ImGui.TextDisabled(ctx, busy and 'Downloading Node and the CLI into ~/.local/node (no admin rights). '
           .. 'Takes a minute or two; you log in once it is done.'
@@ -3266,7 +3266,7 @@ local function cfg_window()
       end
       local function note(col, text)
         ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
         ImGui.TextColored(ctx, col, text)
         ImGui.PopTextWrapPos(ctx)
       end
@@ -3307,7 +3307,7 @@ local function cfg_window()
       end
       if REC.lines then
         ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
         for _, l in ipairs(REC.lines) do
           ImGui.TextColored(ctx, l.ok and shade(C.win_text, 0x30) or C.razor, l.text)
         end

@@ -1151,6 +1151,8 @@ def test_meter_context():
 def test_rack_switch_and_context():
     p = studio_panel({"ctx_level": "1"})
     p.lua.execute("""
+      RACK_CMDS = {}
+      reaper.Main_OnCommand = function(id) RACK_CMDS[#RACK_CMDS + 1] = id end
       TRACKS = { { name = 'Bass A', ext = { hibiki_var = 'Bass/1' }, mute = 0 },
                  { name = 'Bass B', ext = { hibiki_var = 'Bass/2' }, mute = 1 },
                  { name = 'Keys', ext = {}, mute = 0 } }""")
@@ -1162,6 +1164,7 @@ def test_rack_switch_and_context():
     p.m.studio.rack_row()
     t = p.lua.globals().TRACKS
     check("rack: clicking 2 plays Bass B and mutes Bass A", t[1].mute == 1 and t[2].mute == 0 and t[3].mute == 0)
+    check("rack: a click while stopped starts playback (a listen, not just a switch)", 1007 in p.lua_list(p.lua.globals().RACK_CMDS))
     p.lua.execute("RET.InvisibleButton = nil")
     reqs = p.type_and_send("which bass?")
     body = find(reqs, "POST", "/sessions/s1/messages")[0].body["content"]

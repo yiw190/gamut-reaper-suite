@@ -376,6 +376,17 @@ function RK.switch(g, n)
   reaper.UpdateArrange()
   g.active = n
   RK.focus = g.name
+  -- a click is a listen: stopped, it plays the time selection on a loop (the agent sets it to the section where the
+  -- variants differ), or from the edit cursor; playing, the switch happens in place for a seamless A/B
+  if reaper.GetPlayState() & 1 == 0 then
+    local s0, e0 = reaper.GetSet_LoopTimeRange2(0, false, false, 0, 0, false)
+    if e0 > s0 then
+      reaper.GetSet_LoopTimeRange2(0, true, true, s0, e0, false) -- the loop points follow the time selection
+      reaper.GetSetRepeat(1)
+      reaper.SetEditCurPos(s0, false, false)
+    end
+    reaper.Main_OnCommand(1007, 0) -- Transport: Play
+  end
 end
 -- Keep n: the other variants go (tracks deleted / FX removed), the tags are cleared; one undo step
 function RK.keep(g, n)

@@ -96,8 +96,9 @@ BRAIN_CONVENTIONS = """## Hibiki panel conventions
   fx / send / item / envelope / midi) over run_lua, so the change list says what changed.
 - Audition rack: to offer the user alternatives (parts, sounds, FX settings), make each variant a track and tag it
   with track P_EXT:hibiki_var = "<group>/<n>" (n = 1..9; unmute one, mute the rest), or tag FX on one track with
-  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). The panel shows numbered buttons; its Keep
-  button deletes the other variants itself. Match the variants' loudness before handing them over.
+  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). Set the time selection to the section where
+  the variants differ: a number button switches and loops that section. The panel's Keep button deletes the other
+  variants itself. Match the variants' loudness before handing them over.
 - "meter" lines in the REAPER context are measured on the master during the user's last playback (Hibiki Meter).
 - Files named ears-*.wav/.png/.md are the user's selection rendered from the master and measured for you."""
 BRAIN_TEMPLATE = """# Rules for agents working in REAPER

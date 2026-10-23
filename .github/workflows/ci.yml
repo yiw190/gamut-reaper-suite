@@ -25,6 +25,8 @@ jobs:
         run: python gateway/test_gateway.py
       - name: installer (fake HOME, no launchd)
         run: python tests/test_suite.py
+      - name: ears (stdlib excerpt analysis)
+        run: python tests/test_ears.py
 
   lua:
     name: bridge + Lua/shell syntax
@@ -64,3 +66,5 @@ jobs:
         run: python panel/test_panel.py
       - name: installer (fake profile, no services)
         run: python tests/test_suite.py
+      - name: ears (stdlib excerpt analysis)
+        run: python tests/test_ears.py

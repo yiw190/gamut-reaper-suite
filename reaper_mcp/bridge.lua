@@ -637,9 +637,16 @@ local function extend_item_to_notes(take, notes)
   return false
 end
 
+local undo_depth = 0 -- > 0 while a request runs inside its turn's undo block (see run_request)
+
 local function record_item_undo(take, desc)
-  -- Begin/EndBlock does not see pure MIDI edits.
-  reaper.Undo_OnStateChange_Item(0, desc, reaper.GetMediaItemTake_Item(take))
+  local item = reaper.GetMediaItemTake_Item(take)
+  if undo_depth > 0 then
+    -- inside the request's block: marking the item is enough for EndBlock to capture the MIDI edit
+    if reaper.MarkTrackItemsDirty then reaper.MarkTrackItemsDirty(reaper.GetMediaItem_Track(item), item) end
+    return
+  end
+  reaper.Undo_OnStateChange_Item(0, desc, item)
 end
 
 function DSL.add_midi_notes(ti, ii, notes)
@@ -1473,6 +1480,174 @@ function DSL.batch(calls)
 end
 
 ----------------------------------------------------------------------
+-- Turn receipts. Each request that can change the project runs in one undo block labelled
+-- "Hibiki <turn>: <what>", and what it changed goes into ExtState Hibiki/receipts (JSON, newest turn last),
+-- so the panel can list a turn's changes and undo exactly that turn. The turn id comes from the panel
+-- (ExtState Hibiki/turn while it waits for a reply); without one, calls less than 2 min apart share an id.
+----------------------------------------------------------------------
+local READ_ONLY = {
+  ping = true, get_project_summary = true, list_tracks = true, get_midi_notes = true, list_track_fx = true,
+  get_fx_params = true, list_sends = true, list_items = true, list_envelopes = true, get_envelope = true,
+  save_project = true, render_project = true, transport = true, set_time_selection = true, batch = true,
+}
+-- reaper_call of a getter changes nothing; GetSet* can set, so it counts as a change
+local function api_reads(func)
+  if func:match("^GetSet") then return false end
+  return func:match("^Get") or func:match("^Count") or func:match("^Enum") or func:match("^Is")
+    or func:match("^Has") or func:match("^TimeMap") or func:match("^TrackFX_Get") or func:match("^TakeFX_Get")
+    or func:match("^MIDI_Get") or func:match("^MIDI_Count") or func:match("^Master_Get") or func:match("^format_")
+    or func:match("^parse_") or func:match("^Undo_Can") or func:match("^Envelope_Evaluate")
+    or func == "time_precise" or func == "file_exists" or func == "CalculateNormalization" or func == "ShowConsoleMsg"
+end
+
+local function receipt_wanted(func)
+  if DSL[func] then return not READ_ONLY[func] end
+  return type(reaper[func]) == "function" and not api_reads(func)
+end
+
+local function tname(i)
+  if i == -1 then return "master" end
+  local t = type(i) == "number" and reaper.GetTrack(0, i)
+  if not t then return "#" .. tostring(type(i) == "number" and i + 1 or i) end
+  local _, name = reaper.GetTrackName(t)
+  return ("#%d %s"):format(i + 1, name)
+end
+
+local function fxname(ti, fxi)
+  local t = type(ti) == "number" and (ti == -1 and reaper.GetMasterTrack(0) or reaper.GetTrack(0, ti))
+  if not t or type(fxi) ~= "number" then return "FX " .. tostring(fxi) end
+  local ok, name = reaper.TrackFX_GetFXName(t, fxi, "")
+  return ok and name ~= "" and name or ("FX " .. (fxi + 1))
+end
+
+local function short(v, n)
+  local s = type(v) == "table" and json.encode(v) or tostring(v)
+  n = n or 60
+  if #s > n then s = s:sub(1, n - 1) .. "…" end
+  return s
+end
+
+local function props_text(p)
+  if type(p) ~= "table" then return "" end
+  local out = {}
+  local function add(k, f)
+    if p[k] ~= nil then out[#out + 1] = f(p[k]) end
+  end
+  add("name", function(v) return "name → " .. short(v, 30) end)
+  add("volume_db", function(v) return ("volume %.1f dB"):format(v) end)
+  add("gain_db", function(v) return ("gain %.1f dB"):format(v) end)
+  add("pan", function(v) return ("pan %.2f"):format(v) end)
+  add("mute", function(v) return v and "mute" or "unmute" end)
+  add("solo", function(v) return v and "solo" or "unsolo" end)
+  add("mode", function(v) return tostring(v) end)
+  add("position_beats", function(v) return ("move to beat %g"):format(v) end)
+  add("length_beats", function(v) return ("length %g beats"):format(v) end)
+  add("fade_in", function(v) return ("fade in %gs"):format(v) end)
+  add("fade_out", function(v) return ("fade out %gs"):format(v) end)
+  add("loop", function(v) return v and "loop on" or "loop off" end)
+  add("src_channel", function(v) return "src ch " .. v end)
+  add("dst_channel", function(v) return "dst ch " .. v end)
+  return table.concat(out, ", ")
+end
+
+local function count_of(list) return type(list) == "table" and json.len(list) or 0 end
+
+local DESCRIBE = {
+  add_track = function(a) return ("add track %s"):format(short(a[1] or "", 30)) end,
+  delete_track = function(a) return "delete track " .. tname(a[1]) end,
+  update_track = function(a) return tname(a[1]) .. ": " .. props_text(a[2]) end,
+  set_tempo = function(a) return ("tempo %g BPM"):format(a[1] or 0) end,
+  set_time_signature = function(a) return ("time signature %s/%s"):format(a[1], a[2]) end,
+  action = function(a)
+    local id = tonumber(a[1]) or 0
+    local ok, text = pcall(function() return reaper.kbd_getTextFromCmd and reaper.kbd_getTextFromCmd(id, 0) end)
+    return "action " .. tostring(a[1]) .. ((ok and text and text ~= "") and (" " .. text) or "")
+  end,
+  create_midi_item = function(a) return ("%s: new MIDI item at beat %g"):format(tname(a[1]), a[2] or 0) end,
+  add_midi_notes = function(a) return ("%s item %s: add %d notes"):format(tname(a[1]), a[2], count_of(a[3])) end,
+  replace_midi_notes = function(a) return ("%s item %s: replace notes (%d)"):format(tname(a[1]), a[2], count_of(a[3])) end,
+  update_midi_note = function(a) return ("%s item %s: edit note %s"):format(tname(a[1]), a[2], a[3]) end,
+  delete_midi_notes = function(a) return ("%s item %s: delete %d notes"):format(tname(a[1]), a[2], count_of(a[3])) end,
+  add_midi_cc = function(a) return ("%s item %s: add %d CC"):format(tname(a[1]), a[2], count_of(a[3])) end,
+  add_track_fx = function(a) return ("%s: add %s"):format(tname(a[1]), short(a[2], 40)) end,
+  delete_track_fx = function(a) return ("%s: remove %s"):format(tname(a[1]), fxname(a[1], a[2])) end,
+  set_fx_enabled = function(a) return ("%s: %s %s"):format(tname(a[1]), a[3] and "enable" or "bypass", fxname(a[1], a[2])) end,
+  move_track_fx = function(a) return ("%s: move %s to slot %s"):format(tname(a[1]), fxname(a[1], a[2]), (a[3] or 0) + 1) end,
+  set_fx_preset = function(a) return ("%s: %s preset %s"):format(tname(a[1]), fxname(a[1], a[2]), short(a[3], 30)) end,
+  set_fx_param = function(a)
+    local v = a[5] ~= nil and a[5] or a[4]
+    return ("%s: %s %s = %s"):format(tname(a[1]), fxname(a[1], a[2]), short(a[3], 24), short(v, 16))
+  end,
+  add_send = function(a)
+    local p = props_text(a[3])
+    return ("send %s → %s%s"):format(tname(a[1]), tname(a[2]), p ~= "" and (" (" .. p .. ")") or "")
+  end,
+  delete_send = function(a) return ("%s: delete send %s"):format(tname(a[1]), a[2]) end,
+  update_send = function(a) return ("%s send %s: %s"):format(tname(a[1]), a[2], props_text(a[3])) end,
+  update_item = function(a) return ("%s item %s: %s"):format(tname(a[1]), a[2], props_text(a[3])) end,
+  import_media = function(a)
+    local o = type(a[2]) == "table" and a[2] or {}
+    return ("import %s%s"):format(short(tostring(a[1] or ""):match("[^/\\]+$") or a[1], 40),
+      o.as_new_track and " (new track)" or (o.track_index and (" to " .. tname(o.track_index)) or ""))
+  end,
+  set_envelope = function(a) return ("%s: %s envelope, %d points"):format(tname(a[1]), short(a[2], 20), count_of(a[3])) end,
+  add_marker = function(a) return ("%s %s at beat %g"):format(a[3] and "region" or "marker", short(a[2] or "", 30), a[1] or 0) end,
+  create_bus = function(a) return ("bus %s from %d tracks"):format(short(a[1] or "Bus", 30), count_of(a[2])) end,
+}
+
+local function describe(func, args)
+  local f = DESCRIBE[func]
+  if f then
+    local ok, s = pcall(f, args or {})
+    if ok and s then return s end
+  end
+  local parts = {}
+  for i = 1, math.min(json.len(args or {}), 4) do parts[i] = short(args[i], 24) end
+  return func .. "(" .. table.concat(parts, ", ") .. ")"
+end
+
+local MAX_TURNS, MAX_LINES = 8, 60
+local receipts = {}       -- { id, at, n, lines = {}, failed }
+local staged = {}         -- changes of the request that is running
+local auto_turn, auto_at = nil, -math.huge
+
+local function note_change(what, ok)
+  staged[#staged + 1] = { what = what, ok = ok ~= false }
+end
+
+local function current_turn()
+  local t = reaper.GetExtState("Hibiki", "turn")
+  if t ~= "" and t:match("^[%w._-]+$") and #t <= 40 then return t end
+  local now = reaper.time_precise()
+  if not auto_turn or now - auto_at > 120 then auto_turn = "mcp-" .. os.time() end
+  auto_at = now
+  return auto_turn
+end
+
+local function commit_receipt(turn)
+  local r = receipts[#receipts]
+  if not r or r.id ~= turn then
+    r = { id = turn, at = os.time(), n = 0, points = 0, lines = {} }
+    receipts[#receipts + 1] = r
+    if #receipts > MAX_TURNS then table.remove(receipts, 1) end
+  end
+  r.points = r.points + 1 -- undo points this turn left (one per request), so a revert can tell it got them all
+  for _, c in ipairs(staged) do
+    r.n = r.n + 1
+    if not c.ok then r.failed = true end
+    if #r.lines < MAX_LINES then r.lines[#r.lines + 1] = c.ok and c.what or (c.what .. " (failed)") end
+  end
+  r.at = os.time()
+  reaper.SetExtState("Hibiki", "receipts", json.encode(receipts), false)
+  reaper.SetExtState("Hibiki", "receipts_seq", tostring(os.time()) .. "." .. r.n .. "." .. #receipts, false)
+end
+
+local function first_line(code)
+  local line = tostring(code or ""):match("^%s*([^\n]*)") or ""
+  return short(line, 50)
+end
+
+----------------------------------------------------------------------
 -- Dispatch
 ----------------------------------------------------------------------
 local function tidy_err(msg)
@@ -1515,30 +1690,20 @@ dispatch = function(req)
   for i = 1, nargs do args[i] = unmarshal(args[i]) end
 
   if DSL[func] then
-    local run = function()
-      local res = DSL[func](table.unpack(args, 1, nargs))
-      res = res or {}
-      if res.ok == nil then res.ok = true end
-      return res
-    end
-    if MIDI_FUNCS[func] or func == "batch" or func == "ping"
-        or func == "get_project_summary" or func == "list_tracks"
-        or func == "get_midi_notes" or func == "list_track_fx"
-        or func == "get_fx_params" or func == "list_sends"
-        or func == "list_items" or func == "list_envelopes"
-        or func == "get_envelope" or func == "save_project" then
-      return run()
-    end
-    reaper.Undo_BeginBlock()
-    local ok, res = pcall(run)
-    reaper.Undo_EndBlock("MCP: " .. tostring(func), -1)
-    if not ok then error(res) end
+    -- described before the call: a deleted track has no name afterwards
+    local what = receipt_wanted(func) and describe(func, args)
+    local ok, res = pcall(DSL[func], table.unpack(args, 1, nargs))
+    if what then note_change(what, ok, ok and res and res.ret) end
+    if not ok then error(res, 0) end
+    res = res or {}
+    if res.ok == nil then res.ok = true end
     return res
   end
 
   local fn = reaper[func]
   if type(fn) == "function" then
     local packed = table.pack(pcall(fn, table.unpack(args, 1, nargs)))
+    if receipt_wanted(func) then note_change(describe(func, args), packed[1]) end
     if not packed[1] then
       return { ok = false, error = "error calling " .. func .. ": " .. tostring(packed[2]) }
     end
@@ -1549,6 +1714,31 @@ dispatch = function(req)
   end
 
   return { ok = false, error = "unknown function: " .. tostring(func) }
+end
+
+-- one undo block per request that can change something; its changes go on the turn's receipt. An empty block
+-- leaves no undo point (and no state-change tick), which is how a read-only run_lua stays off the receipt
+local function run_request(req)
+  local func = req.func
+  if func ~= "run_lua" and not receipt_wanted(func) and func ~= "batch" then return dispatch(req) end
+  staged = {}
+  local turn = current_turn()
+  reaper.Undo_BeginBlock2(0)
+  undo_depth = undo_depth + 1
+  local ok, resp = pcall(dispatch, req)
+  undo_depth = undo_depth - 1
+  if func == "run_lua" then note_change("script: " .. first_line(req.code), ok and type(resp) == "table" and resp.ok ~= false) end
+  local first = staged[1] and staged[1].what or func
+  local label = "Hibiki " .. turn .. ": " .. short(first, 70) .. (#staged > 1 and (" +" .. (#staged - 1)) or "")
+  local before = reaper.GetProjectStateChangeCount(0)
+  reaper.Undo_EndBlock2(0, label, -1)
+  if reaper.GetProjectStateChangeCount(0) ~= before then
+    if #staged == 0 then note_change(func) end
+    commit_receipt(turn)
+  end
+  staged = {}
+  if not ok then error(resp, 0) end
+  return resp
 end
 
 ----------------------------------------------------------------------
@@ -1575,7 +1765,7 @@ local function handle_mailbox()
     if not req then
       resp = { ok = false, error = "bad request json: " .. tostring(derr) }
     else
-      local ok, r = pcall(dispatch, req)
+      local ok, r = pcall(run_request, req)
       if ok then resp = r
       else resp = { ok = false, error = tidy_err(r) } end
       resp.id = req.id

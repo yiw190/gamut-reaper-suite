@@ -263,8 +263,9 @@ def main() -> None:
     check("list_items reads 3 properties per item",
           r.get("ok") and reads == 3 * n_items, f"reads={reads} items={n_items}")
 
-    # --- read-only ops skip undo block --------------------------------
+    # --- read-only ops leave no undo point --------------------------------
     clear()
+    n_labels = len(list(g.undo_labels.values()))
     r = rpc("batch", [[
         {"func": "list_items", "args": [0]},
         {"func": "list_sends", "args": [0]},
@@ -273,13 +274,49 @@ def main() -> None:
         {"func": "get_envelope", "args": [0, 0]},
     ]])
     check("read-only batch runs", r.get("ok"), r)
-    check("read-only batch skips undo blocks",
-          count("Undo_BeginBlock") == 0, f"undo={count('Undo_BeginBlock')}")
+    check("read-only batch leaves no undo point", len(list(g.undo_labels.values())) == n_labels,
+          list(g.undo_labels.values()))
 
-    # --- mutating ops keep their undo block ---------------------------
+    # --- mutating ops: one labelled undo point per request, and a receipt per turn ------------
     clear()
+    g.ext_state["Hibiki/turn"] = "k1.3"
     rpc("update_track", [0, {"volume_db": -2}])
-    check("mutating op keeps its undo block", count("Undo_BeginBlock") == 1)
+    labels = list(g.undo_labels.values())
+    check("mutating op gets one undo block", count("Undo_BeginBlock2") == 1 and count("Undo_EndBlock2") == 1)
+    check("undo point carries the turn id and what changed",
+          labels and labels[-1].startswith("Hibiki k1.3: #1 ") and "volume -2.0 dB" in labels[-1], labels)
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    check("receipt for the turn", rec[-1]["id"] == "k1.3" and rec[-1]["n"] == 1
+          and "volume -2.0 dB" in rec[-1]["lines"][0], rec)
+    r = rpc("batch", [[
+        {"func": "update_track", "args": [0, {"mute": True}]},
+        {"func": "list_tracks", "args": []},
+        {"func": "add_track", "args": ["Pad", 1]},
+    ]])
+    labels = list(g.undo_labels.values())
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    check("a batch is one undo point (+N more)", r.get("ok") and labels[-1].startswith("Hibiki k1.3: ")
+          and labels[-1].endswith("+1") and count("Undo_BeginBlock2") == 2, labels)
+    check("batch changes join the same turn's receipt", rec[-1]["id"] == "k1.3" and rec[-1]["n"] == 3
+          and rec[-1]["points"] == 2
+          and rec[-1]["lines"][1].endswith("mute") and rec[-1]["lines"][2] == "add track Pad", rec)
+    n_labels = len(labels)
+    r = rpc("run_lua", code="return reaper.CountTracks(0)")
+    check("read-only run_lua: no undo point, no receipt line", r.get("ok") and len(list(g.undo_labels.values())) == n_labels
+          and json.loads(g.ext_state["Hibiki/receipts"])[-1]["n"] == 3)
+    r = rpc("run_lua", code="reaper.InsertTrackAtIndex(0, true)\nreturn 1")
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    check("changing run_lua: receipt line with the script's first line",
+          rec[-1]["n"] == 4 and rec[-1]["lines"][3] == "script: reaper.InsertTrackAtIndex(0, true)", rec)
+    rpc("delete_track", [0])
+    g.ext_state["Hibiki/turn"] = "k1.4"
+    rpc("update_track", [0, {"pan": 0.5}])
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    check("a new turn id starts a new receipt", [x["id"] for x in rec][-2:] == ["k1.3", "k1.4"], rec)
+    g.ext_state["Hibiki/turn"] = ""
+    rpc("update_track", [0, {"pan": 0}])
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    check("no turn id: calls get an automatic mcp-<time> turn", rec[-1]["id"].startswith("mcp-"), rec)
 
     # --- midi CC / program change --------------------------------------
     seeded_track(0)
@@ -294,6 +331,8 @@ def main() -> None:
     check("program change is 0xC0", int(pc["chanmsg"]) == 0xC0 and int(pc["msg2"]) == 33, dict(pc))
     check("cc 64 value 127", int(cc64["chanmsg"]) == 0xB0 and int(cc64["msg2"]) == 64 and int(cc64["msg3"]) == 127, dict(cc64))
     check("add_midi_cc sorts once", count("MIDI_Sort") == 1, f"sort={count('MIDI_Sort')}")
+    check("MIDI edit inside the request's undo block marks the item instead of a separate undo point",
+          count("MarkTrackItemsDirty") == 1 and count("Undo_OnStateChange_Item") == 0)
 
     # --- compact payloads ----------------------------------------------
     seeded_track(0)
@@ -383,7 +422,7 @@ def main() -> None:
     r = rpc("save_project", [None])
     check("save_project named project saves in place", r.get("ok") and r["ret"]["path"] == "/tmp/new dir/song.RPP"
           and count("Main_SaveProject") == 1, r)
-    check("save_project skips undo block", count("Undo_BeginBlock") == 0)
+    check("save_project skips undo block", count("Undo_BeginBlock2") == 0)
     r = rpc("save_project", ["/readonly/song.RPP"])
     check("save_project reports a failed write", r.get("ok") is False and "could not write" in (r.get("error") or ""), r)
 

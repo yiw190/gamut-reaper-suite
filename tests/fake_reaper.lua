@@ -76,6 +76,7 @@ reaper.GetMediaTrackInfo_Value = function(t, key)
 end
 reaper.SetMediaTrackInfo_Value = function(t, key, v)
   hit("SetMediaTrackInfo_Value")
+  fake_changed = true
   if key == "D_VOL" then t.vol = v end
   if key == "B_MUTE" then t.mute = (v == 1) end
   if key == "I_SOLO" then t.solo = (v ~= 0) end
@@ -86,7 +87,7 @@ reaper.GetSetMediaTrackInfo_String = function(t, key, v)
   if key == "P_NAME" then t.name = v end
   return true, t.name
 end
-reaper.InsertTrackAtIndex = function(i) table.insert(tracks, i + 1, new_track()) end
+reaper.InsertTrackAtIndex = function(i) fake_changed = true table.insert(tracks, i + 1, new_track()) end
 reaper.DeleteTrack = function(t)
   for i, x in ipairs(tracks) do
     if x == t then table.remove(tracks, i) return end
@@ -129,6 +130,22 @@ end
 -- undo
 reaper.Undo_BeginBlock = function() hit("Undo_BeginBlock") end
 reaper.Undo_EndBlock = function() hit("Undo_EndBlock") end
+-- like REAPER: an EndBlock that saw no change leaves no undo point and doesn't tick the state counter
+undo_labels, state_changes, fake_changed = {}, 0, false
+reaper.Undo_BeginBlock2 = function() hit("Undo_BeginBlock2") fake_changed = false end
+reaper.Undo_EndBlock2 = function(_, label)
+  hit("Undo_EndBlock2")
+  if fake_changed then
+    undo_labels[#undo_labels + 1] = label
+    state_changes = state_changes + 1
+  end
+end
+reaper.GetProjectStateChangeCount = function() return state_changes end
+reaper.MarkTrackItemsDirty = function() hit("MarkTrackItemsDirty") end
+reaper.GetMediaItem_Track = function(it) return it.track end
+ext_state = {}
+reaper.GetExtState = function(sec, key) return ext_state[sec .. "/" .. key] or "" end
+reaper.SetExtState = function(sec, key, v) ext_state[sec .. "/" .. key] = v end
 reaper.Undo_OnStateChange_Item = function() hit("Undo_OnStateChange_Item") end
 
 -- items
@@ -185,6 +202,7 @@ reaper.MIDI_SetNote = function(take, i, sel, muted, sppq, eppq, chan, pitch, vel
 end
 reaper.MIDI_InsertNote = function(take, sel, muted, sppq, eppq, chan, pitch, vel)
   hit("MIDI_InsertNote")
+  fake_changed = true
   take.notes[#take.notes + 1] = { sel = sel, muted = muted, sppq = sppq,
     eppq = eppq, chan = chan, pitch = pitch, vel = vel }
 end
@@ -200,6 +218,7 @@ reaper.MIDI_GetPPQPosFromProjQN = function(_, qn) return qn * PPQ end
 reaper.MIDI_GetProjQNFromPPQPos = function(_, ppq) return ppq / PPQ end
 reaper.MIDI_InsertCC = function(take, sel, muted, ppq, chanmsg, chan, msg2, msg3)
   hit("MIDI_InsertCC")
+  fake_changed = true
   take.ccs = take.ccs or {}
   take.ccs[#take.ccs + 1] = {
     sel = sel, muted = muted, ppq = ppq, chanmsg = chanmsg,

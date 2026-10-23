@@ -1721,6 +1721,22 @@ do
     REC.running, REC.lines, REC.at = true, nil, reaper.time_precise()
     REC.job = REC.cli('recover', 'recover --json', finished)
   end
+  -- `hibiki use dev`: run the checkout's CLI with the recorded Python. An installed CLI older than dev mode (0.5.0)
+  -- neither forwards nor knows the newer commands (update, ears), so the panel goes to the checkout itself
+  local function dev_cli()
+    local f = io.open(HOME .. '/.config/reaper-mcp/mode.json', 'rb')
+    if not f then return nil end
+    local m = decode(f:read('*a') or '')
+    f:close()
+    if type(m) ~= 'table' or m.mode ~= 'dev' or type(m.path) ~= 'string' or type(m.python) ~= 'string' then return nil end
+    local cli = m.path .. '/reaper_mcp/cli.py'
+    for _, path in ipairs({ cli, m.python }) do
+      local g = io.open(path, 'rb')
+      if not g then return nil end
+      g:close()
+    end
+    return q(m.python) .. ' -s -E ' .. q(cli)
+  end
   function REC.cli(name, args, cb)
     reqn = reqn + 1
     local b = DIR .. name .. RUN .. '_' .. reqn
@@ -1734,6 +1750,9 @@ do
       end)
       if not ok then cb(127, ''); return nil end
       win_bg(line)
+    elseif dev_cli() then
+      sh('( ' .. dev_cli() .. ' ' .. args .. ' > ' .. out .. ' 2>/dev/null; echo $? > ' .. code .. '; /bin/mv ' .. code .. ' '
+        .. done .. ' ) >/dev/null 2>&1 &')
     else
       sh('( for h in /usr/local/bin/hibiki "$HOME/.local/bin/hibiki" "$(command -v hibiki)"; do [ -n "$h" ] && [ -x "$h" ] '
         .. '&& break; h=; done; if [ -n "$h" ]; then "$h" ' .. args .. ' > ' .. out .. ' 2>/dev/null; echo $? > ' .. code

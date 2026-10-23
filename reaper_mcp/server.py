@@ -288,7 +288,8 @@ tool(
     "track",
     "Track operations. action: list | add | delete | update | bus. "
     "update uses name, volume_db, pan (-1..1), mute, solo. "
-    "bus creates a submix named `name` and routes source_indices to it.",
+    "bus creates a submix named `name` and routes source_indices through it (their direct send to the "
+    "master/parent is turned off).",
     obj({
         "action": {"type": "string", "enum": ["list", "add", "delete", "update", "bus"]},
         "index": {"type": "integer", "minimum": -1},
@@ -443,7 +444,8 @@ tool(
     "envelope",
     "Track envelopes. action: list | get | set. "
     "name is REAPER envelope name (Volume, Pan, Mute, ...). "
-    "set replaces all points. value is native envelope value (Volume 1.0 = 0 dB).",
+    "set replaces all points. value is the envelope's value; Volume is linear gain (1.0 = 0 dB, "
+    "0.5 = -6 dB), also on fader-scaled envelopes.",
     obj({
         "action": {"type": "string", "enum": ["list", "get", "set"]},
         "track_index": {"type": "integer", "minimum": -1},

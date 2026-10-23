@@ -988,16 +988,19 @@ local function envelope_at(ti, name_or_index)
   return env
 end
 
+-- Point values come back raw, and a fader-scaled volume envelope (REAPER 6+ default) stores fader positions
+-- (0 dB = 716.2), so convert both ways: the tool speaks gain (Volume 1.0 = 0 dB) for every scaling mode.
 function DSL.get_envelope(ti, name_or_index)
   local env = envelope_at(ti, name_or_index)
   local _, name = reaper.GetEnvelopeName(env, "")
+  local mode = reaper.GetEnvelopeScalingMode(env)
   local pts = {}
   for i = 0, reaper.CountEnvelopePoints(env) - 1 do
     local ok, time, value, shape, tension, selected = reaper.GetEnvelopePoint(env, i)
     if ok then
       pts[#pts + 1] = {
         beats = time_to_beats(time),
-        value = value,
+        value = reaper.ScaleFromEnvelopeMode(mode, value),
         shape = shape,
         tension = tension,
         selected = selected,
@@ -1009,11 +1012,12 @@ end
 
 function DSL.set_envelope(ti, name_or_index, points)
   local env = envelope_at(ti, name_or_index)
+  local mode = reaper.GetEnvelopeScalingMode(env)
   points = points or {}
   reaper.DeleteEnvelopePointRange(env, -math.huge, math.huge)
   for _, p in ipairs(points) do
     reaper.InsertEnvelopePoint(env, beats_to_time(p.beats or p.time or 0),
-      p.value or 0, p.shape or 0, p.tension or 0, p.selected and true or false, true)
+      reaper.ScaleToEnvelopeMode(mode, p.value or 0), p.shape or 0, p.tension or 0, p.selected and true or false, true)
   end
   reaper.Envelope_SortPoints(env)
   refresh_arrange()
@@ -1109,6 +1113,8 @@ function DSL.create_bus(name, source_indices)
   for _, i in ipairs(source_indices or {}) do
     local src = track_at(i)
     reaper.CreateTrackSend(src, bus)
+    -- a submix: the source reaches its parent only through the bus; a direct send as well would play it twice
+    reaper.SetMediaTrackInfo_Value(src, "B_MAINSEND", 0)
   end
   refresh_tracks()
   refresh_arrange()

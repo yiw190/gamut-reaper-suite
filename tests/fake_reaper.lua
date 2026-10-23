@@ -70,6 +70,7 @@ reaper.GetMediaTrackInfo_Value = function(t, key)
     for i, x in ipairs(tracks) do if x == t then return i end end
     return 0
   end
+  if key == "B_MAINSEND" then return t.mainsend == false and 0 or 1 end
   return 0.0
 end
 reaper.SetMediaTrackInfo_Value = function(t, key, v)
@@ -77,6 +78,7 @@ reaper.SetMediaTrackInfo_Value = function(t, key, v)
   if key == "D_VOL" then t.vol = v end
   if key == "B_MUTE" then t.mute = (v == 1) end
   if key == "I_SOLO" then t.solo = (v ~= 0) end
+  if key == "B_MAINSEND" then t.mainsend = (v ~= 0) end
 end
 reaper.GetSetMediaTrackInfo_String = function(t, key, v)
   if key == "P_NAME" then t.name = v end
@@ -268,6 +270,36 @@ reaper.CountEnvelopePoints = function(env) return #env.points end
 reaper.GetEnvelopePoint = function(env, i)
   local p = env.points[i + 1]
   return true, p[1], p[2], 0, 0, false
+end
+reaper.GetTrackEnvelopeByName = function(t, name)
+  for _, e in ipairs(t.envelopes) do if e.name == name then return e end end
+end
+reaper.DeleteEnvelopePointRange = function(env, t0, t1)
+  for i = #env.points, 1, -1 do
+    if env.points[i][1] >= t0 and env.points[i][1] < t1 then table.remove(env.points, i) end
+  end
+end
+reaper.InsertEnvelopePoint = function(env, time, value)
+  env.points[#env.points + 1] = { time, value }
+  return true
+end
+reaper.Envelope_SortPoints = function(env) table.sort(env.points, function(a, b) return a[1] < b[1] end) end
+-- fader scaling as REAPER computes it (schwa, forum.cockos.com t=241604): a gain of 1.0 sits at 716.2 of 1000
+local FADER, FADER_I = 1.9905358527674863, 0.25118864315095801
+reaper.GetEnvelopeScalingMode = function(env) return env.scaling or 0 end
+reaper.ScaleToEnvelopeMode = function(mode, v)
+  if mode ~= 1 then return v end
+  local b = (-FADER + math.sqrt(FADER * FADER + 4 * FADER * v)) * FADER_I
+  return b ^ (1 / 3) * 1000
+end
+reaper.ScaleFromEnvelopeMode = function(mode, y)
+  if mode ~= 1 then return y end
+  y = (y * 0.001) ^ 3
+  return (y + y * y) * FADER
+end
+reaper.CreateTrackSend = function(src, dest)
+  src.sends[#src.sends + 1] = { dest = dest }
+  return #src.sends - 1
 end
 reaper.TrackFX_GetCount = function() return 0 end
 

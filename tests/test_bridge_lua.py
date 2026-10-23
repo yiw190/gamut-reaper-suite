@@ -416,6 +416,40 @@ def main() -> None:
     left = rpc("get_midi_notes", [0, item])["ret"]
     check("delete [0,0,99] removes one note", r.get("ok") and r["ret"]["deleted"] == 1 and len(left) == 1, r)
 
+    # --- volume envelopes speak gain, whatever their scaling ----------
+    lua.execute("""
+        tracks[#tracks + 1] = new_track("Vox")
+        tracks[#tracks].envelopes = { { name = "Volume", scaling = 1, points = {} } }
+        tracks[#tracks + 1] = new_track("Amp")
+        tracks[#tracks].envelopes = { { name = "Volume", points = {} } }
+    """)
+    vox, amp = len(g.tracks) - 2, len(g.tracks) - 1
+    r = rpc("set_envelope", [vox, "Volume", [{"beats": 0, "value": 1.0}, {"beats": 4, "value": 0.5}]])
+    raw = [float(g.tracks[vox + 1]["envelopes"][1]["points"][i][2]) for i in (1, 2)]
+    want = [float(g.reaper.ScaleToEnvelopeMode(1, v)) for v in (1.0, 0.5)]
+    check("set_envelope on a fader-scaled envelope stores fader positions (0 dB = 716.2)",
+          r.get("ok") and all(abs(a - b) < 1e-6 for a, b in zip(raw, want)) and abs(raw[0] - 716.2178) < 1e-3, (raw, want))
+    lua.execute("""tracks[%d].envelopes[1].points = {
+        { 0.0, reaper.ScaleToEnvelopeMode(1, 1.0) }, { 2.0, reaper.ScaleToEnvelopeMode(1, 0.5) } }""" % (vox + 1))
+    r = rpc("get_envelope", [vox, "Volume"])
+    vals = [p["value"] for p in r.get("ret", {}).get("points", [])]
+    check("get_envelope on a fader-scaled envelope returns gain (points drawn at 0 dB and -6 dB)", r.get("ok") and len(vals) == 2
+          and abs(vals[0] - 1.0) < 1e-9 and abs(vals[1] - 0.5) < 1e-9, r)
+    rpc("set_envelope", [amp, "Volume", [{"beats": 0, "value": 0.5}]])
+    check("set_envelope on an amplitude envelope stores the gain as is",
+          float(g.tracks[amp + 1]["envelopes"][1]["points"][1][2]) == 0.5)
+
+    # --- a bus is a submix: sources reach the master through it only -
+    n_before = len(g.tracks)
+    r = rpc("create_bus", ["Drum Bus", [vox, amp]])
+    bus = g.tracks[n_before + 1]
+    srcs = [g.tracks[vox + 1], g.tracks[amp + 1]]
+    check("create_bus sends each source to the new bus", r.get("ok") and r["ret"]["index"] == n_before
+          and all(len(s["sends"]) == 1 and s["sends"][1]["dest"]["name"] == "Drum Bus" for s in srcs), r)
+    check("create_bus turns off the sources' direct master send",
+          all(int(g.reaper.GetMediaTrackInfo_Value(s, "B_MAINSEND")) == 0 for s in srcs)
+          and int(g.reaper.GetMediaTrackInfo_Value(bus, "B_MAINSEND")) == 1)
+
     json_checks(lupa, check)
 
     # --- the bridge is still responsive -------------------------------

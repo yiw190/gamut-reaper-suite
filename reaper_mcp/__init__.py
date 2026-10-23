@@ -1,1 +1,1 @@
-__version__ = "0.5.1-rc.1"  # tests/test_server.py checks VERSION in reaper_mcp/bridge.lua matches
+__version__ = "0.6.0-rc.1"  # tests/test_server.py checks VERSION in reaper_mcp/bridge.lua matches

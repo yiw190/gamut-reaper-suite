@@ -1,0 +1,139 @@
+desc:Hibiki Meter (loudness, true peak, bands, stereo -> gmem Hibiki)
+//author: Hibiki
+//tags: analysis loudness meter
+// Sits in the master's monitoring FX (never rendered) and passes audio through untouched. Every 100 ms of
+// playback it writes one frame to gmem "Hibiki", which the Hibiki panel turns into context for the agent.
+// gmem: [0] layout version  [1] frames written  [2] ring size  [3] stride  [4] srate  [5] alive counter
+//       frame i at 8 + (i % ring) * stride: position s, play state, LUFS-M, LUFS-S, true peak dBTP,
+//       sample peak dBFS, correlation, side/mid dB, then 8 band levels dB (40 100 250 600 1.5k 3k 6k 12k Hz, mid)
+options:gmem=Hibiki no_meter
+in_pin:left input
+in_pin:right input
+out_pin:left output
+out_pin:right output
+
+@init
+ext_noinit = 1;
+VERSION = 1; BASE = 8; STRIDE = 16; RING = 1200;
+gmem[0] != VERSION ? gmem[1] = 0;
+gmem[0] = VERSION; gmem[2] = RING; gmem[3] = STRIDE; gmem[4] = srate;
+
+// K-weighting (ITU-R BS.1770-4) at any sample rate, as libebur128 derives it
+f0 = 1681.974450955533; G = 3.999843853973347; Q = 0.7071752369554196;
+K = tan($pi * f0 / srate); Vh = 10 ^ (G / 20); Vb = Vh ^ 0.4996667741545416;
+a0 = 1 + K / Q + K * K;
+sb0 = (Vh + Vb * K / Q + K * K) / a0; sb1 = 2 * (K * K - Vh) / a0; sb2 = (Vh - Vb * K / Q + K * K) / a0;
+sa1 = 2 * (K * K - 1) / a0; sa2 = (1 - K / Q + K * K) / a0;
+f0 = 38.13547087602444; Q = 0.5003270373238773;
+K = tan($pi * f0 / srate); a0 = 1 + K / Q + K * K;
+ha1 = 2 * (K * K - 1) / a0; ha2 = (1 - K / Q + K * K) / a0;
+
+// true peak: 4x oversampling, 48-tap Blackman-windowed sinc as 4 phases of 12, each phase unity at DC
+TPH = 1000; TPC = 1100;
+i = 0;
+loop(48,
+  t = (i - 23.5) / 4;
+  TPC[i] = (sin($pi * t) / ($pi * t)) * (0.42 - 0.5 * cos(2 * $pi * i / 47) + 0.08 * cos(4 * $pi * i / 47));
+  i += 1;
+);
+p = 0;
+loop(4,
+  sum = 0; k = 0; loop(12, sum += TPC[p + 4 * k]; k += 1);
+  k = 0; loop(12, TPC[p + 4 * k] /= sum; k += 1);
+  p += 1;
+);
+memset(TPH, 0, 32); tpos = 0;
+
+// bands: constant-peak band-pass biquads on the mid signal
+BF = 1200; BC = 1300; BS = 1400; BE = 1500;
+BF[0] = 40; BF[1] = 100; BF[2] = 250; BF[3] = 600; BF[4] = 1500; BF[5] = 3000; BF[6] = 6000; BF[7] = 12000;
+b = 0;
+loop(8,
+  w0 = 2 * $pi * min(BF[b], srate * 0.45) / srate; al = sin(w0) / (2 * 1.2); a0 = 1 + al;
+  o = BC + b * 5;
+  o[0] = al / a0; o[1] = 0; o[2] = -al / a0; o[3] = -2 * cos(w0) / a0; o[4] = (1 - al) / a0;
+  b += 1;
+);
+memset(BS, 0, 16); memset(BE, 0, 8);
+
+// 100 ms blocks; the last 30 block powers give LUFS-M (4 blocks) and LUFS-S (30 blocks)
+BP = 1600; memset(BP, 0, 30); bi = 0; nb = 0;
+blen = floor(srate * 0.1);
+cnt = 0; eL = eR = 0; sLL = sRR = sLR = sMM = sSS = 0; tpk = spk = 0; bpos = play_position;
+sL1 = sL2 = hL1 = hL2 = sR1 = sR2 = hR1 = hR2 = 0;
+showM = showS = showT = -150;
+
+function db10(x) ( 10 * log10(max(x, 1e-20)) );
+function db20(x) ( 20 * log10(max(x, 1e-10)) );
+
+@sample
+cnt == 0 ? bpos = play_position;
+x = spl0;
+y = sb0 * x + sL1; sL1 = sb1 * x - sa1 * y + sL2; sL2 = sb2 * x - sa2 * y;
+z = y + hL1; hL1 = -2 * y - ha1 * z + hL2; hL2 = y - ha2 * z;
+eL += z * z;
+x = spl1;
+y = sb0 * x + sR1; sR1 = sb1 * x - sa1 * y + sR2; sR2 = sb2 * x - sa2 * y;
+z = y + hR1; hR1 = -2 * y - ha1 * z + hR2; hR2 = y - ha2 * z;
+eR += z * z;
+
+a = abs(spl0); c = abs(spl1);
+a > spk ? spk = a; c > spk ? spk = c;
+tpos = (tpos + 1) & 15;
+TPH[tpos] = spl0; TPH[16 + tpos] = spl1;
+// the 4 phases look at the samples around the filter's centre (6 back): only near the block's peak can they set it
+cen = (tpos - 6) & 15;
+max(max(abs(TPH[cen]), abs(TPH[(cen - 1) & 15])), max(abs(TPH[16 + cen]), abs(TPH[16 + ((cen - 1) & 15)]))) > tpk * 0.5 ? (
+  p = 0;
+  loop(4,
+    aL = 0; aR = 0; k = 0;
+    loop(12,
+      idx = (tpos - k) & 15; cf = TPC[p + 4 * k];
+      aL += cf * TPH[idx]; aR += cf * TPH[16 + idx];
+      k += 1;
+    );
+    aL = abs(aL); aR = abs(aR);
+    aL > tpk ? tpk = aL; aR > tpk ? tpk = aR;
+    p += 1;
+  );
+);
+
+m = (spl0 + spl1) * 0.5; sd = (spl0 - spl1) * 0.5;
+sLL += spl0 * spl0; sRR += spl1 * spl1; sLR += spl0 * spl1; sMM += m * m; sSS += sd * sd;
+b = 0;
+loop(8,
+  o = BC + b * 5; s = BS + b * 2;
+  y = o[0] * m + s[0];
+  s[0] = o[1] * m - o[3] * y + s[1];
+  s[1] = o[2] * m - o[4] * y;
+  BE[b] += y * y;
+  b += 1;
+);
+
+cnt += 1;
+cnt >= blen ? (
+  BP[bi] = (eL + eR) / cnt; bi = (bi + 1) % 30; nb = min(nb + 1, 30);
+  mom = 0; k = 0; loop(min(nb, 4), mom += BP[(bi - 1 - k + 30) % 30]; k += 1); mom /= min(nb, 4);
+  sh = 0; k = 0; loop(nb, sh += BP[k]; k += 1); sh /= nb;
+  showM = -0.691 + db10(mom); showS = -0.691 + db10(sh); showT = max(showT - 0.5, db20(tpk));
+  gmem[5] += 1;
+  (play_state & 1) ? (
+    n = gmem[1]; o = BASE + (n % RING) * STRIDE;
+    gmem[o] = bpos; gmem[o + 1] = play_state;
+    gmem[o + 2] = showM; gmem[o + 3] = showS;
+    gmem[o + 4] = db20(tpk); gmem[o + 5] = db20(spk);
+    gmem[o + 6] = (sLL > 1e-12 && sRR > 1e-12) ? sLR / sqrt(sLL * sRR) : 1;
+    gmem[o + 7] = db10(sSS) - db10(sMM);
+    b = 0; loop(8, gmem[o + 8 + b] = db10(BE[b] / cnt); b += 1);
+    gmem[1] = n + 1;
+  );
+  cnt = 0; eL = eR = 0; sLL = sRR = sLR = sMM = sSS = 0; tpk = spk = 0;
+  memset(BE, 0, 8);
+);
+
+@gfx 260 60
+gfx_clear = 0x202020;
+gfx_r = gfx_g = gfx_b = 0.85; gfx_x = 10; gfx_y = 10;
+gfx_printf("LUFS-M %5.1f   LUFS-S %5.1f", showM, showS);
+gfx_x = 10; gfx_y = 30;
+gfx_printf("True peak %5.1f dBTP   frames %d", showT, gmem[1]);

@@ -189,7 +189,8 @@ Needs [ReaImGui](https://github.com/cfillion/reaimgui) ≥ 0.10 and an agent: Ga
 on `127.0.0.1:47892`; for Gamut it uses the desktop app's local REST + SSE API (`127.0.0.1:47891`), the same one
 Gamut's own UI uses.
 
-The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua` to `<REAPER resource path>/Scripts/Hibiki/`, then **Actions → Load ReaScript** and run it.
+The installer puts it in place. By hand: 1. Copy `panel/Hibiki.lua` and `panel/studio.lua` to `<REAPER resource path>/Scripts/Hibiki/`
+(and `panel/Hibiki_Meter.jsfx` to `<REAPER resource path>/Effects/Hibiki/`), then **Actions → Load ReaScript** and run `Hibiki.lua`.
 2. Optional: run `panel/restart_apply.sh` while REAPER is open and quit REAPER — it docks the panel on the right,
    binds **Cmd+L** to toggle it, and relaunches REAPER.
 
@@ -210,6 +211,32 @@ while a composition is open and shows the pending pinyin under the input.
 
 > Gamut's local API has no auth in desktop mode and listens on all interfaces. Block port 47891 in the macOS
 > firewall if the Mac is on a network you don't trust.
+
+### Around the chat (`panel/studio.lua`)
+
+- **Revert a reply.** The bridge runs every request that can change the project in one undo block labelled
+  `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
+  the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
+  **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
+  undone (it says so and stops instead). **Redo** puts them back. Changes made outside the panel (the Gamut app, a
+  CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
+- **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
+  every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,
+  correlation, side vs mid and eight mid bands. The next message's context gets the last playback: bars, gated
+  LUFS-I, the loudest LUFS-S and true peak with their bar.beat, correlation minimum, band levels and a per-bar
+  LUFS-M / true-peak row. Switch it in Agent settings → Studio.
+- **Audition rack.** An agent offers alternatives by tagging tracks `P_EXT:hibiki_var = "<group>/<n>"` (one unmuted)
+  or FX on one track with `P_EXT:hibiki_fxvar` lines `"<group>/<n>\t<fx GUID>"` (one enabled). The panel shows a row
+  of numbered buttons per group above the input; click or press 1–9 (panel focused) to switch, hover for the
+  loudness each variant measured while it played, **Keep** writes the request to keep the one playing.
+- **Ears.** With a time selection or razor area, **Ears** renders it from the master (≤ 30 s, 24-bit WAV in the
+  panel's private folder, your render settings restored afterwards), reads REAPER's LUFS-I / LUFS-S max / true peak,
+  runs `hibiki ears` (stdlib spectrum: 1/3-octave mid and side, tilt, bands over/under the tilt, stereo, level over
+  time → `.png` + `.md`) and attaches the picture, the summary and the audio to your next message.
+- **Agent rules.** `/remember <rule>` saves a line to `~/.config/hibiki/brain/rules.md`. The gateway writes those
+  rules, after a short block of panel conventions, into `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` in the ACP agents'
+  working folder (a marked block; your own text in those files stays) before each new chat, so Codex, Claude Code,
+  Kimi and Gemini start with the same rules. Agent settings → Studio shows the count and opens the file.
 
 ## Start with REAPER
 
@@ -277,6 +304,7 @@ Behaviour worth knowing (all optional parameters; older calls work unchanged):
 - `send add|update` take `mode` (`post_fader` / `pre_fader` / `pre_fx`) and `src_channel` / `dst_channel`, the first channel of a stereo pair counted from 0 (`dst_channel=2` = channels 3/4, a compressor's sidechain input). The destination track gets more channels if it needs them.
 - `envelope get|set` take `unit=db` for volume-type envelopes. `set` turns an inactive (`ACT 0`) envelope back on and rejects points that have no `value`.
 - `run_lua` takes `timeout` (seconds, at most 600). Errors quote the failing source line. REAPER is frozen while a snippet runs, so start long host commands in the background and poll their log.
+- Every call that can change the project is one undo point labelled `Hibiki <reply>: <what changed>` (a `batch` is one point for all its calls); see [Revert a reply](#around-the-chat-panelstudiolua).
 
 ## Tests
 
@@ -286,6 +314,7 @@ uv run --with lupa python tests/test_bridge_lua.py   # bridge.lua against a fake
 uv run --with lupa python panel/test_panel.py   # chat panel events, sends and cards, fake reaper/ImGui
 python3 gateway/test_gateway.py                      # agent gateway against fake Gamut + fake ACP agent
 python3 tests/test_suite.py                          # setup / doctor / connect / uninstall on a fake HOME
+python3 tests/test_ears.py                           # `hibiki ears` on synthetic WAVs
 uv run --with lupa python scripts/check_syntax.py    # every .lua compiles under Lua 5.4, every .sh parses
 ```
 

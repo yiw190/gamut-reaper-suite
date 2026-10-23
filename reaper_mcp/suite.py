@@ -73,6 +73,8 @@ do
   if gid ~= 0 and reaper.GetToggleCommandState(gid) ~= 1 then reaper.Main_OnCommand(gid, 0) end
 end""",)
 LEGACY_PANEL_DIRS = ("GamutChat",)
+PANEL_FILES = ("Hibiki.lua", "studio.lua")  # Scripts/Hibiki/: the panel loads studio.lua next to itself
+METER_JSFX = "Hibiki_Meter.jsfx"  # Effects/Hibiki/: the panel puts it on the master's monitoring FX
 
 # exact versions; bump deliberately. Only minimax runs install scripts: better-sqlite3 fetches its native
 # binding and @vscode/ripgrep fetches rg. kimi's postinstall only renames a legacy shim and node-pty ships
@@ -133,6 +135,7 @@ class Paths:
             self.claude_desktop = self.home / "Library/Application Support/Claude"
         self.resource = Path(resource_path or os.environ.get("REAPER_RESOURCE_PATH") or default_res)
         self.scripts = self.resource / "Scripts"
+        self.effects = self.resource / "Effects"
         self.cfg = self.home / ".config/reaper-mcp"
         self.token = self.cfg / "token"
         self.gw_cfg = self.home / ".config/agent-gateway/config.json"
@@ -302,7 +305,9 @@ def install_bridge(p: Paths) -> None:
 
 
 def install_panel(p: Paths) -> None:
-    say("  panel: " + copy_if_changed(need(ROOT / "panel/Hibiki.lua"), p.scripts / "Hibiki/Hibiki.lua"))
+    for name in PANEL_FILES:
+        say("  panel %s: " % name + copy_if_changed(need(ROOT / "panel" / name), p.scripts / "Hibiki" / name))
+    say("  meter: " + copy_if_changed(need(ROOT / "panel" / METER_JSFX), p.effects / "Hibiki" / METER_JSFX))
     for old in LEGACY_PANEL_DIRS:
         if (p.scripts / old).exists():
             shutil.rmtree(p.scripts / old, ignore_errors=True)
@@ -841,7 +846,8 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
 
 # ---------- dev mode: `hibiki use dev|release` ----------
 
-CHECKOUT_FILES = ("reaper_mcp/cli.py", "reaper_mcp/bridge.lua", "panel/Hibiki.lua", "gateway/agent_gateway.py")
+CHECKOUT_FILES = ("reaper_mcp/cli.py", "reaper_mcp/bridge.lua", "reaper_mcp/ears.py", "panel/Hibiki.lua", "panel/studio.lua",
+                  "panel/Hibiki_Meter.jsfx", "gateway/agent_gateway.py")
 
 
 def mode_file(p: Paths) -> Path:
@@ -1133,10 +1139,11 @@ def cmd_doctor(a) -> int:
         "%s (suite %s)" % (bv or "missing", __version__) + ("" if bv == __version__ else " - run setup"))
     if a.mcp_only:
         return doctor_mcp_only(p, a, rows, row)
-    panel = p.scripts / "Hibiki/Hibiki.lua"
-    shipped = ROOT / "panel/Hibiki.lua"
-    same = panel.exists() and shipped.exists() and panel.read_bytes() == shipped.read_bytes()
-    row("ok" if same else "warn", "chat panel", "%s%s" % (panel, "" if same else " (missing or differs from this suite)"))
+    pairs = [(p.scripts / "Hibiki" / n, ROOT / "panel" / n) for n in PANEL_FILES] + \
+        [(p.effects / "Hibiki" / METER_JSFX, ROOT / "panel" / METER_JSFX)]
+    off = [str(dst) for dst, src in pairs if not (dst.exists() and src.exists() and dst.read_bytes() == src.read_bytes())]
+    row("warn" if off else "ok", "chat panel", "%s%s" % (p.scripts / "Hibiki",
+        "" if not off else " (missing or differs from this suite: %s) - run setup" % ", ".join(off)))
     row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p)
         else "missing (binary or %s): the panel needs it - run setup" % p.imgui_shim)
     row_startup(p, row)
@@ -1259,6 +1266,7 @@ def cmd_uninstall(a) -> int:
             f.unlink()
     for d in ("Hibiki",) + LEGACY_PANEL_DIRS:
         shutil.rmtree(p.scripts / d, ignore_errors=True)
+    shutil.rmtree(p.effects / "Hibiki", ignore_errors=True)
     say("removed the bridge, the panel and the startup hook (ReaImGui stays: other scripts use it)")
     connect_detected(p, remove=True)
     if a.purge:
@@ -1401,7 +1409,7 @@ def repair_files(p: Paths) -> tuple:
     if not (p.scripts / "reaper_mcp_bridge.lua").exists():
         install_bridge(p)
         fixed.append("bridge script")
-    if not (p.scripts / "Hibiki/Hibiki.lua").exists():
+    if not all((p.scripts / "Hibiki" / n).exists() for n in PANEL_FILES) or not (p.effects / "Hibiki" / METER_JSFX).exists():
         install_panel(p)
         fixed.append("panel")
     if not p.token.exists() or len(p.token.read_text().strip()) < MIN_TOKEN:

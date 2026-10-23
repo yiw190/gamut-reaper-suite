@@ -172,6 +172,7 @@ class Panel:
         self.lua = lupa.LuaRuntime(unpack_returned_tuples=True)
         self.lua.globals().OS_NAME = OS_NAME
         self.lua.execute(FAKES)
+        self.lua.globals().HIBIKI_TEST.dir = str(PANEL.parent) + os.sep  # loads panel/studio.lua next to it
         state = self.lua.globals().EXT_STATE
         for k, v in {"ctx_level": "0", **(ext or {})}.items():
             state["Hibiki/" + k] = v
@@ -1015,6 +1016,220 @@ def test_update_auto_check():
     ext = dict(p.lua.globals().EXT_STATE)
     check("dev builds LED: persisted and re-checks with --channel dev",
           ext.get("Hibiki/upd_dev") == "1" and len(jobs) == 1 and "--channel dev" in jobs[0], (ext.get("Hibiki/upd_dev"), jobs))
+
+
+# ---------------------------------------------------------------- studio.lua
+
+STUDIO_FAKES = r"""
+UNDO, REDO = {}, {}
+reaper.Undo_CanUndo2 = function() return UNDO[#UNDO] end
+reaper.Undo_CanRedo2 = function() return REDO[#REDO] end
+reaper.Undo_DoUndo2 = function() REDO[#REDO + 1] = table.remove(UNDO) end
+reaper.Undo_DoRedo2 = function() UNDO[#UNDO + 1] = table.remove(REDO) end
+-- 120 BPM 4/4: 2 s per bar
+reaper.TimeMap2_timeToBeats = function(_, t) local qn = t * 2; return qn % 4, math.floor(qn / 4), 4, qn, 4 end
+GMEM = {}
+reaper.gmem_read = function(i) return GMEM[i] or 0 end
+function METER_FRAMES(from, n, t0, fn)
+  GMEM[0], GMEM[2], GMEM[3] = 1, 1200, 16
+  for k = 0, n - 1 do
+    local i = from + k
+    local o = 8 + (i % 1200) * 16
+    local f = fn(k)
+    GMEM[o] = t0 + k * 0.1
+    GMEM[o + 2], GMEM[o + 3], GMEM[o + 4], GMEM[o + 5] = f.m, f.s, f.tp, f.tp - 0.3
+    GMEM[o + 6], GMEM[o + 7] = f.corr or 0.8, -12
+    for b = 0, 7 do GMEM[o + 8 + b] = -20 - b * 2 end
+  end
+  GMEM[1] = from + n
+end
+TRACKS = {}
+reaper.CountTracks = function() return #TRACKS end
+reaper.GetTrack = function(_, i) return TRACKS[i + 1] end
+reaper.GetMasterTrack = function() return MASTER end
+MASTER = { name = 'MASTER', ext = {}, mute = 0 }
+reaper.GetTrackName = function(t) return true, t.name end
+reaper.GetSetMediaTrackInfo_String = function(t, key, v, set)
+  if not t then return false, '' end
+  local k = key:gsub('^P_EXT:', '')
+  if set then t.ext[k] = v end
+  return t.ext[k] ~= nil, t.ext[k] or ''
+end
+reaper.GetMediaTrackInfo_Value = function(t, key) if key == 'B_MUTE' then return t.mute end return 0 end
+reaper.SetMediaTrackInfo_Value = function(t, key, v) if key == 'B_MUTE' then t.mute = v end end
+LAYOUT(400, 600)
+RET.GetFrameHeight = function() return 24 end
+RET.GetFrameHeightWithSpacing = function() return 30 end
+RET.GetItemRectMin = function() return 0, 0 end
+"""
+
+
+def studio_panel(ext=None):
+    p = Panel(dict(SESSION, **(ext or {})))
+    p.lua.execute(STUDIO_FAKES)
+    p.boot()
+    p.requests()
+    return p
+
+
+def test_studio_loads():
+    p = Panel(SESSION)
+    check("studio: loaded next to the panel, no load error", p.m.studio is not None
+          and p.lua.globals().EXT_STATE["Hibiki/error"] is None, p.lua.globals().EXT_STATE["Hibiki/error"])
+
+
+def test_receipts_turn_and_revert():
+    p = studio_panel()
+    st = p.lua.globals().EXT_STATE
+    p.type_and_send("brighten the pizz")
+    turn = st["Hibiki/turn"]
+    check("receipts: a sent message tags the bridge's changes with this reply's id", bool(turn) and "." in turn, turn)
+    # the bridge's view of that turn: two undo points, three changes; the user edits nothing afterwards
+    p.lua.execute("UNDO = {'Edit: something old', 'Hibiki %s: #4 Pizz: add ReaEQ', 'Hibiki %s: #4 Pizz: ReaEQ Gain = 3 +1'}"
+                  % (turn, turn))
+    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 3, "points": 2,
+                                         "lines": ["#4 Pizz: add ReaEQ", "#4 Pizz: ReaEQ Freq = 3k", "#4 Pizz: ReaEQ Gain = 3"]}])
+    st["Hibiki/receipts_seq"] = "1"
+    p.m.studio.tick(2000)
+    check("receipts: no card while the reply is still running", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+    p.sse({"type": "session_idle"})
+    p.requests()
+    check("receipts: the reply's end clears the turn id", st["Hibiki/turn"] == "")
+    p.m.studio.tick(2001)
+    cards = [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"]
+    check("receipts: one card for the reply that changed things", len(cards) == 1)
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Revert') ~= nil end")
+    cards[0].draw()
+    undo = p.lua_list(p.lua.globals().UNDO)
+    check("receipts: Revert undoes exactly this reply's points and stops at the user's", undo == ["Edit: something old"], undo)
+    check("receipts: the card now offers Redo", p.m.studio._R.state[turn].reverted is True)
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Redo') ~= nil end")
+    cards[0].draw()
+    check("receipts: Redo puts both points back", len(p.lua_list(p.lua.globals().UNDO)) == 3)
+    # a user edit on top blocks the revert instead of undoing the user's work
+    p.lua.execute("UNDO[#UNDO + 1] = 'Move items'")
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Revert') ~= nil end")
+    cards[0].draw()
+    check("receipts: a user edit on top blocks the revert", len(p.lua_list(p.lua.globals().UNDO)) == 4
+          and p.m.studio._R.state[turn].blocked == "Move items")
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Dismiss') ~= nil end")
+    cards[0].draw()
+    check("receipts: Dismiss hides it", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+
+
+def test_meter_context():
+    p = studio_panel({"ctx_level": "1"})
+    p.lua.execute("METER_FRAMES(0, 0, 0, function() end)")
+    p.m.studio.tick(2000)
+    # 8 s of playback from bar 3 (t = 4 s): loud at bar 5, an inter-sample peak at bar 6
+    p.lua.execute("""METER_FRAMES(0, 80, 4.0, function(k)
+      local t = 4 + k * 0.1
+      return { m = (t >= 8 and t < 10) and -7 or -10, s = (t >= 8 and t < 10) and -7.5 or -10.5,
+               tp = (t >= 10.5 and t < 10.6) and 0.4 or -2, corr = (t >= 6 and t < 6.1) and -0.2 or 0.8 }
+    end)""")
+    p.m.studio.tick(2001)
+    reqs = p.type_and_send("too loud?")
+    (post,) = find(reqs, "POST", "/sessions/s1/messages")
+    body = post.body["content"]
+    line = [l for l in body.split("\n") if l.startswith("meter (")]
+    check("meter: the last playback is summarised in the context", len(line) == 1 and "bars 3.1-6.4" in line[0]
+          and "LUFS-S max -7.5 @ 5.1" in line[0] and "true peak max 0.4 dBTP @ 6.2" in line[0]
+          and "correlation min -0.20 @ 4.1" in line[0], line)
+    check("meter: integrated loudness is gated over the playback", "LUFS-I -9." in line[0], line)
+    check("meter: band and per-bar lines", "meter bands (mid" in body and "meter per bar (max LUFS-M / max dBTP): 3 -10.0/-2.0 · 4"
+          in body, body[-600:])
+
+
+def test_rack_switch_and_context():
+    p = studio_panel({"ctx_level": "1"})
+    p.lua.execute("""
+      TRACKS = { { name = 'Bass A', ext = { hibiki_var = 'Bass/1' }, mute = 0 },
+                 { name = 'Bass B', ext = { hibiki_var = 'Bass/2' }, mute = 1 },
+                 { name = 'Keys', ext = {}, mute = 0 } }""")
+    p.m.studio.tick(5000)
+    groups = p.lua_list(p.m.studio._RK.groups)
+    check("rack: tagged sibling tracks form one group, active = the unmuted one",
+          len(groups) == 1 and groups[0].name == "Bass" and groups[0].active == 1)
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##led_rk1_2' end")
+    p.m.studio.rack_row()
+    t = p.lua.globals().TRACKS
+    check("rack: clicking 2 plays Bass B and mutes Bass A", t[1].mute == 1 and t[2].mute == 0 and t[3].mute == 0)
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_rkkeep1' end")
+    p.m.studio.rack_row()
+    check("rack: Keep writes the request into the composer", "Keep variant 2 (#2 Bass B)" in p.S.input, p.S.input)
+    p.lua.execute("RET.InvisibleButton = nil")
+    reqs = p.type_and_send("which bass?")
+    body = find(reqs, "POST", "/sessions/s1/messages")[0].body["content"]
+    check("rack: the context says which variant is playing", 'audition rack "Bass": 2 variants, playing #2 (#2 Bass B)' in body, body[-400:])
+
+
+def test_remember_command():
+    p = studio_panel()
+    reqs = p.type_and_send("/remember never render over an existing file")
+    brain = find(reqs, "POST", "/api/hibiki/brain")
+    check("remember: goes to the gateway's rules, not to the chat", len(brain) == 1
+          and brain[0].body == {"add": "never render over an existing file"}
+          and not find(reqs, "POST", "/sessions/s1/messages") and p.S.input == "")
+    p.reply(brain[0], 200, {"added": True, "count": 3, "path": "/x/rules.md"})
+    check("remember: confirms in the hint line", "3 rules" in (p.m.studio.hint() or ""), p.m.studio.hint())
+
+
+def test_ears_render_and_attach():
+    p = studio_panel({"ctx_level": "1"})
+    p.lua.execute(r"""
+      PROJ, PROJS = { RENDER_SETTINGS = 1, RENDER_BOUNDSFLAG = 1 }, { RENDER_FILE = '/my/renders', RENDER_PATTERN = 'mix', RENDER_FORMAT = 'b2dnZw==' }
+      reaper.GetSet_LoopTimeRange2 = function() return 10.0, 14.0 end
+      reaper.format_timestr_pos = function(t) return ('%.2f'):format(t) end
+      reaper.GetSetProjectInfo = function(_, k, v, set) if set then PROJ[k] = v end return PROJ[k] or 0 end
+      reaper.GetSetProjectInfo_String = function(_, k, v, set)
+        if k == 'RENDER_TARGETS' then return true, PROJS.RENDER_FILE .. '/' .. PROJS.RENDER_PATTERN .. '.wav' end
+        if set then PROJS[k] = v end
+        return true, PROJS[k] or ''
+      end
+      SEEN = {}
+      reaper.Main_OnCommand = function(id)
+        SEEN[#SEEN + 1] = id
+        if id == 42230 then
+          SEEN.during = { PROJ.RENDER_STARTPOS, PROJ.RENDER_ENDPOS, PROJ.RENDER_SETTINGS, PROJS.RENDER_FORMAT }
+          local f = io.open(PROJS.RENDER_FILE .. '/' .. PROJS.RENDER_PATTERN .. '.wav', 'wb'); f:write('RIFF'); f:close()
+        end
+      end
+      reaper.RecursiveCreateDirectory = function(d) os.execute('mkdir -p "' .. d .. '" 2>/dev/null') end
+      reaper.PCM_Source_CreateFromFile = function() return {} end
+      reaper.CalculateNormalization = function(_, mode) return ({ [0] = 2.5, [3] = 1.1, [5] = 2.0 })[mode] end
+    """)
+    if OS_NAME.startswith("Win"):
+        return  # the render/measure path is the same; the CLI line differs (covered by the recover test)
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_ears' end")
+    p.m.studio.ears_chip()
+    p.lua.execute("RET.InvisibleButton = nil")
+    g = p.lua.globals()
+    seen = p.lua_list(g.SEEN)
+    check("ears: media online, then one render of the selection as the master mix in WAV",
+          seen == [40101, 42230] and g.SEEN.during[1] == 10.0 and g.SEEN.during[2] == 14.0
+          and g.SEEN.during[3] == 0 and g.SEEN.during[4] == "ZXZhdxgAAQ==", seen)
+    check("ears: the project's render settings come back", g.PROJ.RENDER_SETTINGS == 1 and g.PROJS.RENDER_FILE == "/my/renders"
+          and g.PROJS.RENDER_PATTERN == "mix" and g.PROJS.RENDER_FORMAT == "b2dnZw==")
+    cmds = [c for c in p.lua_list(g.CMDS) if " ears " in c]
+    check("ears: `hibiki ears` runs in the background with REAPER's loudness numbers",
+          len(cmds) == 1 and "--lufs-i -7.96" in cmds[0] and "--tp -0.83" in cmds[0] and "--label 'bars 6.1-8.1'" in cmds[0], cmds)
+    base = re.search(r"""> '([^']+ears[^']+)\.out'""", cmds[0]).group(1)
+    wav = re.search(r"ears '([^']+\.wav)'", cmds[0]).group(1)
+    png, md = wav[:-4] + ".png", wav[:-4] + ".md"
+    Path(png).write_bytes(b"png")
+    Path(md).write_text("# Ears")
+    Path(base + ".out").write_text(json.dumps({"ok": True, "png": png, "md": md, "tilt_db_per_octave": -1.2,
+                                               "peaks_over_tilt": [{"band": "3.15k", "db": 4.1}]}))
+    Path(base + ".done").write_text("0")
+    p.m.poll_http()
+    names = [f.name for f in p.lua_list(p.S.files)]
+    check("ears: picture, summary and audio attached", len(names) == 3 and names[0].endswith(".png")
+          and names[2].endswith(".wav"), names)
+    p.S.files = p.lua.table()
+    reqs = p.type_and_send("is this harsh?")
+    body = find(reqs, "POST", "/sessions/s1/messages")[0].body["content"]
+    check("ears: the next message's context carries the numbers once",
+          "ears: bars 6.1-8.1 (time selection, 4.0 s)" in body and "LUFS-I -8.0" in body and "3.15k +4.1" in body, body[-500:])
 
 
 def main():

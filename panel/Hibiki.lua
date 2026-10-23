@@ -305,6 +305,7 @@ local S = {
   greqs = {}, greq_at = 0, gans = {}, card_h = {}, gen = 0,
   files = {}, uploading = false, -- attachments waiting to be sent: { path, name }
 }
+local studio -- panel/studio.lua: turn receipts, playback meter, audition rack, Ears (loaded before the first frame)
 local function sval(v) return type(v) == 'string' and v or (type(v) == 'number' and tostring(v)) or nil end
 local function is_acp() return S.agent:sub(1, 4) == 'acp-' end
 local function via_gateway() return HOST == HOSTS[1] end
@@ -577,6 +578,7 @@ local function on_event(d)
     if #S.greqs == 0 then S.waiting = false end
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
+    if studio then studio.turn_end() end
     refresh_messages()
     local now = reaper.time_precise()
     S.title_checks = { now + 2, now + 12 } -- Gamut names a chat in the background after its first turn
@@ -584,6 +586,7 @@ local function on_event(d)
     S.title_checks = { reaper.time_precise() }
   elseif t == 'session_error' then
     S.active, S.perms = false, {}
+    if studio then studio.turn_end() end
     if d.apiErrorCode == 'auth_required' and is_acp() then S.auth = S.auth or { methods = {} } end
     local p = d.errorPresentation
     S.err = (type(p) == 'table' and (sval(p.message) or sval(p.title))) or sval(d.apiErrorCode) or 'error'
@@ -1232,6 +1235,7 @@ local function context(full)
       for _, x in ipairs(fx.params) do L[#L + 1] = x end
     end
   end
+  if full and studio then studio.context_lines(L) end
   return table.concat(L, '\n'), table.concat(chip, ' · ')
 end
 
@@ -1274,6 +1278,7 @@ end
 local function deliver(payload, text, typed, files)
   local bubble = { role = 'user', text = payload }
   local queued = S.active and S.sid ~= ''
+  if studio then studio.turn_start(queued) end
   if queued then
     S.queued[#S.queued + 1] = bubble -- the reply in progress stays above it
   else
@@ -1332,6 +1337,7 @@ local function send()
   S.clear_input = true
   local now = reaper.time_precise()
   if #S.files == 0 and text == S.last_sent and now - (S.last_sent_at or 0) < 2 then S.input = ''; return end
+  if studio and #S.files == 0 and studio.command(text) then S.input = ''; return end
   S.last_sent, S.last_sent_at = text, now
   local payload = text
   if S.ctx_level > 0 then
@@ -3260,6 +3266,11 @@ local function cfg_window()
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
       if led_btn('upddev', 'Include dev builds', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
     end)
+    if studio then
+      ImGui.Dummy(ctx, 0, 2)
+      studio.settings({ section = section, box = box, light_btn = light_btn, led_btn = led_btn, COL = COL,
+        dim = shade(C.win_text, 0x30) })
+    end
     ImGui.EndGroup(ctx)
 
     -- right column (like Receives): the context switch, then one box per live REAPER selection
@@ -3398,6 +3409,7 @@ local function card_list()
   if S.agent ~= '' and not is_acp() and via_gateway() and ONB.reaper_enabled(S.agent) == false then
     L[#L + 1] = { kind = 'reaper', key = 'reaper' }
   end
+  if studio then studio.cards(L) end
   return L
 end
 local function cards_height(L)
@@ -3603,6 +3615,8 @@ local function card(c)
       if S.auth.err then wrapped(S.auth.err, C.danger) end
     elseif c.kind == 'greq' then
       greq_card(c.q, who)
+    elseif c.kind == 'studio' then
+      c.draw()
     elseif c.kind == 'reaper' then
       wrapped(who .. " can't use REAPER yet: Gamut gives MCP servers to agents one by one")
       if primary((ONB.busy[S.agent] and 'Enabling…' or 'Enable REAPER for ' .. who) .. '##enreaper') and not ONB.busy[S.agent] then
@@ -3931,6 +3945,26 @@ local pm do
   end
 end
 
+-- studio.lua sits next to this file (Scripts/Hibiki/); without it the panel is plain chat
+do
+  local dir = (select(2, reaper.get_action_context()) or ''):match('^(.*[/\\])') or ''
+  if HIBIKI_TEST then dir = HIBIKI_TEST.dir or dir end
+  local path = dir .. 'studio.lua'
+  local f = io.open(path, 'rb')
+  if f then
+    f:close()
+    local ok, mod = pcall(dofile, path)
+    if ok and type(mod) == 'function' then
+      ok, mod = pcall(mod, { ImGui = ImGui, ctx = ctx, S = S, C = C, EXT = EXT, DIR = DIR, WIN = WIN, decode = decode,
+        jstr = jstr, q = q, sh = sh, win_bg = win_bg, http_url = http_url, gateway = HOSTS[1], cli = REC.cli,
+        add_file = add_file, chip = chip, led_toggle = led_toggle, primary = primary, wrapped = wrapped,
+        show_tip = show_tip, truncate = truncate })
+    end
+    if ok and type(mod) == 'table' then studio = mod
+    else reaper.SetExtState(EXT, 'error', 'studio.lua: ' .. tostring(mod):sub(1, 2000), false) end
+  end
+end
+
 local function frame()
   local t0 = reaper.time_precise()
   pm()
@@ -3944,6 +3978,7 @@ local function frame()
   pm('http')
   poll_stream()
   pm('sse')
+  if studio then studio.tick(t0) end
   demo_tick(t0)
   if S.title_checks and S.title_checks[1] and t0 >= S.title_checks[1] then
     table.remove(S.title_checks, 1)
@@ -4023,7 +4058,7 @@ local function frame()
         ImGui.SetClipboardText(ctx, selected_text(S.sel))
       end
       local composer_h = 98 + cards_height(cards) + (#S.files > 0 and 30 or 0)
-        + (sel_row_visible() and ImGui.GetFrameHeightWithSpacing(ctx) or 0)
+        + (sel_row_visible() and ImGui.GetFrameHeightWithSpacing(ctx) or 0) + (studio and studio.rack_height() or 0)
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
@@ -4045,6 +4080,7 @@ local function frame()
         if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
         if ImGui.IsItemHovered(ctx) then show_tip(f.path .. '\nClick to remove') end
       end
+      if studio then studio.rack_row() end
       sel_row()
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end
@@ -4086,7 +4122,8 @@ local function frame()
       if ImGui.IsItemHovered(ctx) then show_tip('Attach a file (or drop files on the panel)') end
       ImGui.SameLine(ctx, 0, 2)
       context_chip()
-      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime)
+      if studio then ImGui.SameLine(ctx, 0, 2); studio.ears_chip() end
+      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or (studio and studio.hint())
         or (S.uploading and ('Uploading ' .. S.uploading .. (S.uploading == 1 and ' file…' or ' files…')))
         or 'Enter to send'
       ImGui.PushFont(ctx, font_for(hint), FONT_SIZE) -- measure and draw in the same font
@@ -4131,6 +4168,7 @@ end
 if reaper.set_action_options then reaper.set_action_options(1 | 4) end
 reaper.atexit(function()
   stream_stop()
+  if studio then studio.exit() end
   if reaper.set_action_options then reaper.set_action_options(8) end
 end)
 if S.agent ~= '' then cfg_load() end
@@ -4141,6 +4179,6 @@ if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
     ONB = ONB, REC = REC, UPD = UPD, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
     draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages,
-    demo_tick = demo_tick }
+    demo_tick = demo_tick, studio = studio, card_list = card_list }
 end
 reaper.defer(safe_frame)

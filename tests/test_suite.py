@@ -123,7 +123,9 @@ def main():
     check("setup exits 0", rc == 0, out)
     bridge = (scripts / "reaper_mcp_bridge.lua").read_text()
     check("bridge installed", bridge == (ROOT / "reaper_mcp/bridge.lua").read_text())
-    check("panel installed", (scripts / "Hibiki/Hibiki.lua").exists())
+    check("panel installed", (scripts / "Hibiki/Hibiki.lua").exists() and (scripts / "Hibiki/studio.lua").exists())
+    check("meter JSFX installed under Effects/Hibiki",
+          (scripts.parent / "Effects/Hibiki/Hibiki_Meter.jsfx").read_text() == (ROOT / "panel/Hibiki_Meter.jsfx").read_text())
     cli = home / ".local/bin/hibiki"
     check("source checkout: ~/.local/bin/hibiki launcher for the panel's Recover",
           cli.exists() and os.access(cli, os.X_OK) and str(ROOT / "reaper_mcp/cli.py") in cli.read_text(), out)
@@ -200,7 +202,8 @@ def main():
     hook3 = (scripts / "__startup.lua").read_text()
     check("uninstall: services, scripts, managed hook gone; user lines stay",
           rc == 0 and not list(la.glob("com.hibiki.*")) and not (scripts / "reaper_mcp_bridge.lua").exists()
-          and not (scripts / "Hibiki").exists() and "reaper_mcp_bridge" not in hook3 and "my own thing" in hook3, out)
+          and not (scripts / "Hibiki").exists() and not (scripts.parent / "Effects/Hibiki").exists()
+          and "reaper_mcp_bridge" not in hook3 and "my own thing" in hook3, out)
     check("uninstall: Gamut registration removed", FakeGamut.servers == [], str(FakeGamut.servers))
     check("uninstall keeps the token without --purge", tok.exists())
 

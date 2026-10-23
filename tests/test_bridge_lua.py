@@ -307,15 +307,22 @@ def main() -> None:
           and json.loads(g.ext_state["Hibiki/receipts"])[-1]["n"] == 3)
     r = rpc("run_lua", code="reaper.InsertTrackAtIndex(0, true)\nreturn 1")
     rec = json.loads(g.ext_state["Hibiki/receipts"])
-    check("changing run_lua: receipt line with the script's first line",
-          rec[-1]["n"] == 4 and rec[-1]["lines"][3] == "script: reaper.InsertTrackAtIndex(0, true)", rec)
-    lua.execute("reaper.InsertTrackAtIndex(0, true)")  # same script again: same label as the top, still a new point
-    r = rpc("run_lua", code="reaper.InsertTrackAtIndex(0, true)\nreturn 1")
+    check("changing run_lua: the receipt names the new track instead of the code",
+          rec[-1]["n"] == 4 and rec[-1]["lines"][3].startswith("add track #1"), rec)
+    r = rpc("run_lua", code="-- set up a quieter pad\nlocal t = reaper.GetTrack(0, 0)\n"
+            "reaper.SetMediaTrackInfo_Value(t, 'D_VOL', 0.5)\nt.fx = true\nreturn 1")
+    rec = json.loads(g.ext_state["Hibiki/receipts"])
+    lines = rec[-1]["lines"]
+    check("run_lua: the receipt says what changed (title from the first comment, then a before/after diff)",
+          lines[-3] == "set up a quieter pad" and lines[-2].endswith("volume 0.0 → -6.0 dB")
+          and lines[-1].endswith(": add ReaComp"), lines)
+    rpc("run_lua", code="-- same title\nreaper.InsertTrackAtIndex(0, true)\nreturn 1")
+    r = rpc("run_lua", code="-- same title\nreaper.InsertTrackAtIndex(0, true)\nreturn 1")  # same label as the top
     labels = list(g.undo_labels.values())
     check("a repeated label still counts as a new undo point", labels[-1] == labels[-2] + "·"
-          and json.loads(g.ext_state["Hibiki/receipts"])[-1]["points"] == 4, labels[-2:])
-    rpc("delete_track", [0])
-    rpc("delete_track", [0])
+          and json.loads(g.ext_state["Hibiki/receipts"])[-1]["points"] == 6, labels[-2:])
+    for _ in range(3):
+        rpc("delete_track", [0])
     g.ext_state["Hibiki/turn"] = "k1.4"
     rpc("update_track", [0, {"pan": 0.5}])
     rec = json.loads(g.ext_state["Hibiki/receipts"])

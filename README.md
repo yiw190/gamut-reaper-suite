@@ -214,14 +214,14 @@ while a composition is open and shows the pending pinyin under the input.
 
 ### Around the chat (`panel/studio.lua`)
 
-- **Undo a reply.** The bridge runs every request that can change the project in one undo block labelled
+- **Version history.** The bridge runs every request that can change the project in one undo block labelled
   `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
-  the changes in ExtState `Hibiki/receipts`. Changes are kept; under each reply that changed the project the chat shows
-  `N changes · Undo` (hover = the list). Undo undoes from the top while the undo point is that reply's, so your own
-  later edits are never undone (it says so and stops instead); Redo puts them back. **Version history** (Agent
-  settings, left column) lists the last 10 replies that changed this project: **Revert** goes back to before one
-  (undo is linear, so later replies and your own edits since go too; it asks first), **Redo all** replays them; after
-  a restart a reply's saved copy shows **Open** instead.
+  the changes in ExtState `Hibiki/receipts`; for `run_lua` and raw API calls it diffs the project before and after
+  (tracks, volume, pan, mute, FX added / removed / bypassed / offline, items, lanes, sends, tempo), and a first-line
+  `-- comment` titles the script. Changes are simply kept. Agent settings → Version history lists the last 10 replies
+  that changed this project, each titled with the reply's own first sentence (hover = the change list): **Revert**
+  goes back to before one (undo is linear, so later replies and your own edits since go too; it asks first), **Redo
+  all** replays them; after a restart a reply's saved copy shows **Open** instead.
 - **Saved versions.** After a reply that changed the project, a copy of it (saved or not; `Main_SaveProjectEx` to
   another path leaves the open project's path and dirty state alone) goes to `<project folder>/.hibiki/history/<name>/`
   as `<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media, the newest 200 kept. Version history lists

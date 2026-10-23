@@ -92,8 +92,9 @@ BRAIN_END = "<!-- hibiki rules: end -->"
 BRAIN_MAX = 12000  # characters (~3k tokens): every session of every agent pays for it
 # what every agent in the panel should know about the panel itself; written above the user's rules
 BRAIN_CONVENTIONS = """## Hibiki panel conventions
-- Each reply of yours is one undo unit: the panel shows "N changes · Undo" under it. Prefer the MCP verbs (track /
-  fx / send / item / envelope / midi) over run_lua, so the change list says what changed.
+- A reply of yours that changes REAPER becomes an entry in the panel's Version history, titled with the reply's first
+  sentence: open such a reply with one line saying what you changed. Start run_lua code with a "-- <what it does>"
+  comment (it titles the change); prefer the MCP verbs (track / fx / send / item / envelope / midi) over run_lua.
 - Audition rack, for audible alternatives (sounds, parts, arrangements, effects); not for level or balance (a few
   dB is hard to hear by switching: set the level and say which fader to ride). Preferred: one track in fixed lanes
   (I_FREEMODE 2, I_NUMFIXEDLANES n), one variant per lane (I_FIXEDLANE, P_LANENAME:k), only lane 0 playing

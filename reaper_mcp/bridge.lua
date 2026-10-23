@@ -1644,6 +1644,84 @@ local function commit_receipt(turn)
   reaper.SetExtState("Hibiki", "receipts_seq", tostring(os.time()) .. "." .. r.n .. "." .. #receipts, false)
 end
 
+-- What a run_lua or a raw API call changed, read off the project before and after it (tracks and FX by GUID):
+-- the receipt lists real changes ("#11 Pizz: add Pizz level -3 dB") instead of the script's first line
+local SNAP_MAX_TRACKS = 400
+local function snapshot()
+  local n = reaper.CountTracks(0)
+  if n > SNAP_MAX_TRACKS or not reaper.GetTrackGUID then return nil end
+  local snap = { tempo = reaper.Master_GetTempo(), tracks = {}, order = {} }
+  for i = -1, n - 1 do
+    local tr = i == -1 and reaper.GetMasterTrack(0) or reaper.GetTrack(0, i)
+    local _, name = reaper.GetTrackName(tr)
+    local free = reaper.GetMediaTrackInfo_Value(tr, "I_FREEMODE")
+    local t = { i = i, name = name, vol = reaper.GetMediaTrackInfo_Value(tr, "D_VOL"),
+      pan = reaper.GetMediaTrackInfo_Value(tr, "D_PAN"), mute = reaper.GetMediaTrackInfo_Value(tr, "B_MUTE"),
+      items = reaper.CountTrackMediaItems(tr), sends = reaper.GetTrackNumSends(tr, 0),
+      lanes = free == 2 and reaper.GetMediaTrackInfo_Value(tr, "I_NUMFIXEDLANES") or 0, fx = {}, fxo = {} }
+    for k = 0, reaper.TrackFX_GetCount(tr) - 1 do
+      local g = reaper.TrackFX_GetFXGUID(tr, k) or ("#" .. k)
+      local _, fn = reaper.TrackFX_GetFXName(tr, k, "")
+      t.fx[g] = { name = fn, on = reaper.TrackFX_GetEnabled(tr, k), off = reaper.TrackFX_GetOffline(tr, k) }
+      t.fxo[#t.fxo + 1] = g
+    end
+    local g = i == -1 and "master" or reaper.GetTrackGUID(tr)
+    snap.tracks[g] = t
+    snap.order[#snap.order + 1] = g
+  end
+  return snap
+end
+
+local function snap_diff(a, b)
+  local out = {}
+  local function add(line) if #out < MAX_LINES then out[#out + 1] = line end end
+  local function label(t) return t.i == -1 and "master" or ("#%d %s"):format(t.i + 1, t.name) end
+  if math.abs(a.tempo - b.tempo) > 1e-6 then add(("tempo %g → %g BPM"):format(a.tempo, b.tempo)) end
+  for _, g in ipairs(a.order) do
+    if not b.tracks[g] then add("delete track " .. label(a.tracks[g])) end
+  end
+  for _, g in ipairs(b.order) do
+    local x, y = a.tracks[g], b.tracks[g]
+    if not x then add("add track " .. label(y))
+    else
+      local L = label(y)
+      if x.name ~= y.name then add(("%s: renamed from %s"):format(L, x.name)) end
+      if math.abs(db_of(x.vol) - db_of(y.vol)) > 0.05 then add(("%s: volume %.1f → %.1f dB"):format(L, db_of(x.vol), db_of(y.vol))) end
+      if math.abs(x.pan - y.pan) > 0.005 then add(("%s: pan %.2f → %.2f"):format(L, x.pan, y.pan)) end
+      if x.mute ~= y.mute then add(L .. (y.mute == 1 and ": mute" or ": unmute")) end
+      for _, fg in ipairs(x.fxo) do
+        if not y.fx[fg] then add(("%s: remove %s"):format(L, x.fx[fg].name)) end
+      end
+      for _, fg in ipairs(y.fxo) do
+        local o, f = x.fx[fg], y.fx[fg]
+        if not o then add(("%s: add %s%s"):format(L, f.name, f.on and "" or " (bypassed)"))
+        else
+          if o.name ~= f.name then add(("%s: %s renamed %s"):format(L, o.name, f.name)) end
+          if o.on ~= f.on then add(("%s: %s %s"):format(L, f.on and "enable" or "bypass", f.name)) end
+          if o.off ~= f.off then add(("%s: %s %s"):format(L, f.off and "offline" or "online", f.name)) end
+        end
+      end
+      if x.items ~= y.items then
+        local d = y.items - x.items
+        add(("%s: %s%d item%s"):format(L, d > 0 and "+" or "-", math.abs(d), math.abs(d) == 1 and "" or "s"))
+      end
+      if x.lanes ~= y.lanes then add(y.lanes > 0 and ("%s: %d fixed lanes"):format(L, y.lanes) or (L .. ": back to one lane")) end
+      if x.sends ~= y.sends then
+        local d = y.sends - x.sends
+        add(("%s: %s%d send%s"):format(L, d > 0 and "+" or "-", math.abs(d), math.abs(d) == 1 and "" or "s"))
+      end
+    end
+  end
+  return out
+end
+
+-- "-- set up the Pizz sound rack" on a script's first line is its title on the receipt
+local function script_title(code)
+  local line = tostring(code or ""):match("^%s*([^\n]*)") or ""
+  local t = line:match("^%-%-+%s*(.-)%s*$")
+  if t and t ~= "" then return short(t, 70) end
+end
+
 local function first_line(code)
   local line = tostring(code or ""):match("^%s*([^\n]*)") or ""
   return short(line, 50)
@@ -1725,11 +1803,35 @@ local function run_request(req)
   if func ~= "run_lua" and not receipt_wanted(func) and func ~= "batch" then return dispatch(req) end
   staged = {}
   local turn = current_turn()
+  -- code we can't describe from its arguments (run_lua, raw API calls, a batch holding one): diff the project
+  local opaque = func == "run_lua" or not DSL[func]
+  if func == "batch" then
+    for _, c in ipairs(type(req.args) == "table" and type(req.args[1]) == "table" and req.args[1] or {}) do
+      if type(c) == "table" and (c.func == "run_lua" or not DSL[c.func]) then opaque = true end
+    end
+  end
+  -- never lets a receipt detail cost the call: a failing snapshot just means the generic line
+  local before = opaque and select(2, pcall(snapshot)) or nil
+  if type(before) ~= "table" then before = nil end
   reaper.Undo_BeginBlock2(0)
   undo_depth = undo_depth + 1
   local ok, resp = pcall(dispatch, req)
   undo_depth = undo_depth - 1
-  if func == "run_lua" then note_change("script: " .. first_line(req.code), ok and type(resp) == "table" and resp.ok ~= false) end
+  local fine = ok and not (type(resp) == "table" and resp.ok == false)
+  if opaque then
+    local after = before and select(2, pcall(snapshot))
+    local okd, lines = false, nil
+    if type(after) == "table" then okd, lines = pcall(snap_diff, before, after) end
+    if not okd or type(lines) ~= "table" then lines = {} end
+    local title = func == "run_lua" and script_title(req.code)
+    if title or #lines > 0 then
+      staged = {}
+      if title then note_change(title, fine) end
+      for _, l in ipairs(lines) do note_change(l, fine) end
+    elseif func == "run_lua" then
+      note_change("script: " .. first_line(req.code), fine)
+    end
+  end
   local first = staged[1] and staged[1].what or func
   local label = "Hibiki " .. turn .. ": " .. short(first, 70) .. (#staged > 1 and (" +" .. (#staged - 1)) or "")
   -- EndBlock ticks the state-change counter even when it makes no undo point, so a new point is told apart by

@@ -33,30 +33,60 @@ local note = nil -- { text, till }: a short line in the composer's hint spot
 function M.note(text) note = { text = text, till = now() + 6 } end
 function M.hint() return note and now() < note.till and note.text or nil end
 
----------------------------------------------------------------- receipts: "N changes · Undo" under each reply
--- The bridge labels every undo point an agent makes "Hibiki <reply id>: …" and lists the reply's changes in ExtState
--- Hibiki/receipts. Changes are kept by default; the line under the reply undoes exactly that reply.
-local R = { seq = nil, list = {}, by_id = {}, by_msg = {}, n = 0, current = nil, ended = nil, state = {} }
+---------------------------------------------------------------- receipts
+-- The bridge labels every undo point an agent makes "Hibiki <reply id>: …" and lists each reply's changes in ExtState
+-- Hibiki/receipts. Changes are kept; Agent settings > Version history lists the replies and goes back to before one.
+local R = { seq = nil, list = {}, n = 0, current = nil, ended = nil, summary = {} }
 local RUN_ID = ('%x'):format(math.floor(now() * 1000) % 0xFFFFF)
 reaper.SetExtState(EXT, 'turn', '', false) -- a panel that died mid-reply must not tag later changes as its own
 
--- payload: the sent message, the key that finds the reply's line again in the chat log. queued: sent while a reply
--- runs; it keeps that reply's id until the reply ends
-function M.turn_start(queued, payload)
-  if not (queued and R.current) then
-    R.n = R.n + 1
-    R.current = RUN_ID .. '.' .. R.n
-    reaper.SetExtState(EXT, 'turn', R.current, false)
-  end
-  if payload then R.by_msg[payload] = R.current end
+-- queued: a message sent while a reply runs; it keeps that reply's id until the reply ends
+function M.turn_start(queued)
+  if queued and R.current then return end
+  R.n = R.n + 1
+  R.current = RUN_ID .. '.' .. R.n
+  reaper.SetExtState(EXT, 'turn', R.current, false)
 end
-function M.turn_end()
-  if R.current then R.ended = R.current end
+-- a reply's title: its first sentence that says something (no "OK", no headings or code), markdown stripped, ≤ 60 chars
+local FILLER = { ['好的'] = true, ['好'] = true, ['收到'] = true, ['明白'] = true, ['ok'] = true, ['okay'] = true,
+  ['sure'] = true, ['done'] = true, ['完成'] = true, ['好了'] = true }
+local function title_of(text)
+  local fence = false
+  for line in (tostring(text or '') .. '\n'):gmatch('([^\n]*)\n') do
+    if line:match('^%s*```') then fence = not fence
+    elseif not fence then
+      local l = line:gsub('^%s*#+%s*', ''):gsub('^%s*[-*>]%s+', ''):gsub('^%s*%d+[.)]%s+', '')
+      l = l:gsub('%*%*', ''):gsub('`', ''):gsub('%[(.-)%]%(.-%)', '%1'):gsub('^%s+', ''):gsub('%s+$', '')
+      if not l:match('^|') and l ~= '' then
+        -- first sentence: the earliest terminator, found as plain text (a Lua [...] class splits UTF-8 marks)
+        local cut
+        for _, mark in ipairs({ '。', '！', '？', '；', '!', '?', ';', '. ' }) do
+          local at = l:find(mark, 1, true)
+          if at and (not cut or at < cut) then cut = at end
+        end
+        local first = cut and l:sub(1, cut - 1) or l
+        for _, mark in ipairs({ '：', '，', ':', ',', '.' }) do -- no dangling mark at the end
+          if first:sub(-#mark) == mark then first = first:sub(1, -#mark - 1) end
+        end
+        if not FILLER[first:lower()] and (utf8.len(first) or #first) >= 4 then
+          if (utf8.len(first) or #first) > 60 then first = first:sub(1, (utf8.offset(first, 60) or 61) - 1) .. '…' end
+          return first
+        end
+      end
+    end
+  end
+end
+
+function M.turn_end(said)
+  if R.current then
+    R.ended = R.current
+    R.summary[R.current] = title_of(said)
+  end
   R.current = nil
   reaper.SetExtState(EXT, 'turn', '', false)
 end
 
--- the bridge logs a run_lua call as "script: <first line of code>"; lists say what kind of change it was
+-- the bridge logs a run_lua it could not describe as "script: <first line of code>"
 local function readable(line)
   line = tostring(line or '')
   if line:match('^script: ') then return 'Ran a script' .. (line:match(' %(failed%)$') and ' (failed)' or '') end
@@ -69,75 +99,9 @@ local function read_receipts()
   R.seq = seq
   local list = P.decode(reaper.GetExtState(EXT, 'receipts'))
   R.list = type(list) == 'table' and list or {}
-  R.by_id = {}
-  for _, r in ipairs(R.list) do
-    if type(r) == 'table' and type(r.id) == 'string' then R.by_id[r.id] = r end
-  end
 end
 
 local function prefix(id) return 'Hibiki ' .. id .. ': ' end
--- undo from the top while the top undo point is this reply's; stops at anything else (the user's own edits)
-local function revert(r)
-  local pre, n = prefix(r.id), 0
-  reaper.PreventUIRefresh(1)
-  while n < 1000 do
-    local top = reaper.Undo_CanUndo2(0)
-    if not top or top:sub(1, #pre) ~= pre then break end
-    reaper.Undo_DoUndo2(0)
-    n = n + 1
-  end
-  reaper.PreventUIRefresh(-1)
-  reaper.UpdateArrange()
-  if n == 0 then R.state[r.id] = { blocked = reaper.Undo_CanUndo2(0) or '' }
-  else R.state[r.id] = { reverted = true, undone = n, partial = n < (tonumber(r.points) or n) } end
-end
-local function redo(r)
-  local st = R.state[r.id] or {}
-  local pre, n = prefix(r.id), 0
-  reaper.PreventUIRefresh(1)
-  while n < (st.undone or 0) do
-    local top = reaper.Undo_CanRedo2(0)
-    if not top or top:sub(1, #pre) ~= pre then break end
-    reaper.Undo_DoRedo2(0)
-    n = n + 1
-  end
-  reaper.PreventUIRefresh(-1)
-  reaper.UpdateArrange()
-  if n >= (st.undone or 0) then R.state[r.id] = nil else st.undone = st.undone - n end
-end
-
--- the line under a reply: m = the user message that started it (Hibiki.lua calls this where that reply ends)
-function M.turn_line(m)
-  local id = m and R.by_msg[m.text]
-  if not id or id == R.current then return end
-  local r = R.by_id[id]
-  if not r or r.proj ~= select(2, reaper.EnumProjects(-1, '')) or (tonumber(r.n) or 0) == 0 then return end
-  local st = R.state[id] or {}
-  local n = tonumber(r.n) or 0
-  ImGui.AlignTextToFramePadding(ctx)
-  if st.reverted then
-    ImGui.TextColored(ctx, C.muted, (st.partial and 'Partly undone · ' or 'Undone · ') .. plural(n, 'change'))
-    ImGui.SameLine(ctx, 0, 8)
-    local top = reaper.Undo_CanRedo2(0)
-    local can = top ~= nil and top:sub(1, #prefix(id)) == prefix(id) -- an edit since then clears the redo list
-    if P.chip('redo' .. id, 'Redo', C.muted, false, not can) then redo(r) end
-  else
-    ImGui.TextColored(ctx, C.muted, plural(n, 'change'))
-    if ImGui.IsItemHovered(ctx) then
-      local L = {}
-      for _, l in ipairs(type(r.lines) == 'table' and r.lines or {}) do L[#L + 1] = readable(l) end
-      P.show_tip(table.concat(L, '\n'))
-    end
-    ImGui.SameLine(ctx, 0, 8)
-    if P.chip('undo' .. id, 'Undo', C.muted, false, S.active) then revert(r) end
-    if st.blocked and (reaper.Undo_CanUndo2(0) or '') ~= st.blocked then R.state[id] = nil; st = {} end
-    if st.blocked then
-      ImGui.SameLine(ctx, 0, 8)
-      ImGui.TextColored(ctx, C.danger, 'A newer edit is on top')
-      if ImGui.IsItemHovered(ctx) then P.show_tip(st.blocked) end
-    end
-  end
-end
 
 ---------------------------------------------------------------- meter
 local MT = { on = reaper.GetExtState(EXT, 'meter') ~= '0', next = nil, seg = nil, prev = nil,
@@ -732,7 +696,7 @@ function SV.snap(r)
   local f = io.open(hd .. SEP .. 'index.jsonl', 'ab')
   if f then
     f:write('{"file":', P.jstr(stamp .. '.RPP' .. (P.WIN and '' or '.gz')), ',"at":', tostring(os.time()),
-      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(readable(lines[1])), '}\n')
+      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(R.summary[r.id] or readable(lines[1])), '}\n')
     f:close()
   end
   if not P.WIN then -- compress, and keep the newest MAX_SNAPS, in the background
@@ -821,7 +785,6 @@ local function project_receipts()
 end
 local function revert_to_before(r, list)
   H.err = nil
-  if (R.state[r.id] or {}).reverted then H.err = 'Not reverted: that reply is already reverted on its card'; return end
   local pre, need = prefix(r.id), tonumber(r.points) or 1
   local seen, n = 0, 0
   reaper.PreventUIRefresh(1)
@@ -871,7 +834,7 @@ local function version_rows()
   for _, r in ipairs(list) do
     if not seen[r.id] then
       local lines = type(r.lines) == 'table' and r.lines or {}
-      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = readable(lines[1]), n = tonumber(r.n) or 0, r = r }
+      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = R.summary[r.id] or readable(lines[1]), n = tonumber(r.n) or 0, r = r }
     end
   end
   table.sort(rows, function(x, y) return x.at > y.at end)
@@ -1012,10 +975,12 @@ function M.settings_changes(A)
       local label = x.r and (armed and ('Revert ' .. plural(later + 1, 'reply')) or 'Revert') or 'Open'
       local bw = ImGui.CalcTextSize(ctx, label) + 16
       local cx = ImGui.GetCursorScreenPos(ctx)
-      local summary = x.what .. (x.n > 1 and ('  +' .. (x.n - 1)) or '')
+      local summary = x.what
       ImGui.Text(ctx, P.truncate(summary ~= '' and summary or plural(x.n, 'change'), x0 + w - bw - 8 - cx))
       if ImGui.IsItemHovered(ctx) then
-        local lines = x.r and type(x.r.lines) == 'table' and table.concat(x.r.lines, '\n') or x.what
+        local L = {}
+        for _, l in ipairs(x.r and type(x.r.lines) == 'table' and x.r.lines or {}) do L[#L + 1] = readable(l) end
+        local lines = #L > 0 and table.concat(L, '\n') or x.what
         P.show_tip(os.date('%Y-%m-%d %H:%M', x.at) .. ' · ' .. plural(x.n, 'change') .. '\n' .. lines)
       end
       if right_btn('ver' .. i, label, (went or S.active) and x.r ~= nil, armed) then

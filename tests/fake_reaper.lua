@@ -148,7 +148,7 @@ reaper.SetExtState = function(sec, key, v) ext_state[sec .. "/" .. key] = v end
 reaper.Undo_OnStateChange_Item = function() hit("Undo_OnStateChange_Item") end
 
 -- items
-reaper.CountTrackMediaItems = function(t) return #t.items end
+reaper.CountTrackMediaItems = function(t) return #(t.items or {}) end
 reaper.GetTrackMediaItem = function(t, i)
   hit("GetTrackMediaItem")
   return t.items[i + 1]
@@ -326,7 +326,7 @@ reaper.file_exists = function(path)
 end
 
 -- sends / envelopes / fx
-reaper.GetTrackNumSends = function(t) return #t.sends end
+reaper.GetTrackNumSends = function(t) return #(t.sends or {}) end
 reaper.GetTrackSendInfo_Value = function(t, _, i, key)
   local s = t.sends[i + 1]
   if key == "D_VOL" then return s.vol or 1.0 end
@@ -413,3 +413,14 @@ io.open = function(p, mode)
   if mode == "wb" and p:match("heartbeat$") then hit("heartbeat_writes") end
   return real_open(p, mode)
 end
+
+-- GUIDs for the receipt's before/after project diff
+local guid_n = 0
+reaper.GetTrackGUID = function(t)
+  if not t.guid then guid_n = guid_n + 1; t.guid = ("{T%04d}"):format(guid_n) end
+  return t.guid
+end
+reaper.TrackFX_GetFXGUID = function(t, i) return t.fx and ("{FX-" .. reaper.GetTrackGUID(t) .. "}") or nil end
+reaper.TrackFX_GetFXName = function(t, i) return true, "ReaComp" end
+reaper.TrackFX_GetEnabled = function(t) return not t.fx_bypassed end
+reaper.TrackFX_GetOffline = function() return false end

@@ -1078,51 +1078,23 @@ def test_studio_loads():
           and p.lua.globals().EXT_STATE["Hibiki/error"] is None, p.lua.globals().EXT_STATE["Hibiki/error"])
 
 
-def test_receipts_turn_and_revert():
+def test_receipts_turn_and_title():
     p = studio_panel()
     st = p.lua.globals().EXT_STATE
-    p.type_and_send("brighten the pizz")
+    p.type_and_send("give the pizz another sound")
     turn = st["Hibiki/turn"]
-    asked = p.S.msgs[len(p.lua_list(p.S.msgs))]
     check("receipts: a sent message tags the bridge's changes with this reply's id", bool(turn) and "." in turn, turn)
-    # the bridge's view of that reply: two undo points, three changes; the user edits nothing afterwards
-    p.lua.execute("UNDO = {'Edit: something old', 'Hibiki %s: #4 Pizz: add ReaEQ', 'Hibiki %s: #4 Pizz: ReaEQ Gain = 3 +1'}"
-                  % (turn, turn))
-    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 3, "points": 2, "proj": "",
-                                         "lines": ["#4 Pizz: add ReaEQ", "#4 Pizz: ReaEQ Freq = 3k", "script: local tr = x"]}])
+    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 2, "points": 1, "proj": "",
+                                         "lines": ["#11 Pizz: add ReaEQ", "script: local x = 1"]}])
     st["Hibiki/receipts_seq"] = "1"
-    p.m.studio.tick(2000)
-
-    def line():
-        p.lua.execute("UI = {}")
-        p.m.studio.turn_line(asked)
-        return [c.args[3] for c in p.lua_list(p.lua.globals().UI) if c.name == "TextColored"]
-    check("receipts: no line while the reply is still running", line() == [])
-    p.sse({"type": "session_idle"})
+    p.sse({"type": "stream_delta", "text": "好的。\n\n## 结论\n**Pizz 换成 Celesta，做了 3 个版本。** 细节如下"},
+          {"type": "session_idle"})
     p.requests()
     check("receipts: the reply's end clears the turn id", st["Hibiki/turn"] == "")
-    check("receipts: under the reply, '3 changes' and an Undo button", line() == ["3 changes"])
-    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_undo%s' end" % turn)
-    line()
-    undo = p.lua_list(p.lua.globals().UNDO)
-    check("receipts: Undo undoes exactly this reply's points and stops at the user's", undo == ["Edit: something old"], undo)
-    p.lua.execute("RET.InvisibleButton = nil")
-    check("receipts: the line then says it was undone", line() == ["Undone · 3 changes"])
-    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_redo%s' end" % turn)
-    line()
-    p.lua.execute("RET.InvisibleButton = nil")
-    check("receipts: Redo puts both points back", len(p.lua_list(p.lua.globals().UNDO)) == 3 and line() == ["3 changes"])
-    p.lua.execute("UNDO[#UNDO + 1] = 'Move items'")
-    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_undo%s' end" % turn)
-    line()
-    p.lua.execute("RET.InvisibleButton = nil")
-    check("receipts: a newer edit of the user's blocks Undo instead of undoing it",
-          len(p.lua_list(p.lua.globals().UNDO)) == 4 and line() == ["3 changes", "A newer edit is on top"])
-    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
-                                         "lines": ["#1 Bass: mute"]}])
-    st["Hibiki/receipts_seq"] = "2"
-    p.m.studio.tick(2002)
-    check("receipts: no line for changes in another project tab", line() == [])
+    p.m.studio.tick(2000)
+    rows = p.lua_list(p.m.studio._rows()[0])
+    check("version history: the row is titled with the reply's first real sentence (no 'OK', no heading)",
+          len(rows) == 1 and rows[0].what == "Pizz 换成 Celesta，做了 3 个版本", [r.what for r in rows])
 
 
 def test_meter_context():

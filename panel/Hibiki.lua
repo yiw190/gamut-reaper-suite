@@ -578,7 +578,11 @@ local function on_event(d)
     if #S.greqs == 0 then S.waiting = false end
   elseif t == 'session_idle' then
     S.active, S.waiting, S.perms = false, false, {}
-    if studio then studio.turn_end() end
+    if studio then -- the reply's own words become its title in Version history
+      local said = {}
+      for _, b in ipairs(S.live) do if b.kind == 'text' then said[#said + 1] = b.text end end
+      studio.turn_end(table.concat(said))
+    end
     refresh_messages()
     local now = reaper.time_precise()
     S.title_checks = { now + 2, now + 12 } -- Gamut names a chat in the background after its first turn
@@ -1278,7 +1282,7 @@ end
 local function deliver(payload, text, typed, files)
   local bubble = { role = 'user', text = payload }
   local queued = S.active and S.sid ~= ''
-  if studio then studio.turn_start(queued, payload) end
+  if studio then studio.turn_start(queued) end
   if queued then
     S.queued[#S.queued + 1] = bubble -- the reply in progress stays above it
   else
@@ -3794,16 +3798,10 @@ do
       if grow then cut = nil end
     end
     local y_first, y_cut = ImGui.GetCursorPosY(ctx), nil
-    local asked -- the user message whose reply is being drawn: its "N changes · Undo" line goes where that reply ends
     for i = from, n do
-      if msgs[i].role == 'user' then
-        if asked and studio then flush(); studio.turn_line(asked) end
-        asked = msgs[i]
-      end
       if i == cut then flush(); y_cut = ImGui.GetCursorPosY(ctx) end
       draw_msg(msgs[i], i)
     end
-    if asked and studio and #S.live == 0 then flush(); studio.turn_line(asked) end
     for i, b in ipairs(S.live) do
       if b.kind == 'text' then
         flush()

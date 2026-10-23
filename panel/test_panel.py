@@ -1182,10 +1182,10 @@ def test_rack_switch_and_context():
 
 def test_remember_command():
     p = studio_panel()
-    reqs = p.type_and_send("/remember never render over an existing file")
+    reqs = p.type_and_send("/remember example rule three")
     brain = find(reqs, "POST", "/api/hibiki/brain")
     check("remember: goes to the gateway's rules, not to the chat", len(brain) == 1
-          and brain[0].body == {"add": "never render over an existing file"}
+          and brain[0].body == {"add": "example rule three"}
           and not find(reqs, "POST", "/sessions/s1/messages") and p.S.input == "")
     p.reply(brain[0], 200, {"added": True, "count": 3, "path": "/x/rules.md"})
     check("remember: confirms in the hint line", "3 rules" in (p.m.studio.hint() or ""), p.m.studio.hint())

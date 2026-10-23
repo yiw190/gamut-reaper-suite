@@ -276,20 +276,20 @@ def unit_brain():
           and "P_EXT:hibiki_var" in (work / "CLAUDE.md").read_text())
     for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
         (work / name).unlink()
-    check("brain: add a rule", ag.brain_add("Final loudness -8 LUFS integrated") is True)
-    check("brain: the same rule twice is one line", ag.brain_add("  Final loudness  -8 LUFS integrated ") is False)
+    check("brain: add a rule", ag.brain_add("Example rule one") is True)
+    check("brain: the same rule twice is one line", ag.brain_add("  Example  rule one ") is False)
     (work / "AGENTS.md").write_text("# my notes\nkeep me\n")
     changed = ag.brain_sync(str(work))
     agents = (work / "AGENTS.md").read_text()
     check("brain: every CLI's instruction file gets the block", sorted(changed) == ["AGENTS.md", "CLAUDE.md", "GEMINI.md"])
     check("brain: the user's text stays, the rules follow it",
-          agents.startswith("# my notes\nkeep me\n\n<!-- hibiki rules: begin") and "- Final loudness -8 LUFS integrated" in agents)
+          agents.startswith("# my notes\nkeep me\n\n<!-- hibiki rules: begin") and "- Example rule one" in agents)
     check("brain: unchanged rules rewrite nothing", ag.brain_sync(str(work)) == [])
-    ag.brain_add("Save the project after every edit")
+    ag.brain_add("Example rule two")
     ag.brain_sync(str(work))
     agents = (work / "AGENTS.md").read_text()
     check("brain: the block is replaced in place, not appended",
-          agents.count("hibiki rules: begin") == 1 and "Save the project after every edit" in agents)
+          agents.count("hibiki rules: begin") == 1 and "Example rule two" in agents)
     check("brain: rule count", ag.brain_count(ag.brain_rules()) == 2)
     ag.brain_path().write_text("")
     ag.brain_sync(str(work))
@@ -365,13 +365,13 @@ def main():
         check("title hint not forwarded to Gamut", GAMUT_BODIES[-1][1] == {"message": "hi"})
         check("gamut config -> llmProviderId/model/effort",
               code == 201 and body == {"message": "hi", "llmProviderId": "c1", "model": "m1", "effort": "high"})
-        r = g.post("/api/hibiki/brain", {"add": "Never render over an existing file"})
+        r = g.post("/api/hibiki/brain", {"add": "Example rule three"})
         code, made = g.post("/api/hibiki/brain", {"ensure": True})
         check("brain route: ensure keeps an existing file", code == 200 and made["count"] == 1)
         info = g.get("/api/hibiki/brain")
         check("brain route: add + info", r[0] == 200 and info["count"] == 1 and info["folders"] == [os.path.abspath(tmp)])
         check("brain route: the agents' folder gets the rule at once",
-              "Never render over an existing file" in (Path(tmp) / "AGENTS.md").read_text())
+              "Example rule three" in (Path(tmp) / "AGENTS.md").read_text())
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 

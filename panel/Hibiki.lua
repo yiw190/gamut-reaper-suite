@@ -2412,6 +2412,7 @@ local function draw_ops(L, w)
         end
       end
     end
+    S.n_ops = (S.n_ops or 0) + #ops
     for _, o in ipairs(ops) do
       local k = o[1]
       if k == 't' then
@@ -2484,6 +2485,7 @@ local function md(holder, text)
   local w = math.floor(ImGui.GetContentRegionAvail(ctx))
   local L = holder._md
   if not L or L.w ~= w or L.text ~= text or L.pal ~= pal_ver then
+    S.n_lay = (S.n_lay or 0) + 1
     L = md_layout(L, text, w)
     holder._md = L
   end
@@ -3914,6 +3916,8 @@ local pm do
           local parts = {}
           for k, v in pairs(acc) do parts[#parts + 1] = ('%s=%.2f'):format(k, v * 1000 / n) end
           table.sort(parts)
+          parts[#parts + 1] = ('| md_layouts/s=%d ops/frame=%d'):format(S.n_lay or 0, (S.n_ops or 0) // n)
+          S.n_lay, S.n_ops = 0, 0
           reaper.SetExtState(EXT, 'prof', table.concat(parts, ' '), false)
           acc, n, at = {}, 0, now
         end

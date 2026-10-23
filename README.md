@@ -233,7 +233,8 @@ while a composition is open and shows the pending pinyin under the input.
   correlation, side vs mid and eight mid bands. The next message's context gets the last playback: bars, gated
   LUFS-I, the loudest LUFS-S and true peak with their bar.beat, correlation minimum, band levels and a per-bar
   LUFS-M / true-peak row. Switch it in Agent settings → Context → Measure playback.
-- **Audition rack.** An agent offers alternatives by tagging tracks `P_EXT:hibiki_var = "<group>/<n>"` (one unmuted)
+- **Audition rack.** An agent offers audible alternatives (sounds, parts, effects; not levels) preferably as fixed
+  lanes of one track tagged `P_EXT:hibiki_lanes = "<group>"` (one lane playing, lane names as labels), or by tagging tracks `P_EXT:hibiki_var = "<group>/<n>"` (one unmuted)
   or FX on one track with `P_EXT:hibiki_fxvar` lines `"<group>/<n>\t<fx GUID>"` (one enabled). The panel shows a row
   of numbered buttons per group above the input with the playing variant's name. Click or press 1–9 (panel focused)
   to switch (no undo point); when stopped, a click also loops the time selection, which the agent sets to the section

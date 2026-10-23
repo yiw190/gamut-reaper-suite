@@ -94,11 +94,13 @@ BRAIN_MAX = 12000  # characters (~3k tokens): every session of every agent pays 
 BRAIN_CONVENTIONS = """## Hibiki panel conventions
 - Each reply of yours is one undo unit: the panel shows "N changes · Undo" under it. Prefer the MCP verbs (track /
   fx / send / item / envelope / midi) over run_lua, so the change list says what changed.
-- Audition rack: to offer the user alternatives (parts, sounds, FX settings), make each variant a track and tag it
-  with track P_EXT:hibiki_var = "<group>/<n>" (n = 1..9; unmute one, mute the rest), or tag FX on one track with
-  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). Set the time selection to the section where
-  the variants differ: a number button switches and loops that section. The panel's Keep button deletes the other
-  variants itself. Match the variants' loudness before handing them over.
+- Audition rack, for audible alternatives (sounds, parts, arrangements, effects); not for level or balance (a few
+  dB is hard to hear by switching: set the level and say which fader to ride). Preferred: one track in fixed lanes
+  (I_FREEMODE 2, I_NUMFIXEDLANES n), one variant per lane (I_FIXEDLANE, P_LANENAME:k), only lane 0 playing
+  (C_LANEPLAYS:k = 1 for it, 0 for the rest), tagged P_EXT:hibiki_lanes = "<group>". Also understood: variant tracks
+  tagged P_EXT:hibiki_var = "<group>/<n>", or FX lines in P_EXT:hibiki_fxvar = "<group>/<n><TAB><fx GUID>". Set the
+  time selection to the section where the variants differ: a number button switches and loops it. The panel's Keep
+  deletes the other variants itself. Match the variants' loudness first.
 - "meter" lines in the REAPER context are measured on the master during the user's last playback (Hibiki Meter).
 - Files named ears-*.wav/.png/.md are the user's selection rendered from the master and measured for you."""
 BRAIN_TEMPLATE = """# Rules for agents working in REAPER

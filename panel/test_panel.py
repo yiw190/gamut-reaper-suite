@@ -1189,6 +1189,53 @@ def test_rack_keep():
     check("rack: the row is gone after Keep", len(p.lua_list(p.m.studio._RK.groups)) == 0)
 
 
+def test_rack_lanes():
+    p = studio_panel()
+    p.lua.execute("""
+      LANE_ITEMS = {}
+      TRACKS = { { name = 'Pizz', ext = { hibiki_lanes = 'Pizz level' }, mute = 0, freemode = 2, lanes = 3,
+                   plays = { [0] = 1, [1] = 0, [2] = 0 }, names = { [0] = '+0 dB', [1] = '-3 dB', [2] = '+3 dB' } } }
+      for k = 0, 2 do LANE_ITEMS[#LANE_ITEMS + 1] = { lane = k } end
+      local get, set, gets = reaper.GetMediaTrackInfo_Value, reaper.SetMediaTrackInfo_Value, reaper.GetSetMediaTrackInfo_String
+      reaper.GetMediaTrackInfo_Value = function(t, k)
+        if k == 'I_FREEMODE' then return t.freemode or 0 end
+        if k == 'I_NUMFIXEDLANES' then return t.lanes or 1 end
+        local l = k:match('^C_LANEPLAYS:(%d+)$')
+        if l then return t.plays[tonumber(l)] end
+        return get(t, k)
+      end
+      reaper.SetMediaTrackInfo_Value = function(t, k, v)
+        if k == 'I_FREEMODE' then t.freemode = v; return end
+        local l = k:match('^C_LANEPLAYS:(%d+)$')
+        if l then t.plays[tonumber(l)] = v; return end
+        return set(t, k, v)
+      end
+      reaper.GetSetMediaTrackInfo_String = function(t, k, v, s)
+        local l = k:match('^P_LANENAME:(%d+)$')
+        if l then return true, t.names[tonumber(l)] end
+        return gets(t, k, v, s)
+      end
+      reaper.CountTrackMediaItems = function() return #LANE_ITEMS end
+      reaper.GetTrackMediaItem = function(_, j) return LANE_ITEMS[j + 1] end
+      reaper.GetMediaItemInfo_Value = function(it, k) if k == 'I_FIXEDLANE' then return it.lane end return 0 end
+      reaper.DeleteTrackMediaItem = function(_, it) for i, x in ipairs(LANE_ITEMS) do if x == it then table.remove(LANE_ITEMS, i) end end end
+    """)
+    p.m.studio.tick(6000)
+    g = p.lua_list(p.m.studio._RK.groups)
+    check("rack lanes: a tagged fixed-lane track is a group, the playing lane is active",
+          len(g) == 1 and g[0].name == "Pizz level" and g[0].count == 3 and g[0].active == 1)
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##led_rk1_2' end")
+    p.m.studio.rack_row()
+    t = p.lua.globals().TRACKS[1]
+    check("rack lanes: 2 plays lane 2 alone", t.plays[0] == 0 and t.plays[1] == 1 and t.plays[2] == 0)
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_rkkeep1' end")
+    p.m.studio.rack_row()
+    p.lua.execute("RET.InvisibleButton = nil")
+    items = p.lua_list(p.lua.globals().LANE_ITEMS)
+    check("rack lanes: Keep 2 keeps lane 2's items, one lane again, tag cleared",
+          [x.lane for x in items] == [1] and t.freemode == 0 and (t.ext.hibiki_lanes or "") == "")
+
+
 def test_remember_command():
     p = studio_panel()
     reqs = p.type_and_send("/remember example rule three")

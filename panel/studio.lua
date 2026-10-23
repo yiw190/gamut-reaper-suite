@@ -305,7 +305,9 @@ local function fx_by_guid(tr, guid)
 end
 local function active_of(g)
   for _, v in ipairs(g.vars) do
-    if v.fx then
+    if v.lane then
+      if reaper.GetMediaTrackInfo_Value(v.tr, 'C_LANEPLAYS:' .. v.lane) == 1 then return v.n end
+    elseif v.fx then
       if reaper.TrackFX_GetEnabled(v.tr, v.fx) then return v.n end
     elseif reaper.GetMediaTrackInfo_Value(v.tr, 'B_MUTE') == 0 then return v.n end
   end
@@ -326,6 +328,15 @@ function RK.scan()
       if g and g ~= '' then
         local _, tn = reaper.GetTrackName(tr)
         add(g, { n = tonumber(n), tr = tr, label = track_label(i, tr), short = tn })
+      end
+    end
+    -- fixed lanes (REAPER 7): one variant per lane of one track, the playing lane is the one you hear and see
+    local okl, lg = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:hibiki_lanes', '', false)
+    if okl and lg ~= '' and reaper.GetMediaTrackInfo_Value(tr, 'I_FREEMODE') == 2 then
+      for k = 0, math.min(9, math.floor(reaper.GetMediaTrackInfo_Value(tr, 'I_NUMFIXEDLANES'))) - 1 do
+        local _, ln = reaper.GetSetMediaTrackInfo_String(tr, 'P_LANENAME:' .. k, '', false)
+        add(lg, { n = k + 1, tr = tr, lane = k, short = ln ~= '' and ln or nil,
+          label = track_label(i, tr) .. ': ' .. (ln ~= '' and ln or ('lane ' .. (k + 1))) })
       end
     end
     local ok2, fv = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:hibiki_fxvar', '', false)
@@ -363,7 +374,9 @@ function RK.switch(g, n)
   reaper.PreventUIRefresh(1)
   for _, v in ipairs(g.vars) do
     local on = v.n == n
-    if v.fx then
+    if v.lane then
+      reaper.SetMediaTrackInfo_Value(v.tr, 'C_LANEPLAYS:' .. v.lane, on and 1 or 0) -- no undo point (REAPER 7.79)
+    elseif v.fx then
       -- TrackFX_SetEnabled leaves an "FX bypass toggle" undo point (on top of the reply's, blocking Revert); the
       -- :bypass parameter switches the same thing without one (checked on REAPER 7.79), like B_MUTE
       local pb = reaper.TrackFX_GetParamFromIdent and reaper.TrackFX_GetParamFromIdent(v.tr, v.fx, ':bypass') or -1
@@ -399,13 +412,22 @@ function RK.keep(g, n)
   local fx_drop, tr_drop = {}, {}
   for _, v in ipairs(g.vars) do
     if v.n == n then kept = v
+    elseif v.lane then -- the lanes go together below
     elseif v.fx then fx_drop[#fx_drop + 1] = v
     else tr_drop[#tr_drop + 1] = v end
+  end
+  if kept and kept.lane then -- the kept lane's items stay, the track goes back to one lane
+    for j = reaper.CountTrackMediaItems(kept.tr) - 1, 0, -1 do
+      local it = reaper.GetTrackMediaItem(kept.tr, j)
+      if reaper.GetMediaItemInfo_Value(it, 'I_FIXEDLANE') ~= kept.lane then reaper.DeleteTrackMediaItem(kept.tr, it) end
+    end
+    reaper.SetMediaTrackInfo_Value(kept.tr, 'I_FREEMODE', 0)
+    reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_lanes', '', true)
   end
   table.sort(fx_drop, function(a, b) return a.fx > b.fx end) -- highest index first: the others keep their place
   for _, v in ipairs(fx_drop) do reaper.TrackFX_Delete(v.tr, v.fx) end
   for _, v in ipairs(tr_drop) do reaper.DeleteTrack(v.tr) end
-  if kept then
+  if kept and not kept.lane then
     if kept.fx then
       local _, lines = reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_fxvar', '', false)
       local rest = {}

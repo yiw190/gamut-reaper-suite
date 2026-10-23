@@ -144,10 +144,18 @@ git clone https://github.com/yiw190/hibiki.git ~/hibiki
 sh ~/hibiki/install.sh --mcp-only     # Windows: python -m reaper_mcp setup --mcp-only
 ```
 
-It installs the bridge and a startup hook that starts only the bridge with REAPER, and registers the stdio MCP in
-Claude Desktop, Claude Code and Cursor when they're installed. No panel, no ReaImGui, no LaunchAgents or autostart, no
-token. Gamut connects over the HTTP service, so it needs the full setup. Keep the clone: the clients run
-`reaper_mcp/server.py` from it. Check with `hibiki doctor --mcp-only`. For any other client or OS, set it up by hand:
+What it does:
+
+- Installs the bridge and a startup hook that starts it with REAPER.
+- Registers the MCP in Claude Desktop, Claude Code and Cursor, if they're installed.
+- Nothing else: no panel, no background services, no token.
+
+Keep the cloned folder: those apps run `reaper_mcp/server.py` from it. Check the install with
+`hibiki doctor --mcp-only`.
+
+Gamut needs the full install instead: it reaches REAPER through the background HTTP service, which this mode leaves out.
+
+For other MCP clients or operating systems, see the next section.
 
 ## Manual setup (any MCP client, any OS)
 

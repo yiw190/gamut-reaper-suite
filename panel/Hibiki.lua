@@ -2515,7 +2515,7 @@ local function ctx_tag(m, id)
 end
 
 -- tool calls: one small muted line under the reply (no fill, so it never reads like a message bubble); a run of
--- calls collapses into one line with per-tool counts and the total in blue. holder keeps the label and its widths
+-- calls collapses into one line with per-tool counts. holder keeps the label and its widths
 local function tool_lane(labels, id, holder)
   ImGui.PushFont(ctx, F.reg, FONT_SIZE - 2)
   local w = ImGui.GetContentRegionAvail(ctx)
@@ -2528,10 +2528,8 @@ local function tool_lane(labels, id, holder)
     end
     local parts = {}
     for _, l in ipairs(order) do parts[#parts + 1] = cnt[l] > 1 and (l .. ' ×' .. cnt[l]) or l end
-    local count = #labels == 1 and '1 call' or (#labels .. ' calls')
-    local cw = ImGui.CalcTextSize(ctx, count)
-    local text = truncate(table.concat(parts, ' · '), w - cw - 30)
-    c = { n = #labels, w = w, pal = pal_ver, count = count, text = text, tw = ImGui.CalcTextSize(ctx, text) }
+    local text = truncate(table.concat(parts, ' · '), w - 30)
+    c = { n = #labels, w = w, pal = pal_ver, text = text }
     if holder then holder._lane = c end
   end
   local lh = ImGui.GetTextLineHeight(ctx)
@@ -2543,7 +2541,6 @@ local function tool_lane(labels, id, holder)
   ImGui.DrawList_AddLine(dl, x1 + 4 * s + 1, cy, x1 + 1, cy + 3 * s, C.muted, 1.3)
   ImGui.DrawList_AddLine(dl, x1 + 6, cy + 3 * s, x1 + 11, cy + 3 * s, C.muted, 1.3)
   ImGui.DrawList_AddText(dl, x1 + 16, y1 + 1, C.muted, c.text)
-  ImGui.DrawList_AddText(dl, x1 + 16 + c.tw + 8, y1 + 1, C.value, c.count)
   ImGui.PopFont(ctx)
   if ImGui.IsItemHovered(ctx) and #labels > 1 then
     local seq = {}

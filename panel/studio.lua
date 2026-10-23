@@ -174,7 +174,7 @@ function MT.ensure()
   local slot = meter_slot()
   if MT.on and slot < 0 then
     if not exists(reaper.GetResourcePath() .. '/Effects/Hibiki/Hibiki_Meter.jsfx') then
-      MT.status = 'not installed - run hibiki setup'
+      MT.status = 'not installed'
       return
     end
     local idx = -1
@@ -182,12 +182,12 @@ function MT.ensure()
       idx = reaper.TrackFX_AddByName(m, nm, true, 1)
       if idx >= 0 then break end
     end
-    MT.status = idx >= 0 and 'on the master monitoring FX' or 'REAPER would not load it'
+    MT.status = idx >= 0 and 'idle' or 'could not load'
   elseif not MT.on and slot >= 0 then
     reaper.TrackFX_Delete(m, MON + slot)
     MT.status = 'off'
   else
-    MT.status = MT.on and 'on the master monitoring FX' or 'off'
+    MT.status = MT.on and 'idle' or 'off'
   end
 end
 
@@ -592,6 +592,98 @@ local function brain_edit()
   end)
 end
 
+---------------------------------------------------------------- change history (go back to before any reply)
+-- Undo is linear: going back to before reply X undoes X and everything above it (later replies, the user's own
+-- edits); Redo all replays the same number of steps. Lives as long as REAPER's undo history (until a restart).
+local H = { confirm = nil, last = nil, open_req = false }
+local function project_receipts()
+  local proj = select(2, reaper.EnumProjects(-1, ''))
+  local out = {}
+  for i = #R.list, 1, -1 do
+    local r = R.list[i]
+    if type(r) == 'table' and type(r.id) == 'string' and r.proj == proj then out[#out + 1] = r end
+  end
+  return out
+end
+local function revert_to_before(r, list)
+  local pre, need = prefix(r.id), tonumber(r.points) or 1
+  local seen, n = 0, 0
+  reaper.PreventUIRefresh(1)
+  while n < 2000 and seen < need do
+    local top = reaper.Undo_CanUndo2(0)
+    if not top then break end
+    if top:sub(1, #pre) == pre then seen = seen + 1 end
+    reaper.Undo_DoUndo2(0)
+    n = n + 1
+  end
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  for _, x in ipairs(list) do R.gone[x.id] = true end -- their cards would offer reverts that no longer apply
+  H.last = { undone = n, complete = seen >= need, at = os.date('%H:%M', tonumber(r.at) or os.time()) }
+end
+local function redo_all()
+  local n = 0
+  reaper.PreventUIRefresh(1)
+  while n < (H.last and H.last.undone or 0) and reaper.Undo_CanRedo2(0) do
+    reaper.Undo_DoRedo2(0)
+    n = n + 1
+  end
+  reaper.PreventUIRefresh(-1)
+  reaper.UpdateArrange()
+  H.last = nil
+end
+
+local function history_popup(list)
+  ImGui.SetNextWindowSizeConstraints(ctx, 320, 0, 440, 480)
+  if not ImGui.BeginPopup(ctx, 'hibiki_changes') then return end
+  local w = 400
+  ImGui.Text(ctx, 'Agent changes in this project')
+  ImGui.TextColored(ctx, C.muted, 'Newest first. Revert goes back to before that reply.')
+  if H.last then
+    ImGui.Separator(ctx)
+    P.wrapped(('Went back to before the %s reply (%s).'):format(H.last.at, plural(H.last.undone, 'undo step')), C.muted)
+    if not H.last.complete then P.wrapped('The undo history ended before that reply was fully undone.', C.warn) end
+    if P.primary('Redo all##hist') then redo_all() end
+    if ImGui.IsItemHovered(ctx) then P.show_tip('Replay every step that was undone, back to where you were.') end
+  end
+  for i, r in ipairs(list) do
+    ImGui.Separator(ctx)
+    local lines = type(r.lines) == 'table' and r.lines or {}
+    local n = tonumber(r.n) or 0
+    ImGui.Text(ctx, ('%s  ·  %s%s'):format(os.date('%H:%M', tonumber(r.at) or 0), plural(n, 'change'),
+      r.id:match('^mcp%-') and '  ·  outside the panel' or ''))
+    if lines[1] then
+      ImGui.TextColored(ctx, C.muted, P.truncate(lines[1] .. (#lines > 1 and ('  +' .. (n - 1)) or ''), w))
+      if ImGui.IsItemHovered(ctx) then P.show_tip(table.concat(lines, '\n')) end
+    end
+    if H.confirm == r.id then
+      P.wrapped((i == 1 and 'Undoes this reply and any edits you made after it.'
+        or ('Also undoes the %s after it and any edits you made since.'):format(plural(i - 1, 'later reply')))
+        .. ' Redo all brings everything back.', C.warn)
+      if P.primary('Revert##hc' .. i) then revert_to_before(r, list); H.confirm = nil end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Cancel##hc' .. i) then H.confirm = nil end
+    elseif not H.last and ImGui.Button(ctx, 'Revert to before this##hr' .. i) then
+      H.confirm = r.id
+    end
+  end
+  if #list == 0 then ImGui.TextDisabled(ctx, 'No agent changes in this project yet.') end
+  ImGui.EndPopup(ctx)
+end
+
+-- composer chip, shown once this project has agent changes (or a history revert to redo)
+function M.changes_chip()
+  local list = project_receipts()
+  if #list == 0 and not H.last and not H.open_req then return end
+  ImGui.SameLine(ctx, 0, 2)
+  if P.chip('changes', 'Changes', C.muted, false) or H.open_req then
+    H.open_req, H.confirm = false, nil
+    ImGui.OpenPopup(ctx, 'hibiki_changes')
+  end
+  if ImGui.IsItemHovered(ctx) then P.show_tip('What agents changed in this project; go back to before any reply.') end
+  history_popup(list)
+end
+
 ---------------------------------------------------------------- panel hooks
 function M.tick(t)
   if reaper.GetExtState(EXT, 'open') == 'ears' then -- like open=settings / recover: another script can press Ears
@@ -627,16 +719,28 @@ end
 
 function M.settings(A)
   A.section('Studio', A.COL)
-  if MT.on then MT.status = MT.status ~= '' and MT.status or '…' end
   brain_info()
   A.box('studio', A.COL, function(w, x0)
-    if A.led_btn('review', 'Review changes', not R.auto) then set_auto(not R.auto) end
+    local function row() ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx))) end
+    local function right_btn(id, text, off)
+      local bw = ImGui.CalcTextSize(ctx, text) + 16
+      ImGui.SameLine(ctx)
+      ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+      return A.light_btn(id, text, bw, false, off)
+    end
+    local function right_note(text) -- dim status at the right end of the row just drawn
+      local _, y1 = ImGui.GetItemRectMin(ctx)
+      local _, y2 = ImGui.GetItemRectMax(ctx)
+      local tw = ImGui.CalcTextSize(ctx, text)
+      ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), x0 + w - tw - 4, (y1 + y2 - ImGui.GetTextLineHeight(ctx)) / 2, A.dim, text)
+    end
+    if A.checkbox('review', 'Review changes after each reply', not R.auto, w) then set_auto(not R.auto) end
     if ImGui.IsItemHovered(ctx) then
-      P.show_tip('After a reply that changed REAPER, show what changed with Accept / Revert.\n'
+      P.show_tip('After a reply that changed REAPER, a card lists the changes with Accept / Revert.\n'
         .. 'Off = always accept (each change is still an undo step).')
     end
-    ImGui.SameLine(ctx)
-    if A.led_btn('meter', 'Measure playback', MT.on) then
+    row()
+    if A.checkbox('meter', 'Measure playback', MT.on, w) then
       MT.on = not MT.on
       reaper.SetExtState(EXT, 'meter', MT.on and '1' or '0', true)
       MT.ensure()
@@ -645,27 +749,27 @@ function M.settings(A)
       P.show_tip('Hibiki Meter on the master\'s monitoring FX (never rendered): loudness, true peak, bands and stereo '
         .. 'of what you play go into the context.')
     end
-    ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-    ImGui.TextColored(ctx, A.dim, P.truncate('Meter: ' .. (MT.on and (MT.running() and 'measuring' or MT.status) or 'off'), w))
-    ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+    if MT.on then right_note(MT.running() and 'measuring' or MT.status) end
+    row()
     ImGui.AlignTextToFramePadding(ctx)
     local info = BR.info
-    ImGui.Text(ctx, info and ('Agent rules: ' .. (tonumber(info.count) or 0)) or 'Agent rules')
+    ImGui.Text(ctx, info and ('Agent rules (' .. (tonumber(info.count) or 0) .. ')') or 'Agent rules')
     if ImGui.IsItemHovered(ctx) then
       P.show_tip('One rules file for every agent on this Mac (Codex, Claude Code, Kimi, Gemini...). '
         .. 'Type  /remember <rule>  in the chat to add one.' .. (info and info.path and ('\n' .. info.path) or ''))
     end
-    local bt = 'Edit'
-    local bw = ImGui.CalcTextSize(ctx, bt) + 16
-    ImGui.SameLine(ctx)
-    ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
-    if A.light_btn('brainedit', bt, bw, false, info == false) then brain_edit() end
+    if right_btn('brainedit', 'Edit', info == false) then brain_edit() end
+    row()
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, 'Agent changes')
+    if ImGui.IsItemHovered(ctx) then P.show_tip('Every reply that changed this project; go back to before any of them.') end
+    if right_btn('history', 'Open', false) then H.open_req = true end
   end)
 end
 
 function M.exit() reaper.SetExtState(EXT, 'turn', '', false) end
 
 if MT.on then pcall(MT.ensure) end
-M._R, M._MT, M._RK, M._E = R, MT, RK, E -- headless tests
+M._R, M._MT, M._RK, M._E, M._H = R, MT, RK, E, H -- headless tests
 return M
 end

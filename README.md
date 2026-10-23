@@ -219,7 +219,9 @@ while a composition is open and shows the pending pinyin under the input.
   the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
   **Accept** (keep them, close the card) and **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
   undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Studio → Review changes off) stops the cards;
-  every change is still a labelled undo step. Changes made outside the panel (the Gamut app, a
+  every change is still a labelled undo step. **Changes** (composer, or Agent settings → Studio → Agent changes) lists every reply
+  that changed this project (last 30) and goes back to before any of them: undo is linear, so later replies and your
+  own edits since are undone too (it says so first); **Redo all** replays them. Lives as long as REAPER's undo history. Changes made outside the panel (the Gamut app, a
   CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
   every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,

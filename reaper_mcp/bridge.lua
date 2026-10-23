@@ -1606,7 +1606,7 @@ local function describe(func, args)
   return func .. "(" .. table.concat(parts, ", ") .. ")"
 end
 
-local MAX_TURNS, MAX_LINES = 8, 60
+local MAX_TURNS, MAX_LINES = 30, 60
 local receipts = {}       -- { id, at, n, lines = {}, failed }
 local staged = {}         -- changes of the request that is running
 local auto_turn, auto_at = nil, -math.huge

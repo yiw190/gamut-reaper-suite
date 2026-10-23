@@ -2982,6 +2982,19 @@ local function cfg_window()
         off and shade(C.win_text, 0x60) or C.win_text, text)
       return clicked and not off
     end
+    local function checkbox(id, text, on, w)
+      local cx, cy = ImGui.GetCursorScreenPos(ctx)
+      local hit = ImGui.InvisibleButton(ctx, '##cb_' .. id, w, fh)
+      local bx, by = cx + 1, cy + (fh - 13) / 2
+      ImGui.DrawList_AddRectFilled(dl, bx, by, bx + 13, by + 13, 0xFFFFFFFF, 2)
+      ImGui.DrawList_AddRect(dl, bx, by, bx + 13, by + 13, C.win_line, 2)
+      if on then
+        ImGui.DrawList_AddLine(dl, bx + 3, by + 6.5, bx + 5.5, by + 9.5, C.win_text, 1.8)
+        ImGui.DrawList_AddLine(dl, bx + 5.5, by + 9.5, bx + 10, by + 3.5, C.win_text, 1.8)
+      end
+      ImGui.DrawList_AddText(dl, bx + 20, cy + (fh - ImGui.GetTextLineHeight(ctx)) / 2, C.win_text, text)
+      return hit
+    end
     local function led_btn(id, text, on)
       local w = ImGui.CalcTextSize(ctx, text) + 26
       local clicked = ImGui.InvisibleButton(ctx, '##led_' .. id, w, fh)
@@ -3203,32 +3216,45 @@ local function cfg_window()
         if mode then row('Mode:', function(cw) combo(mode, 'mode', cw) end) end
       end)
     end
+    if studio then
+      ImGui.Dummy(ctx, 0, 2)
+      studio.settings({ section = section, box = box, light_btn = light_btn, checkbox = checkbox, COL = COL,
+        dim = shade(C.win_text, 0x30) })
+    end
+    ImGui.EndGroup(ctx)
+
+    -- right column (like Receives): the context switch, then one box per live REAPER selection
+    ImGui.SameLine(ctx, 0, GAP)
+    ImGui.BeginGroup(ctx)
+    section('Context', COL)
+    if checkbox('ctx', 'Send REAPER context with each message', S.ctx_level > 0, COL) then
+      S.ctx_level = S.ctx_level > 0 and 0 or 1
+      reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
+    end
     ImGui.Dummy(ctx, 0, 2)
-    section('Recovery', COL)
-    REC.tick()
-    box('recover', COL, function(w, x0)
-      ImGui.AlignTextToFramePadding(ctx)
-      ImGui.Text(ctx, REC.running and 'Resetting the connection…' or 'Stuck or not answering?')
-      local bt = REC.running and 'Recovering…' or 'Recover'
-      local bw = ImGui.CalcTextSize(ctx, bt) + 16
-      ImGui.SameLine(ctx)
-      ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
-      if light_btn('recover', bt, bw, false, REC.running) then REC.start() end
-      if ImGui.IsItemHovered(ctx) and not REC.running then
-        show_tip('Stops the reply, restarts the connection, runs  hibiki recover  and reloads this chat.')
-      end
-      if REC.lines then
-        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-        ImGui.PushTextWrapPos(ctx, x0 + w)
-        for _, l in ipairs(REC.lines) do
-          ImGui.TextColored(ctx, l.ok and shade(C.win_text, 0x30) or C.razor, l.text)
+    local KIND = { razor = 'Razor area', time = 'Time selection', tracks = 'Tracks', items = 'Items',
+      notes = 'MIDI notes', env = 'Envelope', fx = 'FX window' }
+    local P = {}
+    for _, p_ in ipairs(SEL.pills or {}) do P[#P + 1] = p_ end
+    table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
+    if #P == 0 then ImGui.TextDisabled(ctx, 'Nothing selected in REAPER.') end
+    for n, p_ in ipairs(P) do
+      if n > 4 then break end
+      box('sel_' .. p_.k, COL, function(w, x0)
+        ImGui.Text(ctx, KIND[p_.k] or p_.k)
+        local lines = 0
+        for ln in (p_.detail or p_.label):gmatch('[^\n]+') do
+          lines = lines + 1
+          if lines > 4 then break end
+          ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+          ImGui.TextColored(ctx, shade(C.win_text, 0x30), truncate(ln, w))
         end
-        ImGui.PopTextWrapPos(ctx)
-      end
-    end)
+      end)
+    end
     ImGui.Dummy(ctx, 0, 2)
     section('Hibiki', COL)
     UPD.tick()
+    REC.tick()
     box('update', COL, function(w, x0)
       local function right_btn(id, text, off)
         local bw = ImGui.CalcTextSize(ctx, text) + 16
@@ -3265,55 +3291,27 @@ local function cfg_window()
       end
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
       if led_btn('upddev', 'Include dev builds', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
-    end)
-    if studio then
-      ImGui.Dummy(ctx, 0, 2)
-      studio.settings({ section = section, box = box, light_btn = light_btn, led_btn = led_btn, COL = COL,
-        dim = shade(C.win_text, 0x30) })
-    end
-    ImGui.EndGroup(ctx)
-
-    -- right column (like Receives): the context switch, then one box per live REAPER selection
-    ImGui.SameLine(ctx, 0, GAP)
-    ImGui.BeginGroup(ctx)
-    section('Context', COL)
-    do
-      local on = S.ctx_level > 0
-      local cx, cy = ImGui.GetCursorScreenPos(ctx)
-      local hit = ImGui.InvisibleButton(ctx, '##cfg_ctx', COL, fh)
-      local bx, by = cx + 1, cy + (fh - 13) / 2 -- REAPER's checkbox: white square, dark tick
-      ImGui.DrawList_AddRectFilled(dl, bx, by, bx + 13, by + 13, 0xFFFFFFFF, 2)
-      ImGui.DrawList_AddRect(dl, bx, by, bx + 13, by + 13, C.win_line, 2)
-      if on then
-        ImGui.DrawList_AddLine(dl, bx + 3, by + 6.5, bx + 5.5, by + 9.5, C.win_text, 1.8)
-        ImGui.DrawList_AddLine(dl, bx + 5.5, by + 9.5, bx + 10, by + 3.5, C.win_text, 1.8)
+      ImGui.Dummy(ctx, 0, 4)
+      ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.Text(ctx, REC.running and 'Resetting the connection…' or 'Stuck or not answering?')
+      local bt = REC.running and 'Recovering…' or 'Recover'
+      local bw = ImGui.CalcTextSize(ctx, bt) + 16
+      ImGui.SameLine(ctx)
+      ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+      if light_btn('recover', bt, bw, false, REC.running) then REC.start() end
+      if ImGui.IsItemHovered(ctx) and not REC.running then
+        show_tip('Stops the reply, restarts the connection, runs  hibiki recover  and reloads this chat.')
       end
-      ImGui.DrawList_AddText(dl, bx + 20, cy + (fh - ImGui.GetTextLineHeight(ctx)) / 2, C.win_text, 'Send REAPER context with each message')
-      if hit then
-        S.ctx_level = on and 0 or 1
-        reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
-      end
-    end
-    ImGui.Dummy(ctx, 0, 2)
-    local KIND = { razor = 'Razor area', time = 'Time selection', tracks = 'Tracks', items = 'Items',
-      notes = 'MIDI notes', env = 'Envelope', fx = 'FX window' }
-    local P = {}
-    for _, p_ in ipairs(SEL.pills or {}) do P[#P + 1] = p_ end
-    table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
-    if #P == 0 then ImGui.TextDisabled(ctx, 'Nothing selected in REAPER.') end
-    for n, p_ in ipairs(P) do
-      if n > 6 then break end
-      box('sel_' .. p_.k, COL, function(w, x0)
-        ImGui.Text(ctx, KIND[p_.k] or p_.k)
-        local lines = 0
-        for ln in (p_.detail or p_.label):gmatch('[^\n]+') do
-          lines = lines + 1
-          if lines > 4 then break end
-          ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-          ImGui.TextColored(ctx, shade(C.win_text, 0x30), truncate(ln, w))
+      if REC.lines then
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        ImGui.PushTextWrapPos(ctx, x0 + w)
+        for _, l in ipairs(REC.lines) do
+          ImGui.TextColored(ctx, l.ok and shade(C.win_text, 0x30) or C.razor, l.text)
         end
-      end)
-    end
+        ImGui.PopTextWrapPos(ctx)
+      end
+    end)
     ImGui.EndGroup(ctx)
 
     if ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then open = false end
@@ -4123,6 +4121,7 @@ local function frame()
       ImGui.SameLine(ctx, 0, 2)
       context_chip()
       if studio then ImGui.SameLine(ctx, 0, 2); studio.ears_chip() end
+      if studio then studio.changes_chip() end
       local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or (studio and studio.hint())
         or (S.uploading and ('Uploading ' .. S.uploading .. (S.uploading == 1 and ' file…' or ' files…')))
         or 'Enter to send'

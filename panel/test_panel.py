@@ -5,6 +5,7 @@ curl never runs: the panel's shell calls are recorded, and the test answers a re
 files the panel polls, or appends SSE text to the stream file, the same way the background curl would.
 
     uv run --with lupa python panel/test_panel.py
+    uv run --with lupa python panel/test_panel.py --bench   # per-frame cost, HEAD vs working copy
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ class Request:
 class Panel:
     """One fresh panel run. ext: saved ExtState (Hibiki/<key>); token: the gateway token file's content."""
 
-    def __init__(self, ext=None, token=None, env=None):
+    def __init__(self, ext=None, token=None, env=None, src=None):
         import lupa
 
         self.tmp = Path(tempfile.mkdtemp())
@@ -174,7 +175,7 @@ class Panel:
         state = self.lua.globals().EXT_STATE
         for k, v in {"ctx_level": "0", **(ext or {})}.items():
             state["Hibiki/" + k] = v
-        self.m = self.lua.execute(PANEL.read_text(encoding="utf-8"))
+        self.m = self.lua.execute(src or PANEL.read_text(encoding="utf-8"))
         self.S = self.m.S
         self.seen = 0
 
@@ -470,6 +471,7 @@ def test_offscreen_messages_are_dummies():
     p.sse({"type": "connected", "isActive": False})
     (req,) = find(p.requests(), "GET", "/sessions/s1/messages")
     p.reply(req, 200, _chat(p, 60))
+    p.S.win_from = 1  # the whole transcript in the window, as after scrolling up to the first message
     g, ui = p.lua.globals(), p.lua.globals().UI
     lay = g.LAYOUT(400, 600)
     p.m.draw_log()
@@ -494,6 +496,208 @@ def test_offscreen_messages_are_dummies():
     lay.y = 0
     p.m.draw_log()
     check("H2: and then culls again with the new heights", lay.y == h300, (lay.y, h300))
+
+
+WIN = 60
+
+
+def _loaded(n_rounds, msgs=None, src=None):
+    p = Panel(SESSION, src=src)
+    p.boot()
+    p.sse({"type": "connected", "isActive": False})
+    (req,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    p.reply(req, 200, msgs if msgs is not None else _chat(p, n_rounds))
+    return p
+
+
+def _frame(p, lay, scroll=None):
+    """One log frame: returns (calls, texts {text: screen y}); applies the frame's last SetScrollY afterwards, the way
+    ImGui does on the next Begin."""
+    g = p.lua.globals()
+    lay.y = 0
+    if scroll is not None:
+        lay.scroll = scroll
+    g.UI = p.lua.table()
+    p.m.draw_log()
+    calls = [g.UI[i] for i in range(1, len(g.UI) + 1)]
+    texts = {}
+    for c in calls:
+        if c.name == "DrawList_AddTextEx" and 0 <= c.args[5] <= lay.h:
+            texts.setdefault(c.args[7], c.args[5])
+    sets = [c.args[2] for c in calls if c.name == "SetScrollY"]
+    p.S.sy_last = sets[-1] if sets else lay.scroll
+    lay.scroll = p.S.sy_last
+    return calls, texts
+
+
+def _bottom(p, lay):
+    _frame(p, lay)
+    _frame(p, lay, max(0, lay.y - lay.h))
+    return _frame(p, lay, max(0, lay.y - lay.h))
+
+
+def test_window_cost_is_constant():
+    counts = {}
+    for rounds in (50, 1500):
+        p = _loaded(rounds)
+        p.S.follow = True
+        lay = p.lua.globals().LAYOUT(400, 600)
+        calls, _ = _bottom(p, lay)
+        counts[rounds * 2] = len(calls)
+        walked = sum(1 for m in p.lua_list(p.S.msgs) if m._h)
+        if rounds == 1500:
+            check("W1: 3000 messages: only the last %d are laid out" % WIN, walked <= WIN + 2, walked)
+            check("W1: window starts %d from the end" % WIN, p.S.win_from == 3000 - WIN + 1, p.S.win_from)
+    check("W1: a frame costs the same ImGui calls for 3000 messages as for 100 (O(window), not O(total))",
+          counts[3000] <= counts[100] + 10, counts)
+
+
+def test_window_grows_at_top_and_keeps_position():
+    p = _loaded(1500)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = True
+    _bottom(p, lay)
+    p.S.follow = False
+    _, before = _frame(p, lay, 0)
+    p.S.sy_last = 0
+    start = p.S.win_from
+    calls, during = _frame(p, lay, 0)
+    check("W2: reaching the top grows the window by %d" % WIN, p.S.win_from == start - WIN, (start, p.S.win_from))
+    check("W2: the top of the window shows text", len(before) >= 5, before)
+    check("W2: the growing frame looks the same (older messages laid out out of sight)", during == before,
+          (sorted(before.items())[:3], sorted(during.items())[:3]))
+    check("W2: the scroll moves down by the inserted height", lay.scroll > 600, lay.scroll)
+    _, after = _frame(p, lay)
+    check("W2: next frame the same text sits at the same screen y", after == before,
+          (sorted(before.items())[:3], sorted(after.items())[:3]))
+    _, again = _frame(p, lay)
+    check("W2: and stays there (no growth away from the top)", again == before and p.S.win_from == start - WIN)
+    check("W2: the hint line is drawn while older messages exist",
+          any(c.name == "TextDisabled" and c.args[2] == "Load earlier messages" for c in calls))
+
+
+def test_window_click_hint_and_first_message():
+    p = _loaded(40)  # 80 messages: one growth reaches the first message and the hint goes away
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = False
+    g = p.lua.globals()
+    _frame(p, lay, 300)
+    _, before = _frame(p, lay, 300)
+    g.RET.IsItemClicked = p.lua.eval("function() return true end")
+    _frame(p, lay)
+    g.RET.IsItemClicked = None
+    check("W3: clicking the hint loads the rest", p.S.win_from == 1, p.S.win_from)
+    calls, after = _frame(p, lay)
+    check("W3: no hint once the first message is in", not any(c.name == "TextDisabled" and c.args[2] == "Load earlier messages"
+                                                              for c in calls))
+    check("W3: text on screen", len(before) >= 5, before)
+    check("W3: the view stays put even though the hint line went away", after == before,
+          (sorted(before.items())[:2], sorted(after.items())[:2]))
+
+
+def test_window_shrinks_when_following():
+    p = _loaded(1500)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = True
+    _bottom(p, lay)
+    p.S.follow = False
+    for _ in range(4):
+        p.S.sy_last = 0
+        _frame(p, lay, 0)
+    grown = 3001 - p.S.win_from
+    check("W4: scrolled up past %d messages" % (3 * WIN), grown > 3 * WIN, grown)
+    p.S.follow = False
+    _bottom(p, lay)
+    check("W4: at the bottom but not following: the window is left alone", 3001 - p.S.win_from == grown)
+    p.S.follow = True
+    _, before = _frame(p, lay, max(0, lay.y - lay.h))
+    _, after = _frame(p, lay)
+    check("W4: following again cuts back to the last %d" % WIN, p.S.win_from == 3000 - WIN + 1, p.S.win_from)
+    check("W4: the bottom shows text", len(before) >= 5, before)
+    check("W4: the cut keeps the bottom in place", after == before and lay.scroll <= lay.y - lay.h + 1,
+          (sorted(before.items())[:2], sorted(after.items())[:2], lay.scroll, lay.y))
+
+
+def test_window_new_messages():
+    p = _loaded(200)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = True
+    _bottom(p, lay)
+    lua = p.lua
+    msgs = p.S.msgs
+    for k in range(4):
+        msgs[len(msgs) + 1] = lua.table_from({"role": "user", "text": "new %d" % k})
+    _frame(p, lay)
+    check("W5: following: the window start advances with new messages", p.S.win_from == len(msgs) - WIN + 1,
+          (p.S.win_from, len(msgs)))
+    p.S.follow = False
+    start = p.S.win_from
+    _, before = _frame(p, lay, 200)
+    for k in range(4):
+        msgs[len(msgs) + 1] = lua.table_from({"role": "user", "text": "more %d" % k})
+    _, after = _frame(p, lay, 200)
+    check("W5: reading scrolled up: new messages don't move the window or the view",
+          p.S.win_from == start and after == before, (start, p.S.win_from))
+
+
+def test_window_resets_on_session_switch():
+    p = _loaded(1500)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.win_from = 7
+    p.lua.globals().EXT_STATE["Hibiki/demo_new"] = "1"
+    p.m.demo_tick(p.lua.globals().NOW)
+    check("W6: new chat / session switch drops the window", p.S.win_from is None, p.S.win_from)
+    p.S.sid = "s1"
+    p.m.refresh_messages(True)
+    (req,) = find(p.requests(), "GET", "/sessions/s1/messages")
+    p.reply(req, 200, _chat(p, 1500))
+    _frame(p, lay)
+    check("W6: a fresh load shows the last %d" % WIN, p.S.win_from == 3000 - WIN + 1, p.S.win_from)
+
+
+def test_window_tool_run_boundary():
+    msgs = []
+    for i in range(100):
+        msgs.append({"type": "user", "id": "u%d" % i, "content": {"text": "q %d" % i}})
+        msgs.append({"type": "assistant", "id": "a%d" % i, "content": {"text": "a %d" % i}})
+    run = [{"type": "assistant", "id": "t%d" % i, "content": {"text": ""}, "toolCalls": [{"name": "Bash"}]}
+           for i in range(30)]
+    msgs = msgs[:150] + run + msgs[150:]  # the run covers 151..180; n = 230, so n - 59 = 171 falls inside it
+    p = _loaded(0, msgs)
+    lay = p.lua.globals().LAYOUT(400, 600)
+    p.S.follow = True
+    _bottom(p, lay)
+    check("W7: the window starts at the first message of a tool-only run, not inside it", p.S.win_from == 151,
+          p.S.win_from)
+    first = p.S.msgs[151]
+    check("W7: the whole run is one lane held by its first message", first._hl and first._hl.key == 30,
+          first._hl and first._hl.key)
+    check("W7: no lane cache on messages inside the run",
+          all(not p.S.msgs[i]._hl for i in range(152, 181)))
+
+
+def bench():
+    """Per-frame Lua time and ImGui call count, HEAD panel vs this one (mock ImGui; Lua cost includes the mocks)."""
+    import subprocess
+    import time
+    old = subprocess.run(["git", "show", "HEAD:panel/Hibiki.lua"], cwd=PANEL.parent.parent, capture_output=True,
+                         text=True).stdout
+    print("%-8s %6s %16s %16s" % ("version", "msgs", "lua ms/frame", "ImGui calls"))
+    for label, src in (("before", old), ("after", None)):
+        for rounds in (50, 500, 1500):
+            p = _loaded(rounds, src=src)
+            p.S.follow = True
+            lay = p.lua.globals().LAYOUT(400, 600)
+            calls, _ = _bottom(p, lay)
+            g = p.lua.globals()
+            g.RECORD = False
+            frames = 60
+            t = time.perf_counter()
+            for _ in range(frames):
+                lay.y = 0
+                p.m.draw_log()
+            ms = (time.perf_counter() - t) / frames * 1000
+            print("%-8s %6d %16.3f %16d" % (label, rounds * 2, ms, len(calls)))
 
 
 def test_truncate_binary_search():
@@ -819,6 +1023,9 @@ def main():
         import lupa  # noqa: F401
     except ImportError:
         raise SystemExit("needs lupa: uv run --with lupa python panel/test_panel.py")
+    if "--bench" in sys.argv:
+        bench()
+        return
     for OS_NAME in ("macOS-arm64", "Win64"):
         print("== " + OS_NAME)
         for name, fn in list(globals().items()):

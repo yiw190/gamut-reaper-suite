@@ -388,7 +388,7 @@ local function refresh_messages(full)
       local o = old[m.role .. '\0' .. m.text]
       if o then m._md, m._bubble, m._h = o._md, o._bubble, o._h end
     end
-    if #S.msgs == 0 then scroll() end
+    if #S.msgs == 0 then scroll(); S.win_from = nil end
     if keep > 0 then
       local msgs = table.move(S.msgs, 1, keep, 1, {})
       S.msgs = table.move(out, 1, #out, keep + 1, msgs)
@@ -1374,6 +1374,7 @@ local function reset_view()
   stream_stop()
   S.gen = S.gen + 1 -- late callbacks from the previous view check this and drop their result
   S.msgs, S.live, S.queued, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, {}, false, nil, false, {}, 0
+  S.win_from = nil
   S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
   S.last_sent, S.last_sent_at = nil, nil
   S.stream.fails = 0
@@ -3656,7 +3657,9 @@ end
 
 -- the conversation. Every element (sent message, reply, tool line) remembers its drawn height; one whose height is
 -- known for this width and palette and lies outside the visible scroll range is replaced by a Dummy of that height,
--- so off-screen history costs two calls and the scroll range (and scroll_engine) stays exact
+-- so off-screen history costs two calls and the scroll range (and scroll_engine) stays exact. Only a window of the
+-- newest messages (S.win_from..) is walked at all: reaching the top grows it by WIN, following the live edge cuts it
+-- back to the last WIN, and each change shifts the scroll by the height it added or removed above the viewport
 local draw_log
 do
   local W, SP, V0, V1 = 0, 6, 0, 0
@@ -3674,8 +3677,10 @@ do
     if not c then c = {}; holder[slot] = c end
     c.w, c.key, c.pal, c.h = W, key, pal_ver, ImGui.GetCursorPosY(ctx) - y
   end
+  local flush, to_lane
+  do
   local lane, lane_holder, lane_id = {}, nil, ''
-  local function flush()
+  function flush()
     if #lane == 0 then return end
     local skipped, y = skip(lane_holder, '_hl', #lane)
     if not skipped then
@@ -3685,10 +3690,13 @@ do
     end
     for i = #lane, 1, -1 do lane[i] = nil end
   end
-  local function to_lane(holder, id, labels)
+  function to_lane(holder, id, labels)
     if #lane == 0 then lane_id, lane_holder = id, holder end
     for _, l in ipairs(labels) do lane[#lane + 1] = l end
   end
+  end
+  local draw_msg
+  do
   local function user_msg(m, id)
     if m._had == nil then
       m._body, m._had, m._ctx = split_context(m.text)
@@ -3709,7 +3717,7 @@ do
     end
     ImGui.Spacing(ctx)
   end
-  local function draw_msg(m, id)
+  function draw_msg(m, id)
     local tools = m.tools and #m.tools > 0
     if m.role == 'user' then
       flush()
@@ -3732,14 +3740,46 @@ do
       to_lane(m, id, m._tl)
     end
   end
-  local one = {}
+  end
+  local one, WIN = {}, 60
+  local function tools_of(m) return m and m.role ~= 'user' and m.tools and #m.tools > 0 end
+  -- a window never starts inside a run of tool-only replies: the whole run is one lane, held by its first message
+  local function boundary(i)
+    local msgs = S.msgs
+    i = math.max(1, i)
+    while i > 1 and msgs[i] and msgs[i].text == '' and tools_of(msgs[i]) and tools_of(msgs[i - 1]) do i = i - 1 end
+    return i
+  end
+  local function shift(d, sy)
+    if d == 0 then return end
+    S.sy_last = math.max(0, (S.sy_last or sy) + d)
+    S.sy_target = math.max(0, (S.sy_target or sy) + d)
+    ImGui.SetScrollY(ctx, S.sy_last)
+  end
   function draw_log()
     W = math.floor(ImGui.GetContentRegionAvail(ctx))
     local _, sp = ImGui.GetStyleVar(ctx, ImGui.StyleVar_ItemSpacing)
     SP = sp or 6
     local sy, wh = ImGui.GetScrollY(ctx), ImGui.GetWindowHeight(ctx)
     V0, V1 = sy - 200, sy + wh + 200
-    for i, m in ipairs(S.msgs) do draw_msg(m, i) end
+    local msgs, n = S.msgs, #S.msgs
+    if not S.win_from or S.win_from > math.max(1, n) then S.win_from = boundary(n - WIN + 1) end
+    local from, cut, grow = boundary(S.win_from), nil, false
+    if S.follow and n - from + 1 > WIN and (n ~= S.win_n or n - from + 1 > 3 * WIN) then
+      cut = boundary(n - WIN + 1)
+      if cut <= from then cut = nil end
+    end
+    S.win_n = n
+    if from > 1 then
+      ImGui.TextDisabled(ctx, 'Load earlier messages')
+      grow = ImGui.IsItemClicked(ctx) or (S.follow == false and (S.sy_last or sy) <= 2)
+      if grow then cut = nil end
+    end
+    local y_first, y_cut = ImGui.GetCursorPosY(ctx), nil
+    for i = from, n do
+      if i == cut then flush(); y_cut = ImGui.GetCursorPosY(ctx) end
+      draw_msg(msgs[i], i)
+    end
     for i, b in ipairs(S.live) do
       if b.kind == 'text' then
         flush()
@@ -3758,6 +3798,23 @@ do
       ImGui.TextColored(ctx, C.accent, 'Working ' .. s)
     end
     if S.err then ImGui.TextColored(ctx, C.danger, S.err) end
+    S.win_from = from
+    if y_cut then
+      S.win_from = cut
+      shift((from == 1 and ImGui.GetTextLineHeight(ctx) + SP or 0) - (y_cut - y_first), sy)
+    elseif grow then
+      -- the older messages are laid out once below everything, out of sight, so their heights are known before
+      -- they move to the top next frame together with the compensating scroll
+      local nf = boundary(from - WIN)
+      local gap = sy + wh - ImGui.GetCursorPosY(ctx)
+      if gap > 0 then ImGui.Dummy(ctx, W, gap) end
+      local ya = ImGui.GetCursorPosY(ctx)
+      for i = nf, from - 1 do draw_msg(msgs[i], i) end
+      flush()
+      local h = ImGui.GetCursorPosY(ctx) - ya
+      S.win_from = nf
+      shift(h - (nf == 1 and ImGui.GetTextLineHeight(ctx) + SP or 0), sy)
+    end
   end
 end
 

@@ -23,6 +23,9 @@ Gemini CLI, ...) run as stdio subprocesses and are served under the same routes,
   POST /api/agents/<slug>/sessions/<id>/interrupt
   POST /api/agents/<slug>/sessions/<id>/permission {requestId, optionId|null}
   POST /api/agents/<slug>[/sessions/<id>]/upload-file   multipart "file" -> {success, path, filename, size}
+  GET  /api/hibiki/brain                             {path, exists, count, chars, max, folders}: the shared rules file
+  POST /api/hibiki/brain           {add} | {ensure}  append one rule line (and rewrite the agents' instruction files),
+                                                     or create rules.md from the template so it can be opened
 
 Attachments use Gamut's convention: the message ends with "[Attached files:]" and "- <path>" lines. For ACP agents
 the gateway also sends each file as a prompt block (an image block when the agent accepts images, otherwise a
@@ -79,6 +82,30 @@ IDLE_CHECK = float(os.environ.get("AGENT_GATEWAY_IDLE_CHECK", "30"))
 MAX_REQUESTS = int(os.environ.get("AGENT_GATEWAY_MAX_REQUESTS", "32"))
 MAX_STREAMS = int(os.environ.get("AGENT_GATEWAY_MAX_STREAMS", "64"))
 SAFE_ID = re.compile(r"^[A-Za-z0-9._-]+$")
+# Hibiki brain: the user's standing rules, shared by every ACP agent. The gateway copies rules.md into the agents'
+# working folder as a marked block in the instruction file each CLI reads by itself (Codex / Kimi / Copilot
+# AGENTS.md, Claude Code CLAUDE.md, Gemini GEMINI.md), before each new or reloaded session.
+BRAIN = Path(os.environ.get("HIBIKI_BRAIN", "~/.config/hibiki/brain")).expanduser()
+BRAIN_FILES = ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+BRAIN_BEGIN = "<!-- hibiki rules: begin. Written by the Hibiki gateway from %s; edit that file, not this block -->"
+BRAIN_END = "<!-- hibiki rules: end -->"
+BRAIN_MAX = 12000  # characters (~3k tokens): every session of every agent pays for it
+# what every agent in the panel should know about the panel itself; written above the user's rules
+BRAIN_CONVENTIONS = """## Hibiki panel conventions
+- Each of your replies is one revertable unit: the panel lists what you changed in REAPER and offers Revert. Prefer the
+  MCP verbs (track / fx / send / item / envelope / midi) over run_lua, so the list says what changed.
+- Audition rack: to offer the user alternatives (parts, sounds, FX settings), make each variant a track and tag it
+  with track P_EXT:hibiki_var = "<group>/<n>" (n = 1..9; unmute one, mute the rest), or tag FX on one track with
+  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). The panel shows numbered buttons and keys 1-9.
+  Match the variants' loudness before handing them over. "Keep variant n" means: delete the others, remove the tags.
+- "meter" lines in the REAPER context are measured on the master during the user's last playback (Hibiki Meter).
+- Files named ears-*.wav/.png/.md are the user's selection rendered from the master and measured for you."""
+BRAIN_TEMPLATE = """# Rules for agents working in REAPER
+
+Every Hibiki agent on this Mac (Codex, Claude Code, Kimi, Gemini, ...) reads these rules at the start of a chat.
+Write one rule per line. `/remember <rule>` in the Hibiki panel adds a line here.
+
+"""
 ENV_KEY = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
@@ -325,6 +352,71 @@ def chat_title(text):
 
 # how to reopen an ACP chat in the agent's own terminal UI ({id} = the ACP session id); spec "resume" overrides
 RESUME = {"claude": ["claude", "--resume", "{id}"], "kimi": ["kimi", "--session", "{id}"]}
+
+
+def brain_path():
+    return BRAIN / "rules.md"
+
+
+def brain_rules():
+    """rules.md without the template's header comment, or '' when there are no rules yet."""
+    try:
+        text = brain_path().read_text(encoding="utf-8")
+    except OSError:
+        return ""
+    return text.strip()[:BRAIN_MAX]
+
+
+def brain_count(text):
+    return sum(1 for line in text.splitlines() if re.match(r"^\s*([-*]|\d+[.)])\s+\S", line))
+
+
+def brain_add(rule):
+    rule = " ".join(str(rule or "").split())
+    if not rule or len(rule) > 500:
+        raise ValueError("a rule is one line of 1-500 characters")
+    path = brain_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    old = path.read_text(encoding="utf-8") if path.exists() else BRAIN_TEMPLATE
+    if any(line.strip().lstrip("-* ").strip() == rule for line in old.splitlines()):
+        return False
+    path.write_text(old.rstrip("\n") + "\n- " + rule + "\n", encoding="utf-8")
+    return True
+
+
+def brain_sync(cwd):
+    """Put the panel conventions and rules.md into cwd's AGENTS.md / CLAUDE.md / GEMINI.md as a marked block; text
+    outside the block is the user's and stays."""
+    cwd = os.path.abspath(cwd)
+    if cwd in (os.path.abspath(os.path.expanduser("~")), os.path.abspath(os.sep)):
+        return []  # a block in ~/CLAUDE.md would reach every project under the home folder
+    rules = brain_rules()
+    begin = BRAIN_BEGIN % brain_path()
+    changed = []
+    for name in BRAIN_FILES:
+        path = Path(cwd) / name
+        try:
+            old = path.read_text(encoding="utf-8") if path.exists() else ""
+        except OSError:
+            continue
+        i = old.find("<!-- hibiki rules: begin")
+        j = old.find(BRAIN_END, i) if i >= 0 else -1
+        if i >= 0 and j >= 0:
+            outside = (old[:i].rstrip("\n"), old[j + len(BRAIN_END):].lstrip("\n"))
+        else:
+            outside = (old.rstrip("\n"), "")
+        block = begin + "\n" + BRAIN_CONVENTIONS + ("\n\n" + rules if rules else "") + "\n" + BRAIN_END
+        new = "\n\n".join(x for x in (outside[0], block, outside[1]) if x) + "\n"
+        if new == old:
+            continue
+        try:
+            tmp = path.with_name(path.name + ".hibiki-tmp")
+            tmp.write_text(new, encoding="utf-8")
+            os.replace(tmp, path)
+            changed.append(name)
+        except OSError as e:
+            log("brain: cannot write", path, e)
+    return changed
 
 
 class Session:
@@ -747,6 +839,7 @@ class AcpAgent:
     def open_session(self, s):
         """Give `s` a fresh ACP session (starting the agent if needed)."""
         self.ensure()
+        brain_sync(self.cwd)
         try:
             res = self.request("session/new", {"cwd": self.cwd, "mcpServers": self.mcp_servers}, timeout=180)
         except AcpError as e:
@@ -787,6 +880,7 @@ class AcpAgent:
             return
         self.ensure()
         if s.acp_id and self.caps.get("loadSession"):
+            brain_sync(self.cwd)
             s.loading = True
             self.by_acp[s.acp_id] = s
             try:
@@ -1326,6 +1420,26 @@ class Handler(BaseHTTPRequestHandler):
                 if not safe_id(self.json["agent"]):
                     return self.reply(400, {"error": "bad agent id"})
                 return self.reply(200, {"status": s.gamut_enable(s.Paths(), self.json["agent"])})
+        if rest == ["brain"]:
+            if method == "POST" and self.json.get("ensure") is True:
+                if not brain_path().exists():
+                    brain_path().parent.mkdir(parents=True, exist_ok=True)
+                    brain_path().write_text(BRAIN_TEMPLATE, encoding="utf-8")
+                return self.reply(200, {"path": str(brain_path()), "count": brain_count(brain_rules())})
+            if method == "POST":
+                try:
+                    added = brain_add(self.json.get("add"))
+                except ValueError as e:
+                    return self.reply(400, {"error": str(e)})
+                for a in GW.acp.values():
+                    brain_sync(a.cwd)
+                text = brain_rules()
+                return self.reply(200, {"added": added, "path": str(brain_path()), "count": brain_count(text)})
+            if method == "GET":
+                text = brain_rules()
+                return self.reply(200, {"path": str(brain_path()), "exists": brain_path().exists(),
+                                        "count": brain_count(text), "chars": len(text), "max": BRAIN_MAX,
+                                        "folders": sorted({a.cwd for a in GW.acp.values()})})
         return self.reply(404, {"error": "unknown hibiki route"})
 
     def acp_route(self, method, a, rest):

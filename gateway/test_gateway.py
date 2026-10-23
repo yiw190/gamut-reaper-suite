@@ -112,7 +112,7 @@ class GW:
             "mcpServers": [{"name": "reaper", "command": sys.executable, "args": ["-c", "pass"]}],
         }))
         env = dict(os.environ, AGENT_GATEWAY_PORT=str(self.port), GAMUT_URL="http://127.0.0.1:%d" % gamut_port,
-                   AGENT_GATEWAY_CONFIG=str(cfg), **(gw_env or {}))
+                   AGENT_GATEWAY_CONFIG=str(cfg), HIBIKI_BRAIN=str(Path(tmp) / "brain"), **(gw_env or {}))
         self.proc = subprocess.Popen([sys.executable, str(HERE / "agent_gateway.py")], env=env,
                                      stderr=subprocess.DEVNULL)
         self.auth = {}
@@ -264,6 +264,46 @@ def unit_terminal_login():
           ag.login_variants(gemini, {"command": ["gemini", "--acp"], "authMethods": ["oauth-personal"]}) == [{"id": "oauth-personal"}])
 
 
+def unit_brain():
+    sys.path.insert(0, str(HERE))
+    import agent_gateway as ag
+    tmp = Path(tempfile.mkdtemp())
+    ag.BRAIN = tmp / "brain"
+    work = tmp / "work"
+    work.mkdir()
+    check("brain: no rules yet, the panel conventions still go in",
+          sorted(ag.brain_sync(str(work))) == ["AGENTS.md", "CLAUDE.md", "GEMINI.md"]
+          and "P_EXT:hibiki_var" in (work / "CLAUDE.md").read_text())
+    for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md"):
+        (work / name).unlink()
+    check("brain: add a rule", ag.brain_add("Final loudness -8 LUFS integrated") is True)
+    check("brain: the same rule twice is one line", ag.brain_add("  Final loudness  -8 LUFS integrated ") is False)
+    (work / "AGENTS.md").write_text("# my notes\nkeep me\n")
+    changed = ag.brain_sync(str(work))
+    agents = (work / "AGENTS.md").read_text()
+    check("brain: every CLI's instruction file gets the block", sorted(changed) == ["AGENTS.md", "CLAUDE.md", "GEMINI.md"])
+    check("brain: the user's text stays, the rules follow it",
+          agents.startswith("# my notes\nkeep me\n\n<!-- hibiki rules: begin") and "- Final loudness -8 LUFS integrated" in agents)
+    check("brain: unchanged rules rewrite nothing", ag.brain_sync(str(work)) == [])
+    ag.brain_add("Save the project after every edit")
+    ag.brain_sync(str(work))
+    agents = (work / "AGENTS.md").read_text()
+    check("brain: the block is replaced in place, not appended",
+          agents.count("hibiki rules: begin") == 1 and "Save the project after every edit" in agents)
+    check("brain: rule count", ag.brain_count(ag.brain_rules()) == 2)
+    ag.brain_path().write_text("")
+    ag.brain_sync(str(work))
+    agents = (work / "AGENTS.md").read_text()
+    check("brain: emptied rules leave only the conventions, the user's text stays",
+          agents.startswith("# my notes\nkeep me\n") and "Save the project" not in agents and "hibiki_var" in agents)
+    check("brain: never writes into the home folder", ag.brain_sync(os.path.expanduser("~")) == [])
+    try:
+        ag.brain_add("x" * 600)
+        check("brain: overlong rule refused", False)
+    except ValueError:
+        check("brain: overlong rule refused", True)
+
+
 def unit_install():
     sys.path.insert(0, str(HERE))
     import agent_gateway as ag
@@ -304,6 +344,7 @@ def unit_install():
 def main():
     unit()
     unit_terminal_login()
+    unit_brain()
     unit_install()
     gsrv = ThreadingHTTPServer(("127.0.0.1", 0), FakeGamut)
     threading.Thread(target=gsrv.serve_forever, daemon=True).start()
@@ -324,6 +365,13 @@ def main():
         check("title hint not forwarded to Gamut", GAMUT_BODIES[-1][1] == {"message": "hi"})
         check("gamut config -> llmProviderId/model/effort",
               code == 201 and body == {"message": "hi", "llmProviderId": "c1", "model": "m1", "effort": "high"})
+        r = g.post("/api/hibiki/brain", {"add": "Never render over an existing file"})
+        code, made = g.post("/api/hibiki/brain", {"ensure": True})
+        check("brain route: ensure keeps an existing file", code == 200 and made["count"] == 1)
+        info = g.get("/api/hibiki/brain")
+        check("brain route: add + info", r[0] == 200 and info["count"] == 1 and info["folders"] == [os.path.abspath(tmp)])
+        check("brain route: the agents' folder gets the rule at once",
+              "Never render over an existing file" in (Path(tmp) / "AGENTS.md").read_text())
         q = g.stream("/api/agents/g1/sessions/gs1/stream")
         check("gamut chunked SSE proxied clean", [d["type"] for d in until(q, "stream_delta")] == ["connected", "stream_delta"])
 

@@ -846,12 +846,14 @@ function M.settings(A)
     if H.last then
       row()
       ImGui.AlignTextToFramePadding(ctx)
-      ImGui.TextColored(ctx, A.dim, 'Went back to before ' .. H.last.at)
+      ImGui.TextColored(ctx, A.dim, P.truncate('Went back to before ' .. H.last.at, w - 80))
       if right_btn('redoall', 'Redo all', false) then redo_all() end
     end
     if #rows == 0 then
       row()
-      ImGui.TextColored(ctx, A.dim, 'Nothing yet: replies that change this project show up here.')
+      ImGui.PushTextWrapPos(ctx, x0 + w)
+      ImGui.TextColored(ctx, A.dim, 'No agent changes to this project yet.')
+      ImGui.PopTextWrapPos(ctx)
     end
     local today = os.date('%Y%m%d')
     for i, x in ipairs(rows) do

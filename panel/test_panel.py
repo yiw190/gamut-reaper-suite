@@ -1239,14 +1239,14 @@ def test_ears_render_and_attach():
                                                "peaks_over_tilt": [{"band": "3.15k", "db": 4.1}]}))
     Path(base + ".done").write_text("0")
     p.m.poll_http()
-    names = [f.name for f in p.lua_list(p.S.files)]
-    check("ears: picture, summary and audio attached", len(names) == 3 and names[0].endswith(".png")
-          and names[2].endswith(".wav"), names)
-    p.S.files = p.lua.table()
-    reqs = p.type_and_send("is this harsh?")
-    body = find(reqs, "POST", "/sessions/s1/messages")[0].body["content"]
+    files = p.lua_list(p.S.files)
+    names = [f.name for f in files]
+    check("ears: picture, summary and audio attached as one group", len(names) == 3 and names[0].endswith(".png")
+          and names[2].endswith(".wav") and len({f.group for f in files}) == 1 and files[0].group == "Ears bars 6.1-8.1", names)
+    body = p.m.context(True)[0]
     check("ears: the next message's context carries the numbers once",
-          "ears: bars 6.1-8.1 (time selection, 4.0 s)" in body and "LUFS-I -8.0" in body and "3.15k +4.1" in body, body[-500:])
+          "ears: bars 6.1-8.1 (time selection, 4.0 s)" in body and "LUFS-I -8.0" in body and "3.15k +4.1" in body
+          and "ears: bars" not in p.m.context(True)[0], body[-500:])
 
 
 

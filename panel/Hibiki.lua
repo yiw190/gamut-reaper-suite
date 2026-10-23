@@ -2538,13 +2538,13 @@ local function bubble(holder, text)
 end
 
 ---------------------------------------------------------------- UI
-local function add_file(path)
+local function add_file(path, group) -- group: files that go and get removed together (one Ears run)
   if type(path) ~= 'string' or path == '' then return end
   local f = io.open(path, 'rb')
   if not f then return end
   f:close()
   for _, x in ipairs(S.files) do if x.path == path then return end end
-  S.files[#S.files + 1] = { path = path, name = path:match('[^/]+$') or path }
+  S.files[#S.files + 1] = { path = path, name = path:match('[^/]+$') or path, group = group }
 end
 local function accept_file_drop() -- call right after the item that should take dropped files
   if ImGui.BeginDragDropTarget(ctx) then
@@ -2716,29 +2716,6 @@ local function led_toggle(id, label, on)
   return clicked
 end
 
-local function draw_icon(dl, kind, cx, cy, col)
-  if kind == 'clock' then
-    ImGui.DrawList_AddCircle(dl, cx, cy, 6, col, 0, 1.5)
-    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx, cy - 3, col, 1.5)
-    ImGui.DrawList_AddLine(dl, cx, cy + 0.5, cx + 2.5, cy + 2, col, 1.5)
-  elseif kind == 'plus' then
-    ImGui.DrawList_AddLine(dl, cx - 5, cy, cx + 5, cy, col, 1.6)
-    ImGui.DrawList_AddLine(dl, cx, cy - 5, cx, cy + 5, col, 1.6)
-  else
-    ImGui.DrawList_AddRectFilled(dl, cx - 4, cy - 4, cx + 4, cy + 4, col, 1.5)
-  end
-end
-
-local function icon_button(id, kind, col, tip)
-  local sz = ImGui.GetFrameHeight(ctx) - 2
-  local clicked = ImGui.InvisibleButton(ctx, '##icon_' .. id, sz, sz)
-  local x1, y1 = ImGui.GetItemRectMin(ctx)
-  local dl = ImGui.GetWindowDrawList(ctx)
-  bevel(dl, x1, y1, x1 + sz, y1 + sz, face_col())
-  if tip and ImGui.IsItemHovered(ctx) then show_tip(tip) end
-  draw_icon(dl, kind, x1 + sz / 2, y1 + sz / 2, col or C.btn_text)
-  return clicked
-end
 
 -- one picker for every backend: Gamut agents and local ACP agents, each with a status dot and Connect
 local function agent_state(a) -- status colour + short text for the menu
@@ -2847,8 +2824,14 @@ local function header()
   ImGui.SetCursorScreenPos(ctx, hx + 1, hy + 1)
   agent_picker()
   if S.agent ~= '' then
-    local n = S.active and 3 or 2
-    local right = n * fh + (n - 1) * 3
+    -- the column's text buttons: Stop (while a reply runs), Chats, New
+    local labels = S.active and { 'Stop', 'Chats', 'New' } or { 'Chats', 'New' }
+    local right = (#labels - 1) * 3
+    for _, l in ipairs(labels) do
+      ImGui.PushFont(ctx, font_for(l), FONT_SIZE)
+      right = right + ImGui.CalcTextSize(ctx, l) + 18 -- chip(): label + 9 px padding each side
+      ImGui.PopFont(ctx)
+    end
     ImGui.SameLine(ctx, 0, 8)
     local title = S.sid == '' and 'New chat' or (S.title ~= '' and S.title or 'Chat')
     local room = ImGui.GetContentRegionAvail(ctx) - right - 16
@@ -2865,15 +2848,15 @@ local function header()
     ImGui.DrawList_AddRectFilled(dl, bx - 4, hy - 3, hx + hw + 3, hy + hh - 5, C.field, RND_STRIP - 1, ImGui.DrawFlags_RoundCornersRight)
     ImGui.SetCursorScreenPos(ctx, bx, hy + 1)
     if S.active then
-      if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
+      if chip('stop', 'Stop', C.muted, false) then stop() end
       ImGui.SameLine(ctx, 0, 3)
     end
-    if icon_button('hist', 'clock', nil, 'Recent chats') then
+    if chip('hist', 'Chats', C.muted, false) then
       load_sessions()
       ImGui.OpenPopup(ctx, 'histpop')
     end
     ImGui.SameLine(ctx, 0, 3)
-    if icon_button('new', 'plus', nil, 'New chat') then new_chat() end
+    if chip('new', 'New', C.muted, false) then new_chat() end
     history_popup()
   end
   ImGui.SetCursorScreenPos(ctx, hx, hy + hh + 2)
@@ -3232,7 +3215,7 @@ local function cfg_window()
     end
     if studio then
       ImGui.Dummy(ctx, 0, 2)
-      studio.settings({ section = section, box = box, light_btn = light_btn, checkbox = checkbox, COL = COL,
+      studio.settings_changes({ section = section, box = box, light_btn = light_btn, checkbox = checkbox, COL = COL,
         dim = shade(C.win_text, 0x30) })
     end
     ImGui.EndGroup(ctx)
@@ -3244,6 +3227,11 @@ local function cfg_window()
     if checkbox('ctx', 'Send REAPER context with each message', S.ctx_level > 0, COL) then
       S.ctx_level = S.ctx_level > 0 and 0 or 1
       reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
+    end
+    if studio then
+      ImGui.Dummy(ctx, 0, 2)
+      studio.settings_context({ box = box, light_btn = light_btn, checkbox = checkbox, COL = COL,
+        dim = shade(C.win_text, 0x30) })
     end
     ImGui.Dummy(ctx, 0, 2)
     local KIND = { razor = 'Razor area', time = 'Time selection', tracks = 'Tracks', items = 'Items',
@@ -4096,12 +4084,27 @@ local function frame()
       end
 
       for _, c in ipairs(cards) do card(c) end
-      for n, f in ipairs(S.files) do -- attachments waiting to be sent; click to remove
-        if n > 1 then ImGui.SameLine(ctx, 0, 4) end
-        if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
-        if ImGui.IsItemHovered(ctx) then show_tip(f.path) end
-      end
       if studio then studio.rack_row() end
+      do -- attachments waiting to be sent, one chip per file or per group; × removes it
+        local n, seen = 0, {}
+        for i, f in ipairs(S.files) do
+          if not (f.group and seen[f.group]) then
+            if f.group then seen[f.group] = true end
+            n = n + 1
+            if n > 1 then ImGui.SameLine(ctx, 0, 4) end
+            local function mine(x) return x == f or (f.group ~= nil and x.group == f.group) end
+            if chip('file' .. i, (f.group or f.name) .. '  ×', C.text, false) then
+              for j = #S.files, 1, -1 do if mine(S.files[j]) then table.remove(S.files, j) end end
+              break
+            end
+            if ImGui.IsItemHovered(ctx) then
+              local paths = {}
+              for _, x in ipairs(S.files) do if mine(x) then paths[#paths + 1] = x.path end end
+              show_tip(table.concat(paths, '\n'))
+            end
+          end
+        end
+      end
       sel_row()
 
       if S.focus then ImGui.SetKeyboardFocusHere(ctx); S.focus = false end

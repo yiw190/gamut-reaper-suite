@@ -218,8 +218,8 @@ while a composition is open and shows the pending pinyin under the input.
   `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
   the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
   **Accept** (keep them, close the card) and **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
-  undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Studio → Review changes off) stops the cards;
-  every change is still a labelled undo step. **Version history** (Agent settings → Studio) lists the last 10
+  undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Changes → Review changes off) stops the cards;
+  every change is still a labelled undo step. **Version history** (Agent settings → Changes) lists the last 10
   replies that changed this project (time + what changed): **Revert** goes back to before one (undo is linear, so later
   replies and your own edits since go too; it asks first), **Redo all** replays them; after a restart a reply's saved
   copy shows **Open** instead.
@@ -227,13 +227,13 @@ while a composition is open and shows the pending pinyin under the input.
   another path leaves the open project's path and dirty state alone) goes to `<project folder>/.hibiki/history/<name>/`
   as `<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media, the newest 200 kept. Version history lists
   them after a restart too; **Open** opens one in a new tab as `<name>_restore_<stamp>.RPP` next to the
-  project. Agent settings → Studio → Save a version after each reply turns it off. Changes made outside the panel (the Gamut app, a
+  project. Agent settings → Changes → Save a version after each reply turns it off. Changes made outside the panel (the Gamut app, a
   CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
   every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,
   correlation, side vs mid and eight mid bands. The next message's context gets the last playback: bars, gated
   LUFS-I, the loudest LUFS-S and true peak with their bar.beat, correlation minimum, band levels and a per-bar
-  LUFS-M / true-peak row. Switch it in Agent settings → Studio.
+  LUFS-M / true-peak row. Switch it in Agent settings → Context → Measure playback.
 - **Audition rack.** An agent offers alternatives by tagging tracks `P_EXT:hibiki_var = "<group>/<n>"` (one unmuted)
   or FX on one track with `P_EXT:hibiki_fxvar` lines `"<group>/<n>\t<fx GUID>"` (one enabled). The panel shows a row
   of numbered buttons per group above the input; click or press 1–9 (panel focused) to switch, hover for the
@@ -246,7 +246,7 @@ while a composition is open and shows the pending pinyin under the input.
 - **Agent rules.** `/remember <rule>` saves a line to `~/.config/hibiki/brain/rules.md`. The gateway writes those
   rules, after a short block of panel conventions, into `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` in the ACP agents'
   working folder (a marked block; your own text in those files stays) before each new chat, so Codex, Claude Code,
-  Kimi and Gemini start with the same rules. Agent settings → Studio shows the count and opens the file.
+  Kimi and Gemini start with the same rules. Agent settings → Context → Agent rules shows the count and opens the file.
 
 ## Start with REAPER
 

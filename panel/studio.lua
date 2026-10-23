@@ -488,7 +488,7 @@ function M.rack_row()
 end
 
 ---------------------------------------------------------------- ears
-local E = { busy = false, n = 0, pending = nil }
+local E = { busy = false, n = 0, pend = {} }
 local MAX_EARS = 30
 local function ears_range()
   local s, e = reaper.GetSet_LoopTimeRange2(0, false, false, 0, 0, false)
@@ -579,20 +579,21 @@ function E.run(s, e, what)
     if not E.busy or E.wav ~= wav then return end -- timed out earlier (M.tick): the WAV is already attached
     E.busy = false
     local r = P.decode(out)
+    local group = 'Ears ' .. label
     if code == 0 and type(r) == 'table' and r.ok == true and type(r.png) == 'string' then
-      P.add_file(r.png)
-      P.add_file(r.md)
-      P.add_file(wav)
+      P.add_file(r.png, group)
+      P.add_file(r.md, group)
+      P.add_file(wav, group)
       local peaks = {}
       for _, p in ipairs(type(r.peaks_over_tilt) == 'table' and r.peaks_over_tilt or {}) do
         peaks[#peaks + 1] = tostring(p.band) .. ' +' .. tostring(p.db)
       end
-      E.pending = (E.pending and (E.pending .. '\n') or '') .. base .. ('; tilt %s dB/oct; over the tilt: %s; spectrum, stereo and levels in the attached .md/.png')
-        :format(tostring(r.tilt_db_per_octave), #peaks > 0 and table.concat(peaks, ', ') or 'none')
+      E.pend[#E.pend + 1] = { group = group, text = base .. ('; tilt %s dB/oct; over the tilt: %s; spectrum, stereo and '
+        .. 'levels in the attached .md/.png'):format(tostring(r.tilt_db_per_octave), #peaks > 0 and table.concat(peaks, ', ') or 'none') }
       M.note('Ears: ' .. label .. ' attached')
     else
-      P.add_file(wav)
-      E.pending = (E.pending and (E.pending .. '\n') or '') .. base .. '; the WAV is attached (no spectrum: this Hibiki has no `hibiki ears` yet)'
+      P.add_file(wav, group)
+      E.pend[#E.pend + 1] = { group = group, text = base .. '; the WAV is attached (no spectrum: this Hibiki has no `hibiki ears` yet)' }
       M.note('Ears: ' .. label .. ' attached as audio')
     end
   end)
@@ -837,8 +838,8 @@ function M.tick(t)
   read_receipts()
   if E.busy and now() - E.at > 90 then -- `hibiki ears` never answered (or Recover dropped the job): the WAV alone
     E.busy = false
-    P.add_file(E.wav)
-    if E.base then E.pending = (E.pending and (E.pending .. '\n') or '') .. E.base .. '; the WAV is attached (no spectrum)' end
+    P.add_file(E.wav, 'Ears ' .. E.label)
+    if E.base then E.pend[#E.pend + 1] = { group = 'Ears ' .. E.label, text = E.base .. '; the WAV is attached (no spectrum)' } end
     M.note('Ears: ' .. E.label .. ' attached as audio')
   end
   snap_tick()
@@ -856,8 +857,15 @@ function M.cards(L)
   if r then L[#L + 1] = { kind = 'studio', key = 'receipt_' .. r.id, draw = function() receipt_card(r) end } end
 end
 
--- the Ears summary waiting for the next message (Hibiki.lua sends it alone when Context is off)
-function M.take_ears() local p = E.pending; E.pending = nil; return p end
+-- the Ears summaries waiting for the next message (Hibiki.lua sends them alone when Context is off): only those whose
+-- attachment chip is still there; removing the chip drops its numbers too
+function M.take_ears()
+  local have, out = {}, {}
+  for _, f in ipairs(S.files) do if f.group then have[f.group] = true end end
+  for _, x in ipairs(E.pend) do if have[x.group] then out[#out + 1] = x.text end end
+  E.pend = {}
+  return #out > 0 and table.concat(out, '\n') or nil
+end
 
 -- extra lines for the REAPER context block (sent with each message)
 function M.context_lines(L)
@@ -873,27 +881,28 @@ function M.context_lines(L)
   if p then L[#L + 1] = p end
 end
 
-function M.settings(A)
-  A.section('Studio', A.COL)
-  if now() - (H.drawn or 0) > 0.5 then H.confirm = nil end -- the window was closed: an armed Revert doesn't wait for next time
-  H.drawn = now()
+local function settings_rows(A, w, x0)
+  local function row() ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx))) end
+  local function right_btn(id, text, off, on)
+    local bw = ImGui.CalcTextSize(ctx, text) + 16
+    ImGui.SameLine(ctx)
+    ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+    return A.light_btn(id, text, bw, on, off)
+  end
+  local function right_note(text) -- dim status at the right end of the row just drawn
+    local _, y1 = ImGui.GetItemRectMin(ctx)
+    local _, y2 = ImGui.GetItemRectMax(ctx)
+    local tw = ImGui.CalcTextSize(ctx, text)
+    ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), x0 + w - tw, (y1 + y2 - ImGui.GetTextLineHeight(ctx)) / 2, A.dim, text)
+  end
+  return row, right_btn, right_note
+end
+
+-- Agent settings, right column under the context switch: what else the agent is told
+function M.settings_context(A)
   brain_info()
-  A.box('studio', A.COL, function(w, x0)
-    local function row() ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx))) end
-    local function right_btn(id, text, off, on)
-      local bw = ImGui.CalcTextSize(ctx, text) + 16
-      ImGui.SameLine(ctx)
-      ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
-      return A.light_btn(id, text, bw, on, off)
-    end
-    local function right_note(text) -- dim status at the right end of the row just drawn
-      local _, y1 = ImGui.GetItemRectMin(ctx)
-      local _, y2 = ImGui.GetItemRectMax(ctx)
-      local tw = ImGui.CalcTextSize(ctx, text)
-      ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), x0 + w - tw, (y1 + y2 - ImGui.GetTextLineHeight(ctx)) / 2, A.dim, text)
-    end
-    if A.checkbox('review', 'Review changes after each reply', not R.auto, w) then set_auto(not R.auto) end
-    row()
+  A.box('agentctx', A.COL, function(w, x0)
+    local row, right_btn, right_note = settings_rows(A, w, x0)
     if A.checkbox('meter', 'Measure playback', MT.on, w) then
       MT.on = not MT.on
       reaper.SetExtState(EXT, 'meter', MT.on and '1' or '0', true)
@@ -901,6 +910,24 @@ function M.settings(A)
     end
     if ImGui.IsItemHovered(ctx) then P.show_tip('Hibiki_Meter.jsfx · master monitoring FX (not rendered)') end
     if MT.on then right_note(MT.running() and 'running' or MT.status) end
+    row()
+    ImGui.AlignTextToFramePadding(ctx)
+    local info = BR.info
+    ImGui.Text(ctx, info and ('Agent rules: ' .. (tonumber(info.count) or 0))
+      or (info == false and 'Agent rules: gateway not answering' or 'Agent rules'))
+    if ImGui.IsItemHovered(ctx) and info and info.path then P.show_tip(info.path) end
+    if right_btn('brainedit', 'Edit', info == false) then brain_edit() end
+  end)
+end
+
+-- Agent settings, left column: what agents changed, and the way back
+function M.settings_changes(A)
+  A.section('Changes', A.COL)
+  if now() - (H.drawn or 0) > 0.5 then H.confirm = nil end -- the window was closed: an armed Revert doesn't wait for next time
+  H.drawn = now()
+  A.box('changes', A.COL, function(w, x0)
+    local row, right_btn, right_note = settings_rows(A, w, x0)
+    if A.checkbox('review', 'Review changes after each reply', not R.auto, w) then set_auto(not R.auto) end
     row()
     if A.checkbox('snapshots', 'Save a version after each reply', SV.on, w) then
       SV.on = not SV.on
@@ -911,13 +938,6 @@ function M.settings(A)
       P.show_tip(hist and (hist .. '\n~40 KB each, no audio · newest ' .. MAX_SNAPS .. ' kept') or 'project not saved')
     end
     if SV.on and not hist then right_note('not saved') end
-    row()
-    ImGui.AlignTextToFramePadding(ctx)
-    local info = BR.info
-    ImGui.Text(ctx, info and ('Agent rules: ' .. (tonumber(info.count) or 0))
-      or (info == false and 'Agent rules: gateway not answering' or 'Agent rules'))
-    if ImGui.IsItemHovered(ctx) and info and info.path then P.show_tip(info.path) end
-    if right_btn('brainedit', 'Edit', info == false) then brain_edit() end
     ImGui.Dummy(ctx, 0, 4)
     row()
     ImGui.AlignTextToFramePadding(ctx)

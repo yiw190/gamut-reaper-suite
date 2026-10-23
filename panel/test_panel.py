@@ -1115,6 +1115,17 @@ def test_receipts_turn_and_revert():
     p.lua.execute("RET.Button = function(_, label) return label:find('^Accept') ~= nil end")
     cards[0].draw()
     check("receipts: Accept keeps the changes and hides the card", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+    st["Hibiki/receipts"] = json.dumps([{"id": "k9.1", "at": 1, "n": 1, "points": 1, "proj": "", "lines": ["#1 Bass: mute"]}])
+    st["Hibiki/receipts_seq"] = "1b"
+    p.m.studio._R.ended = "k9.1"
+    p.m.studio.tick(2001.5)
+    cards = [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"]
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Always accept') ~= nil end")
+    cards[0].draw()
+    check("receipts: Always accept hides this card and every later one, and is remembered",
+          not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"] and st["Hibiki/receipt_auto"] == "1")
+    st["Hibiki/receipt_auto"] = "0"
+    p.m.studio._R.auto = False
     st["Hibiki/receipts"] = json.dumps([{"id": "mcp-1", "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
                                          "lines": ["#1 Bass: mute"]}])
     st["Hibiki/receipts_seq"] = "2"

@@ -57,8 +57,15 @@ local function read_receipts()
   R.list = type(list) == 'table' and list or {}
 end
 
+-- "Always accept": no card after a reply; every change is still a labelled undo point (Edit > Undo history)
+R.auto = reaper.GetExtState(EXT, 'receipt_auto') == '1'
+local function set_auto(on)
+  R.auto = on
+  reaper.SetExtState(EXT, 'receipt_auto', on and '1' or '0', true)
+end
+
 local function receipt_shown()
-  if S.active then return nil end
+  if S.active or R.auto then return nil end
   local r = R.list[#R.list]
   if type(r) ~= 'table' or type(r.id) ~= 'string' or R.gone[r.id] then return nil end
   -- undo is per project tab: a receipt from another tab can't be reverted here
@@ -131,6 +138,12 @@ local function receipt_card(r)
     ImGui.SameLine(ctx)
     if ImGui.Button(ctx, 'Revert##rcpt') then revert(r) end
     if ImGui.IsItemHovered(ctx) then P.show_tip('Undo exactly what this reply changed (Edit > Undo history shows each step).') end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Always accept##rcpt') then R.gone[r.id] = true; set_auto(true) end
+    if ImGui.IsItemHovered(ctx) then
+      P.show_tip('Keep every reply\'s changes without asking. Each change stays an undo step (Cmd+Z);\n'
+        .. 'turn the card back on in Agent settings > Studio > Review changes.')
+    end
     if st.blocked then
       P.wrapped('Your own edit is on top of the undo list ("' .. P.truncate(st.blocked, 200) .. '"). Undo it first, then Revert.', C.warn)
     elseif st.redo_failed then
@@ -617,6 +630,12 @@ function M.settings(A)
   if MT.on then MT.status = MT.status ~= '' and MT.status or '…' end
   brain_info()
   A.box('studio', A.COL, function(w, x0)
+    if A.led_btn('review', 'Review changes', not R.auto) then set_auto(not R.auto) end
+    if ImGui.IsItemHovered(ctx) then
+      P.show_tip('After a reply that changed REAPER, show what changed with Accept / Revert.\n'
+        .. 'Off = always accept (each change is still an undo step).')
+    end
+    ImGui.SameLine(ctx)
     if A.led_btn('meter', 'Measure playback', MT.on) then
       MT.on = not MT.on
       reaper.SetExtState(EXT, 'meter', MT.on and '1' or '0', true)

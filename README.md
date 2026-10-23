@@ -24,6 +24,9 @@ MCP client  --stdio JSON-RPC-->  reaper_mcp/server.py  --JSON mailbox-->  reaper
 
 Fourteen grouped tools. Multi-step edits go through `batch`; anything else through `reaper_call` / `run_lua`. Track index `-1` is the master. Time is project quarter notes. Call `status` first; on a new project pass `detail=true` for arrangement facts (time signature, length in beats, markers, MIDI vs audio) — not chords. `midi cc` is CC and program change; `item import` takes a path on the REAPER host; `project save` writes without a dialog (pass `path` if the project is unsaved). `midi get` omits default fields; `batch` slots are the inner result or `{error}`.
 
+**Just want the MCP?** For Claude Desktop, Claude Code or Cursor with no panel, no gateway and no background
+services, see [MCP only](#mcp-only).
+
 ## Install (macOS)
 
 1. **REAPER first.** Download it from [reaper.fm](https://www.reaper.fm/download.php), drag it to Applications and
@@ -120,6 +123,20 @@ rights) and loads it without a restart — then **Connect** to log in once. The 
 Same from a terminal: `hibiki agents add claude kimi minimax grok gemini copilot codex`. Not one-click yet: Qwen Code (ACP only offers
 an OpenAI-compatible API key set through environment variables) and DeepSeek (its harness's ACP server is
 automation-only; DeepSeek models work through an ACP agent such as OpenCode with an API key).
+
+## MCP only
+
+On macOS or Windows, from a clone:
+
+```bash
+git clone https://github.com/yiw190/hibiki.git ~/hibiki
+sh ~/hibiki/install.sh --mcp-only     # Windows: python -m reaper_mcp setup --mcp-only
+```
+
+It installs the bridge and a startup hook that starts only the bridge with REAPER, and registers the stdio MCP in
+Claude Desktop, Claude Code and Cursor when they're installed. No panel, no ReaImGui, no LaunchAgents or autostart, no
+token. Gamut connects over the HTTP service, so it needs the full setup. Keep the clone: the clients run
+`reaper_mcp/server.py` from it. Check with `hibiki doctor --mcp-only`. For any other client or OS, set it up by hand:
 
 ## Manual setup (any MCP client, any OS)
 

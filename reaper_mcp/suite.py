@@ -842,6 +842,8 @@ def cmd_setup(a) -> int:
     say("hibiki %s from %s (python %s)" % (__version__, ROOT, sys.executable))
     say("REAPER")
     install_bridge(p)
+    if a.mcp_only:
+        return setup_mcp_only(p, a)
     install_panel(p)
     if not a.no_reaimgui:
         install_imgui(p)
@@ -867,6 +869,21 @@ def cmd_setup(a) -> int:
     return 0 if ok else 1
 
 
+def setup_mcp_only(p: Paths, a) -> int:
+    """Bridge + startup hook + stdio clients: no panel, no ReaImGui, no background services. Gamut needs the
+    HTTP service, so it's left out."""
+    install_startup(p)  # without the panel installed, the hook only starts the bridge
+    install_cli_shim(p)
+    if not a.no_connect:
+        say("MCP clients")
+        for name, (present, fn) in CLIENTS.items():
+            if name != "gamut" and present(p):
+                say("  %s: %s" % (name, fn(p)))
+    say("")
+    say("Done. Restart REAPER: the bridge starts with it. Check with `hibiki doctor --mcp-only`.")
+    return 0
+
+
 def bridge_version(path: Path) -> str:
     m = re.search(r'^local VERSION = "([^"]+)"', path.read_text(), re.M) if path.exists() else None
     return m.group(1) if m else ""
@@ -886,15 +903,15 @@ def cmd_doctor(a) -> int:
     bv = bridge_version(p.scripts / "reaper_mcp_bridge.lua")
     row("ok" if bv == __version__ else "FAIL", "bridge script",
         "%s (suite %s)" % (bv or "missing", __version__) + ("" if bv == __version__ else " - run setup"))
+    if a.mcp_only:
+        return doctor_mcp_only(p, a, rows, row)
     panel = p.scripts / "Hibiki/Hibiki.lua"
     shipped = ROOT / "panel/Hibiki.lua"
     same = panel.exists() and shipped.exists() and panel.read_bytes() == shipped.read_bytes()
     row("ok" if same else "warn", "chat panel", "%s%s" % (panel, "" if same else " (missing or differs from this suite)"))
     row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p)
         else "missing (binary or %s): the panel needs it - run setup" % p.imgui_shim)
-    startup = p.scripts / "__startup.lua"
-    hooked = startup.exists() and "reaper_mcp_bridge.lua" in startup.read_text()
-    row("ok" if hooked else "FAIL", "startup hook", str(startup) if hooked else "REAPER won't start the bridge on launch")
+    row_startup(p, row)
     if not p.token.exists():
         row("FAIL", "token", "%s missing" % p.token)
     elif WINDOWS:  # NTFS ACLs, not mode bits: the token sits in the user's profile
@@ -923,10 +940,7 @@ def cmd_doctor(a) -> int:
     row("ok" if up else "FAIL", "MCP http", "127.0.0.1:%d %s" % (port(), "answers" if up else "no answer"))
     gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT, 0)
     row("ok" if gw else "warn", "agent gateway", "127.0.0.1:%d %s" % (GW_PORT, "answers" if gw else "no answer"))
-    hb = p.ipc / "heartbeat"
-    age = time.time() - hb.stat().st_mtime if hb.exists() else None
-    row("ok" if age is not None and age < 5 else "warn", "bridge heartbeat",
-        "%.1fs old" % age if age is not None else "never seen: start REAPER")
+    row_heartbeat(p, row)
     try:
         servers = gamut_call("GET", "/api/remote-mcps").get("servers", [])
         reg = next((s for s in servers if s.get("url") == mcp_url()), None)
@@ -934,7 +948,30 @@ def cmd_doctor(a) -> int:
             "running, MCP not registered - `hibiki connect gamut`")
     except (OSError, ValueError):
         row("warn", "Gamut", "not running at %s" % gamut_url())
-    if a.json:
+    return print_rows(rows, a.json)
+
+
+def doctor_mcp_only(p: Paths, a, rows: list, row) -> int:
+    row_startup(p, row)
+    row_heartbeat(p, row)
+    return print_rows(rows, a.json)
+
+
+def row_startup(p: Paths, row) -> None:
+    startup = p.scripts / "__startup.lua"
+    hooked = startup.exists() and "reaper_mcp_bridge.lua" in startup.read_text()
+    row("ok" if hooked else "FAIL", "startup hook", str(startup) if hooked else "REAPER won't start the bridge on launch")
+
+
+def row_heartbeat(p: Paths, row) -> None:
+    hb = p.ipc / "heartbeat"
+    age = time.time() - hb.stat().st_mtime if hb.exists() else None
+    row("ok" if age is not None and age < 5 else "warn", "bridge heartbeat",
+        "%.1fs old" % age if age is not None else "never seen: start REAPER")
+
+
+def print_rows(rows: list, as_json: bool) -> int:
+    if as_json:
         print(json.dumps(rows, indent=2))
     else:
         for r in rows:
@@ -1198,10 +1235,13 @@ def parser() -> argparse.ArgumentParser:
                                            "%%APPDATA%%\\REAPER on Windows)")
     s.add_argument("--no-reaimgui", action="store_true", help="don't download ReaImGui")
     s.add_argument("--no-connect", action="store_true", help="don't register the MCP in Gamut / Claude / Cursor")
+    s.add_argument("--mcp-only", action="store_true", help="only the MCP: bridge, startup hook and Claude / Cursor; "
+                                                           "no panel, no gateway, no background services, no Gamut")
     s.set_defaults(fn=cmd_setup)
     d = sub.add_parser("doctor", help="check every piece and say what's wrong")
     d.add_argument("--resource-path")
     d.add_argument("--json", action="store_true")
+    d.add_argument("--mcp-only", action="store_true", help="check only what `setup --mcp-only` installs")
     d.set_defaults(fn=cmd_doctor)
     c = sub.add_parser("connect", help="register the MCP in a client")
     c.add_argument("client", choices=["all", *CLIENTS])

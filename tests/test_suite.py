@@ -166,6 +166,25 @@ def main():
     check("doctor flags an outdated bridge", rc == 1 and rows.get("bridge script", {}).get("level") == "FAIL", out)
     check("doctor sees the Gamut registration", rows.get("Gamut", {}).get("level") == "ok", out)
 
+    mhome = Path(tempfile.mkdtemp(prefix="grs_mcp_only_"))
+    mres = mhome / "Library/Application Support/REAPER"
+    for d in (mres / "Scripts", mhome / ".cursor", mhome / "Applications/REAPER.app"):
+        d.mkdir(parents=True)
+    FakeGamut.servers, before = [], list(FakeGamut.servers)
+    rc, out = run(mhome, "setup", "--mcp-only", gamut=gamut)
+    mhook = (mres / "Scripts/__startup.lua").read_text() if (mres / "Scripts/__startup.lua").exists() else ""
+    check("setup --mcp-only: bridge + startup hook + Cursor, nothing else",
+          rc == 0 and (mres / "Scripts/reaper_mcp_bridge.lua").exists() and "reaper_mcp_bridge.lua" in mhook
+          and "reaper" in json.loads((mhome / ".cursor/mcp.json").read_text())["mcpServers"]
+          and not (mres / "Scripts/Hibiki").exists() and not (mhome / "Library/LaunchAgents").exists()
+          and not (mhome / ".config/reaper-mcp/token").exists() and not (mhome / ".config/agent-gateway").exists()
+          and not FakeGamut.servers, out)
+    FakeGamut.servers = before
+    rc, out = run(mhome, "doctor", "--mcp-only", "--json", gamut=gamut)
+    mrows = {r["check"]: r["level"] for r in json.loads(out[out.index("["):])} if "[" in out else {}
+    check("doctor --mcp-only: passes without panel, token or services",
+          rc == 0 and mrows.get("startup hook") == "ok" and "token" not in mrows and "MCP http" not in mrows, out)
+
     rc, out = run(home, "connect", "gamut", "--agent", "Music", gamut=gamut)
     check("connect gamut --agent: REAPER assigned to that agent only",
           rc == 0 and FakeGamut.assigned.get("ag1") == [FakeGamut.servers[0]["id"]] and "ag2" not in FakeGamut.assigned

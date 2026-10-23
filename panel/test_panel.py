@@ -1014,7 +1014,7 @@ def test_update_auto_check():
     _settings(p, "##led_upddev")
     jobs = _update_jobs(p)
     ext = dict(p.lua.globals().EXT_STATE)
-    check("dev builds LED: persisted and re-checks with --channel dev",
+    check("release candidates LED: persisted and re-checks with --channel dev",
           ext.get("Hibiki/upd_dev") == "1" and len(jobs) == 1 and "--channel dev" in jobs[0], (ext.get("Hibiki/upd_dev"), jobs))
 
 

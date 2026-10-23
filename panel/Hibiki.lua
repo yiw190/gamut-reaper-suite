@@ -3309,7 +3309,7 @@ local function cfg_window()
       elseif UPD.checked and not UPD.running then note(dim, 'No release found')
       end
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-      if led_btn('upddev', 'Include dev builds', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
+      if led_btn('upddev', 'Include release candidates', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
       ImGui.Dummy(ctx, 0, 4)
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
       ImGui.AlignTextToFramePadding(ctx)

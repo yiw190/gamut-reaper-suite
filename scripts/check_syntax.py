@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Syntax gate for the parts no test imports: every .lua compiles under Lua 5.4 (REAPER's version) and calls no
-top-level local function above its declaration (that call hits a nil global at runtime), every .sh parses.
+top-level local function above its declaration (that call hits a nil global at runtime), every .jsfx has no
+exponent literal (EEL2 can't parse one and REAPER drops the section silently), every .sh parses.
 Needs `pip install lupa`."""
 import re
 import subprocess
@@ -47,6 +48,17 @@ for p in files(".lua"):
     err = compile_lua(src, str(p.relative_to(ROOT))) or use_before_declare(src)
     print(("  ok   " if not err else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if not err else "  " + err))
     bad += bool(err)
+# JSFX (EEL2): REAPER silently skips a section that fails to compile; 1e-20 literals did that to the meter
+for p in files(".jsfx"):
+    errs = []
+    for n, line in enumerate(p.read_text().splitlines(), 1):
+        code = line.split("//")[0]
+        if code.startswith(("desc:", "options:", "in_pin:", "out_pin:", "slider", "import ", "filename:", "tags:")):
+            continue
+        if re.search(r"(?<![\w.])\d+(\.\d*)?[eE][-+]?\d", code):
+            errs.append("line %d: exponent literal (EEL2 has none; write 10 ^ (-n))" % n)
+    print(("  ok   " if not errs else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if not errs else "  " + "; ".join(errs)))
+    bad += bool(errs)
 for p in files(".sh") + sorted((ROOT / "packaging/macos/scripts").glob("*")):
     r = subprocess.run(["bash", "-n", str(p)], capture_output=True, text=True)
     print(("  ok   " if r.returncode == 0 else "  FAIL ") + str(p.relative_to(ROOT)) + ("" if r.returncode == 0 else "  " + r.stderr.strip()))

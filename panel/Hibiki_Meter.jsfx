@@ -59,12 +59,14 @@ memset(BS, 0, 16); memset(BE, 0, 8);
 // 100 ms blocks; the last 30 block powers give LUFS-M (4 blocks) and LUFS-S (30 blocks)
 BP = 1600; memset(BP, 0, 30); bi = 0; nb = 0;
 blen = floor(srate * 0.1);
-cnt = 0; eL = eR = 0; sLL = sRR = sLR = sMM = sSS = 0; tpk = spk = 0; bpos = play_position;
-sL1 = sL2 = hL1 = hL2 = sR1 = sR2 = hR1 = hR2 = 0;
-showM = showS = showT = -150;
+cnt = 0; eL = 0; eR = 0; sLL = 0; sRR = 0; sLR = 0; sMM = 0; sSS = 0; tpk = 0; spk = 0; bpos = play_position;
+sL1 = 0; sL2 = 0; hL1 = 0; hL2 = 0; sR1 = 0; sR2 = 0; hR1 = 0; hR2 = 0;
+showM = -150; showS = -150; showT = -150;
 
-function db10(x) ( 10 * log10(max(x, 1e-20)) );
-function db20(x) ( 20 * log10(max(x, 1e-10)) );
+// EEL2 can't parse 1e-20: a literal like that silently drops the whole section
+TINY20 = 10 ^ (-20); TINY10 = 10 ^ (-10); TINY12 = 10 ^ (-12);
+function db10(x) ( 10 * log10(max(x, TINY20)) );
+function db20(x) ( 20 * log10(max(x, TINY10)) );
 
 @sample
 cnt == 0 ? bpos = play_position;
@@ -122,18 +124,18 @@ cnt >= blen ? (
     gmem[o] = bpos; gmem[o + 1] = play_state;
     gmem[o + 2] = showM; gmem[o + 3] = showS;
     gmem[o + 4] = db20(tpk); gmem[o + 5] = db20(spk);
-    gmem[o + 6] = (sLL > 1e-12 && sRR > 1e-12) ? sLR / sqrt(sLL * sRR) : 1;
+    gmem[o + 6] = (sLL > TINY12 && sRR > TINY12) ? sLR / sqrt(sLL * sRR) : 1;
     gmem[o + 7] = db10(sSS) - db10(sMM);
     b = 0; loop(8, gmem[o + 8 + b] = db10(BE[b] / cnt); b += 1);
     gmem[1] = n + 1;
   );
-  cnt = 0; eL = eR = 0; sLL = sRR = sLR = sMM = sSS = 0; tpk = spk = 0;
+  cnt = 0; eL = 0; eR = 0; sLL = 0; sRR = 0; sLR = 0; sMM = 0; sSS = 0; tpk = 0; spk = 0;
   memset(BE, 0, 8);
 );
 
 @gfx 260 60
 gfx_clear = 0x202020;
-gfx_r = gfx_g = gfx_b = 0.85; gfx_x = 10; gfx_y = 10;
+gfx_r = 0.85; gfx_g = 0.85; gfx_b = 0.85; gfx_x = 10; gfx_y = 10;
 gfx_printf("LUFS-M %5.1f   LUFS-S %5.1f", showM, showS);
 gfx_x = 10; gfx_y = 30;
 gfx_printf("True peak %5.1f dBTP   frames %d", showT, gmem[1]);

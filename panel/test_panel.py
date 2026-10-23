@@ -1298,6 +1298,21 @@ def test_saved_versions():
           p.lua_list(p.lua.globals().CMDS2) == [40859] and len(opened) == 2 and opened[1].startswith("noprompt:" + str(proj_dir / "Song_restore_"))
           and proj not in [x.replace("noprompt:", "") for x in opened], opened)
 
+
+def test_changes_window():
+    p = studio_panel()
+    p.lua.execute("UI = {}; RET.Begin = function() return true, true end")
+    p.m.studio.windows()
+    check("changes window: closed by default", not [c for c in p.lua_list(p.lua.globals().UI) if c.name == "Begin"])
+    p.m.studio._H.win = True
+    p.m.studio.windows()
+    begins = [c.args[2] for c in p.lua_list(p.lua.globals().UI) if c.name == "Begin"]
+    check("changes window: Settings > Open draws its own window, with the empty-state text",
+          begins == ["Agent changes##hibiki_changes"] and any(c.name == "TextColored" for c in p.lua_list(p.lua.globals().UI)), begins)
+    p.lua.execute("RET.Begin = function() return true, false end")
+    p.m.studio.windows()
+    check("changes window: its close box closes it", p.m.studio._H.win is False)
+
 def main():
     global OS_NAME
     try:

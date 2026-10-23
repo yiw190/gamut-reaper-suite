@@ -4142,6 +4142,7 @@ local function frame()
   end
   pm('end')
   cfg_window()
+  if studio then studio.windows() end
   pm('settings')
   ImGui.PopStyleVar(ctx, #VARS)
   ImGui.PopStyleColor(ctx, #COLORS)

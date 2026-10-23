@@ -689,7 +689,7 @@ for _, r in ipairs(R.list) do if type(r) == 'table' and type(r.id) == 'string' t
 ---------------------------------------------------------------- change history (go back to before any reply)
 -- Undo is linear: going back to before reply X undoes X and everything above it (later replies, the user's own
 -- edits); Redo all replays the same number of steps. Lives as long as REAPER's undo history (until a restart).
-local H = { confirm = nil, last = nil, open_req = false }
+local H = { confirm = nil, last = nil, win = false }
 local function project_receipts()
   local proj = select(2, reaper.EnumProjects(-1, ''))
   local out = {}
@@ -727,12 +727,10 @@ local function redo_all()
   H.last = nil
 end
 
-local function history_popup(list)
-  ImGui.SetNextWindowSizeConstraints(ctx, 320, 0, 440, 480)
-  if not ImGui.BeginPopup(ctx, 'hibiki_changes') then return end
-  local w = 400
-  ImGui.Text(ctx, 'Agent changes in this project')
-  ImGui.TextColored(ctx, C.muted, 'Newest first. Revert goes back to before that reply.')
+local function history_body(list)
+  local w = ImGui.GetContentRegionAvail(ctx)
+  ImGui.TextColored(ctx, C.muted, P.truncate(select(2, project_where()) or '(unsaved project)', w))
+  if #list > 0 then ImGui.TextColored(ctx, C.muted, 'Newest first. Revert goes back to before that reply.') end
   if H.last then
     ImGui.Separator(ctx)
     P.wrapped(('Went back to before the %s reply (%s).'):format(H.last.at, plural(H.last.undone, 'undo step')), C.muted)
@@ -761,7 +759,10 @@ local function history_popup(list)
       H.confirm = r.id
     end
   end
-  if #list == 0 then ImGui.TextDisabled(ctx, 'No agent changes in this project yet.') end
+  if #list == 0 and not H.last then
+    P.wrapped('No agent changes in this project since REAPER started. When a reply changes it, the reply shows up '
+      .. 'here with Revert.', C.muted)
+  end
   local saved = SV.list()
   if #saved > 0 then
     ImGui.Dummy(ctx, 0, 6)
@@ -780,25 +781,40 @@ local function history_popup(list)
       ImGui.TextColored(ctx, C.muted, P.truncate(('%s · %s'):format(plural(tonumber(e.n) or 0, 'change'), tostring(e.what or '')), 220))
       if ImGui.IsItemHovered(ctx) then P.show_tip(tostring(e.what or '') .. '\n' .. tostring(e.file)) end
       ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Open as copy##sv' .. i) then SV.open(e); ImGui.CloseCurrentPopup(ctx) end
+      if ImGui.Button(ctx, 'Open as copy##sv' .. i) then SV.open(e) end
     end
+  elseif SV.on then
+    ImGui.Dummy(ctx, 0, 6)
+    P.wrapped('Saved versions (kept after a restart) appear here after the first reply that changes this project.', C.muted)
   end
-  ImGui.EndPopup(ctx)
+end
+
+-- the Agent changes window: opened from the composer's Changes chip or Agent settings > Studio > Agent changes
+function M.windows()
+  if not H.win then return end
+  local rect = S.panel_rect
+  if rect then ImGui.SetNextWindowPos(ctx, rect[1] - 470, rect[2] + 40, ImGui.Cond_Appearing) end
+  ImGui.SetNextWindowSize(ctx, 450, 480, ImGui.Cond_FirstUseEver)
+  local visible, open = ImGui.Begin(ctx, 'Agent changes##hibiki_changes', true, ImGui.WindowFlags_NoCollapse)
+  if visible then
+    history_body(project_receipts())
+    if ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
+      open = false
+    end
+    ImGui.End(ctx)
+  end
+  if not open then H.win, H.confirm = false, nil end
 end
 
 -- composer chip, shown once this project has agent changes (or a history revert to redo)
 function M.changes_chip()
   local list = project_receipts()
-  if #list == 0 and not H.last and not H.open_req and #SV.list() == 0 then return end
+  if #list == 0 and not H.last and #SV.list() == 0 then return end
   ImGui.SameLine(ctx, 0, 2)
-  if P.chip('changes', 'Changes', C.muted, false) or H.open_req then
-    H.open_req, H.confirm = false, nil
-    ImGui.OpenPopup(ctx, 'hibiki_changes')
-  end
+  if P.chip('changes', 'Changes', C.muted, false) then H.win, H.confirm = not H.win, nil end
   if ImGui.IsItemHovered(ctx) then
     P.show_tip('What agents changed in this project: go back to before any reply, or open a saved version.')
   end
-  history_popup(list)
 end
 
 ---------------------------------------------------------------- panel hooks
@@ -890,7 +906,7 @@ function M.settings(A)
     ImGui.AlignTextToFramePadding(ctx)
     ImGui.Text(ctx, 'Agent changes')
     if ImGui.IsItemHovered(ctx) then P.show_tip('Every reply that changed this project; go back to before any of them.') end
-    if right_btn('history', 'Open', false) then H.open_req = true end
+    if right_btn('history', 'Open', false) then H.win, H.confirm = true, nil end
   end)
 end
 

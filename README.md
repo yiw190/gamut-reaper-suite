@@ -219,7 +219,7 @@ while a composition is open and shows the pending pinyin under the input.
   the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
   **Accept** (keep them, close the card) and **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
   undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Studio → Review changes off) stops the cards;
-  every change is still a labelled undo step. **Changes** (composer, or Agent settings → Studio → Agent changes) lists every reply
+  every change is still a labelled undo step. **Changes** (composer, or Agent settings → Studio → Agent changes) opens the Agent changes window: every reply
   that changed this project (last 30) and goes back to before any of them: undo is linear, so later replies and your
   own edits since are undone too (it says so first); **Redo all** replays them. Lives as long as REAPER's undo history.
 - **Saved versions.** After a reply that changed the project, a copy of it (saved or not; `Main_SaveProjectEx` to

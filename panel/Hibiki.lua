@@ -3901,14 +3901,45 @@ local demo_tick do
   end
 end
 
+-- per-section frame timing for diagnosis: ExtState Hibiki/profile = 1 → averages (ms) in ExtState Hibiki/prof each second
+local pm do
+  local on, last, acc, n, at, checked = false, 0, {}, 0, 0, 0
+  pm = function(name)
+    local now = reaper.time_precise()
+    if name == nil then
+      if now - checked > 1 then checked = now; on = reaper.GetExtState(EXT, 'profile') == '1' end
+      if on then
+        n = n + 1
+        if now - at >= 1 and n > 0 then
+          local parts = {}
+          for k, v in pairs(acc) do parts[#parts + 1] = ('%s=%.2f'):format(k, v * 1000 / n) end
+          table.sort(parts)
+          reaper.SetExtState(EXT, 'prof', table.concat(parts, ' '), false)
+          acc, n, at = {}, 0, now
+        end
+      end
+      last = now
+      return
+    end
+    if not on then return end
+    acc[name] = (acc[name] or 0) + (now - last)
+    last = now
+  end
+end
+
 local function frame()
   local t0 = reaper.time_precise()
+  pm()
   if S.auth and (S.auth.waiting or #S.auth.methods == 0) and t0 - (S.auth_at or 0) > 2 then load_status() end
   if S.waiting and #S.greqs == 0 and t0 - S.greq_at > 3 then load_requests() end
   check_theme()
+  pm('theme')
   sel_tick()
+  pm('sel')
   poll_http()
+  pm('http')
   poll_stream()
+  pm('sse')
   demo_tick(t0)
   if S.title_checks and S.title_checks[1] and t0 >= S.title_checks[1] then
     table.remove(S.title_checks, 1)
@@ -3933,8 +3964,10 @@ local function frame()
       (ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_L) or ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Super | ImGui.Key_L)) then
     open = false
   end
+  pm('pre')
   if visible then
     header()
+    pm('header')
 
     if S.agent == '' then
       -- onboarding: no agent chosen yet
@@ -3979,6 +4012,7 @@ local function frame()
       ImGui.PopTextWrapPos(ctx)
     else
       local cards = card_list()
+      pm('cards')
       if S.sel and not S.sel_clicked and ImGui.IsMouseClicked(ctx, 0) then S.sel = nil end -- clicked elsewhere
       if S.sel and not S.comp_active and not S.sel.drag
           and ImGui.IsKeyChordPressed(ctx, ImGui.Mod_Ctrl | ImGui.Key_C) then
@@ -3992,6 +4026,7 @@ local function frame()
         draw_log()
         ImGui.EndChild(ctx)
       end
+      pm('log')
       accept_file_drop() -- files dropped on the conversation attach too
       do -- the composer is a track-panel strip as well
         local _, cy = ImGui.GetCursorScreenPos(ctx)
@@ -4062,9 +4097,12 @@ local function frame()
         show_tip('Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
       end
     end
+    pm('composer')
     ImGui.End(ctx)
   end
+  pm('end')
   cfg_window()
+  pm('settings')
   ImGui.PopStyleVar(ctx, #VARS)
   ImGui.PopStyleColor(ctx, #COLORS)
   ImGui.PopFont(ctx)

@@ -103,6 +103,14 @@ ACP_AGENTS = {
     "grok": {"package": "@xai-official/grok", "version": "1.0.67", "bin": "grok",
              "args": ["--no-auto-update", "agent", "stdio"], "name": "Grok",
              "description": "xAI's Grok Build over ACP; SuperGrok or X Premium+ (beta)"},
+    # Google login opens the browser itself; the API-key, Vertex and gateway methods need keys the panel can't set
+    "gemini": {"package": "@google/gemini-cli", "version": "0.65.0", "bin": "gemini", "args": ["--acp"],
+               "name": "Gemini", "description": "Gemini CLI over ACP; uses your Google AI Pro / Ultra login",
+               "authMethods": ["oauth-personal"]},
+    # ACP auth method copilot-login runs `copilot login` (device code) in a terminal
+    "copilot": {"package": "@github/copilot", "version": "1.0.103", "bin": "copilot",
+                "args": ["--acp", "--no-auto-update"], "name": "Copilot",
+                "description": "GitHub Copilot CLI over ACP; uses your Copilot Pro / Pro+ subscription"},
 }
 
 
@@ -807,7 +815,7 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
         entry = {"slug": slug, "name": a["name"], "description": a["description"],
                  "command": [str(bin_dir / (a["bin"] + (".cmd" if WINDOWS else "")))] + a["args"], "env": {"PATH": path},
                  "cwd": "~/Documents/REAPER Media"}
-        for k in ("loginVariants", "terminalLogin"):
+        for k in ("loginVariants", "terminalLogin", "authMethods"):
             if a.get(k):
                 entry[k] = a[k]
         cfg["acp"] = [x for x in cfg.get("acp", []) if x.get("slug") != slug] + [entry]

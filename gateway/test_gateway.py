@@ -259,6 +259,9 @@ def unit_terminal_login():
     check("terminal login argv = command + login + region", ag.terminal_auth(ms[0], spec)[0] == ["mcode", "acp", "login", "--region", "global"]
           and ag.terminal_auth(ms[1], spec)[0] == ["mcode", "acp", "login"])
     check("declared methods win over terminalLogin", ag.login_variants([{"id": "grok.com"}], spec) == [{"id": "grok.com"}])
+    gemini = [{"id": "oauth-personal"}, {"id": "gemini-api-key"}, {"id": "vertex-ai"}, {"id": "gateway"}]
+    check("authMethods keeps only the listed methods",
+          ag.login_variants(gemini, {"command": ["gemini", "--acp"], "authMethods": ["oauth-personal"]}) == [{"id": "oauth-personal"}])
 
 
 def unit_install():
@@ -326,8 +329,8 @@ def main():
 
         # Windows has no mode bits (NTFS ACLs; the file sits in the user's profile)
         inst = g.get("/api/hibiki/installable")
-        check("hibiki: installable lists codex, claude, kimi, minimax, grok (none installed here)",
-              [x["key"] for x in inst] == ["codex", "claude", "kimi", "minimax", "grok"] and not any(x["installed"] for x in inst))
+        check("hibiki: installable lists codex, claude, kimi, minimax, grok, gemini, copilot (none installed here)",
+              [x["key"] for x in inst] == ["codex", "claude", "kimi", "minimax", "grok", "gemini", "copilot"] and not any(x["installed"] for x in inst))
         st = g.get("/api/hibiki/gamut-reaper?agent=g1")
         check("hibiki: REAPER registered in Gamut, not yet enabled for g1", st == {"registered": True, "enabled": False})
         code, r = g.post("/api/hibiki/gamut-reaper", {"agent": "g1"})

@@ -36,7 +36,7 @@ body:
     attributes:
       label: Agent
       description: Which agent and model the panel was using.
-      placeholder: Gamut / Claude Code / Codex / Kimi / MiniMax / Grok / other MCP client
+      placeholder: Gamut / Claude Code / Codex / Kimi / MiniMax / Grok / Gemini / Copilot / other MCP client
   - type: textarea
     id: logs
     attributes:

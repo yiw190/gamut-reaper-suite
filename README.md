@@ -114,8 +114,10 @@ rights) and loads it without a restart — then **Connect** to log in once. The 
 | Kimi | `@moonshot-ai/kimi-code` | kimi.ai or kimi.com (one button each) |
 | MiniMax | `@minimax-ai/code` | global or mainland account (one button each) |
 | Grok | `@xai-official/grok` | browser sign-in; SuperGrok or X Premium+ (beta) |
+| Gemini | `@google/gemini-cli` | Google sign-in in the browser; Google AI Pro / Ultra |
+| Copilot | `@github/copilot` | `copilot login` (device code) in Terminal; Copilot Pro / Pro+ |
 
-Same from a terminal: `hibiki agents add claude kimi minimax grok codex`. Not one-click yet: Qwen Code (ACP only offers
+Same from a terminal: `hibiki agents add claude kimi minimax grok gemini copilot codex`. Not one-click yet: Qwen Code (ACP only offers
 an OpenAI-compatible API key set through environment variables) and DeepSeek (its harness's ACP server is
 automation-only; DeepSeek models work through an ACP agent such as OpenCode with an API key).
 

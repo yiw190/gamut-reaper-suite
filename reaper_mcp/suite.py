@@ -1044,9 +1044,9 @@ def cmd_uninstall(a) -> int:
             shutil.rmtree(d, ignore_errors=True)
         say("removed %s and %s" % (p.cfg, p.gw_cfg.parent))
     if WINDOWS:
-        if "Programs" in ROOT.parts and "Hibiki" in ROOT.parts:
+        if packaged():
             say("App files: remove Hibiki in Settings -> Apps (its uninstaller runs this command too)")
-    elif PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
+    elif packaged():
         say("App files: sudo rm -rf '%s' /usr/local/bin/hibiki && sudo pkgutil --forget %s"
             % (PKG_ROOT, PKG_ID))
     return 0
@@ -1329,6 +1329,207 @@ def cmd_recover(a) -> int:
     return 0 if ok else 1
 
 
+# ---------- update ----------
+
+RELEASES_API = "https://api.github.com/repos/yiw190/hibiki/releases?per_page=50"
+RELEASE_DOWNLOAD = "https://github.com/yiw190/hibiki/releases/download/"
+UPDATE_TIMEOUT = 10
+DOWNLOAD_TIMEOUT = 60
+VERSION_RE = re.compile(r"^v?(\d+(?:\.\d+){0,3})(?:[-.]?(dev|a|alpha|b|beta|c|pre|rc)[.-]?(\d*))?$", re.I)
+STAGES = {"dev": 0, "a": 1, "alpha": 1, "b": 2, "beta": 2, "c": 3, "pre": 3, "rc": 3}
+FINAL = 9
+
+
+class UpdateError(Exception):
+    pass
+
+
+def version_key(v: str) -> tuple:
+    """0.5.0 < 0.5.1-dev.1 < 0.5.1-dev.4 < 0.5.1-rc.1 < 0.5.1 (dev < alpha < beta < rc < final)."""
+    m = VERSION_RE.match(v.strip())
+    if not m:
+        raise ValueError("not a version: %r" % v)
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    stage = STAGES[m.group(2).lower()] if m.group(2) else FINAL
+    return nums + (0,) * (4 - len(nums)) + (stage, int(m.group(3) or 0))
+
+
+def default_channel() -> str:
+    return "dev" if "-" in __version__ else "stable"
+
+
+def host_os() -> str:
+    return "windows" if WINDOWS else ("macos" if sys.platform == "darwin" else sys.platform)
+
+
+def packaged() -> bool:
+    """True when ROOT is the .pkg payload (macOS) or the setup.exe install (Windows), not a git clone."""
+    if WINDOWS:
+        return "Programs" in ROOT.parts and "Hibiki" in ROOT.parts
+    return PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT
+
+
+def gh_open(url: str, timeout: float):
+    req = urllib.request.Request(url, headers={"User-Agent": "hibiki/%s" % __version__,
+                                               "Accept": "application/vnd.github+json"})
+    return urllib.request.urlopen(req, timeout=timeout)
+
+
+def fetch_releases() -> list:
+    with gh_open(RELEASES_API, UPDATE_TIMEOUT) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    if not isinstance(data, list):
+        raise UpdateError("GitHub answered without a release list: %s" % str(data)[:200])
+    return data
+
+
+def pick_release(releases: list, channel: str) -> dict | None:
+    best = None
+    for r in releases:
+        if not isinstance(r, dict) or r.get("draft"):
+            continue
+        try:
+            key = version_key(str(r.get("tag_name") or ""))
+        except ValueError:
+            continue
+        if channel == "stable" and (r.get("prerelease") or key[4] != FINAL):
+            continue
+        if best is None or key > best[0]:
+            best = (key, r)
+    return best[1] if best else None
+
+
+def release_url_ok(url: str) -> bool:
+    u = urllib.parse.urlparse(url)
+    return (url.startswith(RELEASE_DOWNLOAD) and u.scheme == "https" and u.netloc == "github.com"
+            and not u.query and not u.fragment and ".." not in u.path and "\\" not in url)
+
+
+def updates_dir() -> Path:
+    if host_os() == "windows":
+        d = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Hibiki/updates"
+    else:
+        d = Path.home() / "Library/Caches/Hibiki/updates"
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o700)
+    return d
+
+
+def installer_name(version: str) -> str:
+    if host_os() == "macos":
+        return "Hibiki-%s.pkg" % version
+    if host_os() == "windows":
+        return "Hibiki-%s-setup.exe" % version
+    raise UpdateError("no Hibiki installer for %s; update the source checkout with git" % host_os())
+
+
+def asset_url(release: dict, name: str) -> str:
+    for asset in release.get("assets") or []:
+        if isinstance(asset, dict) and asset.get("name") == name:
+            url = str(asset.get("browser_download_url") or "")
+            if not release_url_ok(url):
+                raise UpdateError("refusing %s: %s is not a Hibiki release download" % (name, url))
+            return url
+    raise UpdateError("release %s has no %s" % (release.get("tag_name"), name))
+
+
+def download(url: str, dst: Path) -> str:
+    if not release_url_ok(url):
+        raise UpdateError("refusing to download %s: not a Hibiki release download" % url)
+    part = dst.with_name(dst.name + ".part")
+    h = hashlib.sha256()
+    with gh_open(url, DOWNLOAD_TIMEOUT) as r, open(part, "wb") as f:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            h.update(chunk)
+            f.write(chunk)
+    os.replace(part, dst)
+    return h.hexdigest()
+
+
+def expected_sha(text: str, name: str) -> str:
+    parts = text.split()
+    if not parts or not re.match(r"^[0-9a-fA-F]{64}$", parts[0]):
+        raise UpdateError("%s.sha256 is not a sha256 file" % name)
+    if len(parts) > 1 and parts[1].lstrip("*") != name:
+        raise UpdateError("%s.sha256 is for %s" % (name, parts[1]))
+    return parts[0].lower()
+
+
+def launch_installer(path: Path) -> list:
+    """Opens the installer for the user; never silent, never sudo (macOS Installer asks for the admin password)."""
+    cmd = ["open", str(path)] if host_os() == "macos" else [str(path)]
+    kw = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+    if host_os() == "windows":
+        kw["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        kw["start_new_session"] = True
+    subprocess.Popen(cmd, **kw)
+    return cmd
+
+
+def install_release(release: dict, version: str) -> dict:
+    name = installer_name(version)
+    url, sha_url = asset_url(release, name), asset_url(release, name + ".sha256")
+    d = updates_dir()
+    with gh_open(sha_url, UPDATE_TIMEOUT) as r:
+        want = expected_sha(r.read(64 * 1024).decode("utf-8", "replace"), name)
+    dst = d / name
+    got = download(url, dst)
+    if got != want:
+        dst.unlink()
+        raise UpdateError("%s failed its sha256 check (got %s, expected %s); nothing was installed" % (name, got, want))
+    return {"installer": str(dst), "sha256": got, "launched": launch_installer(dst)}
+
+
+def cmd_update(a) -> int:
+    channel = a.channel or default_channel()
+    out = {"current": __version__, "channel": channel, "latest": None, "tag": None, "url": None, "published": None,
+           "update_available": False, "notes": ""}
+    try:
+        if a.install and not packaged():
+            raise UpdateError("running from a source checkout; install the package instead")
+        rel = pick_release(fetch_releases(), channel)
+        if rel:
+            tag = str(rel.get("tag_name"))
+            latest = tag[1:] if tag[:1] in ("v", "V") else tag
+            out.update(latest=latest, tag=tag, url=rel.get("html_url"), published=rel.get("published_at"),
+                       update_available=version_key(latest) > version_key(__version__),
+                       notes=str(rel.get("body") or "")[:600])
+        if a.install:
+            if not rel:
+                raise UpdateError("no release on the %s channel" % channel)
+            if not out["update_available"] and not a.force:
+                out.update(launched=None, message="already up to date (%s)" % __version__)
+            else:
+                out.update(install_release(rel, out["latest"]))
+                out["message"] = ("installer opened: finish it in the Installer window, then restart REAPER"
+                                  if host_os() == "macos" else "installer opened: finish it, then restart REAPER")
+    except (UpdateError, OSError, ValueError) as e:
+        out["error"] = str(e) or repr(e)
+    if a.json:
+        print(json.dumps(out))
+        return 1 if "error" in out else 0
+    say("current: %s (channel %s)" % (__version__, channel))
+    if out["latest"]:
+        say("latest:  %s (%s, %s)  %s" % (out["latest"], out["tag"], str(out["published"] or "")[:10], out["url"]))
+        say("update available: %s" % ("yes - run `hibiki update --install`" if out["update_available"] and not a.install
+                                      else "yes" if out["update_available"] else "no, up to date"))
+    elif "error" not in out:
+        say("latest:  no release on the %s channel" % channel)
+    if out.get("launched"):
+        say("downloaded %s (sha256 ok)" % out["installer"])
+        say("launched: %s" % " ".join(out["launched"]))
+    if out.get("message"):
+        say(out["message"])
+    if "error" in out:
+        say("error: %s" % out["error"])
+        return 1
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="hibiki", description="REAPER MCP, Hibiki panel and agent gateway.")
     sub = ap.add_subparsers(dest="cmd")
@@ -1370,6 +1571,15 @@ def parser() -> argparse.ArgumentParser:
     u.add_argument("--resource-path")
     u.add_argument("--purge", action="store_true", help="also delete tokens, gateway config and ACP transcripts")
     u.set_defaults(fn=cmd_uninstall)
+    up = sub.add_parser("update", help="check GitHub for a newer Hibiki release; --install downloads, verifies and opens "
+                                       "its installer")
+    up.add_argument("--check", action="store_true", help="only report (the default)")
+    up.add_argument("--install", action="store_true", help="download the installer, verify its sha256 and open it")
+    up.add_argument("--channel", choices=["stable", "dev"], help="dev includes pre-releases (default: dev on a "
+                                                                    "pre-release build, else stable)")
+    up.add_argument("--force", action="store_true", help="--install even when already up to date")
+    up.add_argument("--json", action="store_true")
+    up.set_defaults(fn=cmd_update)
     r = sub.add_parser("run", help=argparse.SUPPRESS)  # the Windows supervisor (started by setup and at logon)
     r.add_argument("--port", type=int, default=port())
     r.set_defaults(fn=cmd_run)

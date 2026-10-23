@@ -60,6 +60,8 @@ hibiki agents add codex claude kimi   # ACP agents for the panel (Node goes in ~
 hibiki watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
 hibiki stop                           # turn the background services off; they stay off after login
 hibiki start                          # turn them back on (setup does too)
+hibiki update                         # newer release on GitHub? (--channel stable|dev, --json; dev builds default to dev)
+hibiki update --install               # download it, verify its sha256, open the installer (you finish it); source clones: git pull
 hibiki uninstall [--purge]            # --purge also deletes tokens and gateway config
 ```
 

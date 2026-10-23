@@ -681,6 +681,138 @@ def test_recover():
               and find(reqs, "GET", "/sessions/s1/messages"), reqs)
 
 
+def _update_jobs(p):
+    return [c for c in p.lua_list(p.lua.globals().CMDS) if " update --" in c]
+
+
+def _finish_update(p, cmd, body, code=0):
+    base = re.search(r"""> ['"]([^'"]+update[^'"]+)\.out['"]""", cmd).group(1)
+    Path(base + ".out").write_text(body if isinstance(body, str) else json.dumps(body))
+    Path(base + ".done").write_text(str(code))
+    p.m.poll_http()
+
+
+def _settings(p, click=None):
+    """Draw one frame with the settings window open; click: the id of a light/LED button to press."""
+    g = p.lua.globals()
+    g.LAYOUT(400, 600)
+    p.lua.execute("UI = {}; RET.Begin = function(_, name) if name:find('hibiki_cfg', 1, true) then return true, true end end; "
+                  "RET.GetCursorPosX = function() return 0 end; RET.GetFrameHeight = function() return 20 end; "
+                  "RET.GetItemRectMin = function() return 0, 0 end; RET.GetItemRectMax = function() return 0, 0 end")
+    if click:
+        p.lua.execute("RET.InvisibleButton = function(_, id, w, h) return id == %r end" % click)
+    p.S.cfgwin = True
+    try:
+        p.m.frame()
+    finally:
+        p.lua.execute("RET.Begin, RET.InvisibleButton, RET.GetCursorPosX, RET.GetFrameHeight = nil, nil, nil, nil; "
+                      "RET.GetItemRectMin, RET.GetItemRectMax = nil, nil")
+        g.LAYOUT(400, 600)
+    texts = []
+    ui = p.lua.globals().UI
+    for i in range(1, len(ui) + 1):
+        e = ui[i]
+        if e.name in ("Text", "TextColored", "TextDisabled"):
+            args = [e.args[k] for k in range(1, e.args.n + 1)]
+            texts.append(str(args[-1]))
+    return texts
+
+
+UPDATE_OK = {"current": "0.5.1-dev.4", "latest": "0.5.1-dev.4", "tag": "v0.5.1-dev.4", "url": "https://x",
+             "published": "2026-10-20T10:00:00Z", "update_available": False, "channel": "dev", "notes": ""}
+UPDATE_NEW = dict(UPDATE_OK, latest="0.5.1-dev.5", tag="v0.5.1-dev.5", published="2026-10-23T10:00:00Z",
+                  update_available=True)
+
+
+def test_update_check():
+    import time
+    for case in ("up-to-date", "available", "error", "missing"):
+        p = Panel(dict(SESSION, upd_at=str(int(time.time()))))
+        p.boot()
+        texts = _settings(p, "##lb_updcheck")
+        jobs = _update_jobs(p)
+        check("update(%s): Check for updates starts `hibiki update --check --json` in the background" % case,
+              len(jobs) == 1 and " update --check --json" in jobs[0] and p.m.UPD.running == "check"
+              and (jobs[0].endswith("&") or "cmd.exe" in jobs[0]) and "--install" not in jobs[0], jobs)
+        if not jobs:
+            continue
+        if case == "up-to-date":
+            _finish_update(p, jobs[0], UPDATE_OK)
+        elif case == "available":
+            _finish_update(p, jobs[0], UPDATE_NEW)
+        elif case == "error":
+            _finish_update(p, jobs[0], {"current": "0.5.1-dev.4", "error": "<urlopen error offline>"}, 1)
+        else:
+            _finish_update(p, jobs[0], "", 127)
+        texts = _settings(p)
+        ext = dict(p.lua.globals().EXT_STATE)
+        check("update(%s): no longer running" % case, p.m.UPD.running is None)
+        if case == "up-to-date":
+            check("update(up-to-date): 'Version 0.5.1-dev.4' + 'Up to date'; check time saved",
+                  "Version 0.5.1-dev.4" in texts and "Up to date" in texts and ext.get("Hibiki/upd_at", "") != "", texts)
+        elif case == "available":
+            check("update(available): '0.5.1-dev.5 available (Oct 23)' with an Install button",
+                  "0.5.1-dev.5 available (Oct 23)" in texts and p.m.UPD.available is True, texts)
+        elif case == "error":
+            check("update(error): the CLI's error is shown", "<urlopen error offline>" in texts and p.m.UPD.err, texts)
+        else:
+            check("update(missing): says the hibiki command was not found",
+                  any("not found" in t for t in texts), texts)
+
+
+def test_update_install():
+    import time
+    p = Panel(dict(SESSION, upd_at=str(int(time.time())), upd_current="0.5.1-dev.4", upd_latest="0.5.1-dev.5",
+                   upd_available="1", upd_published="2026-10-23T10:00:00Z"))
+    p.boot()
+    texts = _settings(p)
+    check("install: cached result shows the available version", "0.5.1-dev.5 available (Oct 23)" in texts
+          and not _update_jobs(p), texts)
+    _settings(p, "##lb_updinstall")
+    jobs = _update_jobs(p)
+    check("install: Install runs `hibiki update --install --json` in the background",
+          len(jobs) == 1 and " update --install --json" in jobs[0] and p.m.UPD.running == "install", jobs)
+    if not jobs:
+        return
+    texts = _settings(p)
+    check("install: shows Downloading…", "Downloading…" in texts, texts)
+    _finish_update(p, jobs[0], dict(UPDATE_NEW, installer="/tmp/x.pkg", launched=["open", "/tmp/x.pkg"],
+                                     message="installer opened"))
+    texts = _settings(p)
+    check("install: tells the user to finish the installer and restart REAPER",
+          any(t.startswith("Installer opened") and "restart REAPER" in t for t in texts), texts)
+    p2 = Panel(dict(SESSION, upd_at=str(int(time.time())), upd_current="0.5.1-dev.4", upd_latest="0.5.1-dev.5",
+                    upd_available="1"))
+    p2.boot()
+    _settings(p2, "##lb_updinstall")
+    _finish_update(p2, _update_jobs(p2)[0], {"current": "0.5.1-dev.4", "error": "sha256 mismatch; nothing was installed"}, 1)
+    texts = _settings(p2)
+    check("install: the CLI's refusal is shown", "sha256 mismatch; nothing was installed" in texts, texts)
+
+
+def test_update_auto_check():
+    import time
+    p = Panel(dict(SESSION, upd_at=str(int(time.time()) - 25 * 3600), upd_current="0.5.1-dev.4"))
+    p.boot()
+    p.S.cfgwin_was = False
+    _settings(p)
+    jobs = _update_jobs(p)
+    check("auto: opening settings with a check older than 24 h checks once, never installs",
+          len(jobs) == 1 and "--check" in jobs[0] and "--install" not in jobs[0], jobs)
+    _settings(p)
+    check("auto: not again while the window stays open", len(_update_jobs(p)) == 1)
+    p = Panel(dict(SESSION, upd_at=str(int(time.time()) - 3600)))
+    p.boot()
+    p.S.cfgwin_was = False
+    _settings(p)
+    check("auto: a check under 24 h old is not repeated", not _update_jobs(p), _update_jobs(p))
+    _settings(p, "##led_upddev")
+    jobs = _update_jobs(p)
+    ext = dict(p.lua.globals().EXT_STATE)
+    check("dev builds LED: persisted and re-checks with --channel dev",
+          ext.get("Hibiki/upd_dev") == "1" and len(jobs) == 1 and "--channel dev" in jobs[0], (ext.get("Hibiki/upd_dev"), jobs))
+
+
 def main():
     global OS_NAME
     try:

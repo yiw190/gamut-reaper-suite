@@ -1712,30 +1712,116 @@ do
     S.gen = S.gen + 1
     S.active, S.waiting, S.perms, S.err, S.creating, S.uploading = false, false, {}, nil, false, false
     REC.running, REC.lines, REC.at = true, nil, reaper.time_precise()
+    REC.job = REC.cli('recover', 'recover --json', finished)
+  end
+  function REC.cli(name, args, cb)
     reqn = reqn + 1
-    local b = DIR .. 'recover' .. RUN .. '_' .. reqn
+    local b = DIR .. name .. RUN .. '_' .. reqn
     local out, code, done = q(b .. '.out'), q(b .. '.code'), q(b .. '.done')
     if WIN then
       local exe = (os.getenv('LOCALAPPDATA') or (HOME .. '\\AppData\\Local')) .. '\\Programs\\Hibiki\\bin\\hibiki.cmd'
       local ok, line = pcall(function()
-        return '(if exist ' .. q(exe) .. ' (call ' .. q(exe) .. ' recover --json > ' .. out .. ' 2>NUL && (> ' .. code
-          .. ' echo 0) || (> ' .. code .. ' echo 1)) else (call hibiki recover --json > ' .. out .. ' 2>NUL && (> ' .. code
+        return '(if exist ' .. q(exe) .. ' (call ' .. q(exe) .. ' ' .. args .. ' > ' .. out .. ' 2>NUL && (> ' .. code
+          .. ' echo 0) || (> ' .. code .. ' echo 1)) else (call hibiki ' .. args .. ' > ' .. out .. ' 2>NUL && (> ' .. code
           .. ' echo 0) || (> ' .. code .. ' echo 127))) & move /Y ' .. code .. ' ' .. done .. ' >NUL'
       end)
-      if not ok then return finished(127, '') end
+      if not ok then cb(127, ''); return nil end
       win_bg(line)
     else
       sh('( for h in /usr/local/bin/hibiki "$HOME/.local/bin/hibiki" "$(command -v hibiki)"; do [ -n "$h" ] && [ -x "$h" ] '
-        .. '&& break; h=; done; if [ -n "$h" ]; then "$h" recover --json > ' .. out .. ' 2>/dev/null; echo $? > ' .. code
+        .. '&& break; h=; done; if [ -n "$h" ]; then "$h" ' .. args .. ' > ' .. out .. ' 2>/dev/null; echo $? > ' .. code
         .. '; else echo 127 > ' .. code .. '; fi; /bin/mv ' .. code .. ' ' .. done .. ' ) >/dev/null 2>&1 &')
     end
-    REC.job = { b = b, cb = finished }
-    pending[#pending + 1] = REC.job
+    local job = { b = b, cb = cb }
+    pending[#pending + 1] = job
+    return job
   end
   function REC.tick() -- a CLI that never returns must not leave the button disabled
     if not REC.running or reaper.time_precise() - REC.at < 180 then return end
     for i = #pending, 1, -1 do if pending[i] == REC.job then table.remove(pending, i) end end
     finished(124, '')
+  end
+end
+
+---------------------------------------------------------------- update: `hibiki update` in the background
+local UPD = {}
+do
+  local DAY = 24 * 3600
+  local MON = { 'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec' }
+  local function ext(k) return reaper.GetExtState(EXT, 'upd_' .. k) end
+  local function put(k, v) reaper.SetExtState(EXT, 'upd_' .. k, v or '', true) end
+  local function opt(v) return v ~= '' and v or nil end
+  UPD.current, UPD.latest, UPD.published = opt(ext('current')), opt(ext('latest')), opt(ext('published'))
+  UPD.available, UPD.checked = ext('available') == '1', ext('at') ~= ''
+  function UPD.date()
+    local m, d = tostring(UPD.published or ''):match('^%d+%-(%d+)%-(%d+)')
+    if not m then return nil end
+    return (MON[tonumber(m)] or m) .. ' ' .. tonumber(d)
+  end
+  function UPD.dev()
+    local v = ext('dev')
+    if v ~= '' then return v == '1' end
+    return (UPD.current or ''):find('-', 1, true) ~= nil
+  end
+  local function failed(code, r)
+    if type(r) == 'table' and sval(r.error) then return sval(r.error) end
+    if code == 127 then return 'hibiki command not found; reinstall Hibiki' end
+    if code == 124 then return 'hibiki update did not answer' end
+    return 'hibiki update failed' .. ((code or 0) ~= 0 and (' (exit ' .. code .. ')') or '')
+  end
+  local function take(r)
+    UPD.current = sval(r.current) or UPD.current
+    UPD.latest, UPD.published = sval(r.latest), sval(r.published)
+    UPD.available, UPD.checked = r.update_available == true, true
+    put('current', UPD.current); put('latest', UPD.latest); put('published', UPD.published)
+    put('available', UPD.available and '1' or '0')
+  end
+  local function ok_body(r) return type(r) == 'table' and r.error == nil and sval(r.current) ~= nil end
+  local function checked(code, body)
+    UPD.running, UPD.job = nil, nil
+    local r = decode(body)
+    if not ok_body(r) then UPD.err = failed(code, r); return end
+    UPD.err = nil
+    take(r)
+    put('at', tostring(os.time()))
+  end
+  local function installed(code, body)
+    UPD.running, UPD.job = nil, nil
+    local r = decode(body)
+    if not ok_body(r) then UPD.err = failed(code, r); return end
+    UPD.err = nil
+    take(r)
+    if type(r.launched) == 'table' then
+      UPD.msg = WIN and 'Installer opened — finish it, then restart REAPER'
+        or 'Installer opened — finish it in the Installer window, then restart REAPER'
+      put('at', '')
+    else
+      UPD.msg = 'Already up to date'
+    end
+  end
+  function UPD.start(kind)
+    if UPD.running then return end
+    UPD.running, UPD.at, UPD.err, UPD.msg = kind, reaper.time_precise(), nil, nil
+    local v = ext('dev')
+    local args = 'update --' .. kind .. ' --json' .. (v == '1' and ' --channel dev' or (v == '0' and ' --channel stable' or ''))
+    UPD.job = REC.cli('update', args, kind == 'install' and installed or checked)
+  end
+  function UPD.set_dev(on)
+    put('dev', on and '1' or '0')
+    put('at', '')
+    if not UPD.running then UPD.start('check') end
+  end
+  function UPD.auto()
+    if not UPD.running and os.time() - (tonumber(ext('at')) or 0) >= DAY then UPD.start('check') end
+  end
+  function UPD.tick()
+    if not UPD.running then return end
+    local live = false
+    for _, j in ipairs(pending) do if j == UPD.job then live = true end end
+    if live and reaper.time_precise() - UPD.at < (UPD.running == 'install' and 900 or 60) then return end
+    for i = #pending, 1, -1 do if pending[i] == UPD.job then table.remove(pending, i) end end
+    local fin = UPD.running == 'install' and installed or checked
+    fin(124, '')
   end
 end
 
@@ -2779,6 +2865,7 @@ local function cfg_window()
     local r = ONB.reaper[S.agent]
     if r then r.stale = true end
     S.agentpop_at = 0
+    UPD.auto()
   end
   S.cfgwin_was = S.cfgwin
   if not S.cfgwin then return end
@@ -3129,6 +3216,46 @@ local function cfg_window()
         end
         ImGui.PopTextWrapPos(ctx)
       end
+    end)
+    ImGui.Dummy(ctx, 0, 2)
+    section('Hibiki', COL)
+    UPD.tick()
+    box('update', COL, function(w, x0)
+      local function right_btn(id, text, off)
+        local bw = ImGui.CalcTextSize(ctx, text) + 16
+        ImGui.SameLine(ctx)
+        ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
+        return light_btn(id, text, bw, false, off)
+      end
+      local function note(col, text)
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.TextColored(ctx, col, text)
+        ImGui.PopTextWrapPos(ctx)
+      end
+      local dim = shade(C.win_text, 0x30)
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.Text(ctx, 'Version ' .. (UPD.current or '…'))
+      if right_btn('updcheck', UPD.running == 'check' and 'Checking…' or 'Check for updates', UPD.running ~= nil) then
+        UPD.start('check')
+      end
+      if UPD.running == 'install' then note(dim, 'Downloading…')
+      elseif UPD.err then note(C.razor, UPD.err)
+      elseif UPD.msg then note(dim, UPD.msg)
+      elseif UPD.available and UPD.latest then
+        local d = UPD.date()
+        ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+        ImGui.AlignTextToFramePadding(ctx)
+        ImGui.Text(ctx, UPD.latest .. ' available' .. (d and (' (' .. d .. ')') or ''))
+        if right_btn('updinstall', 'Install', UPD.running ~= nil) then UPD.start('install') end
+        if ImGui.IsItemHovered(ctx) and not UPD.running then
+          show_tip('Downloads the installer, checks its sha256 and opens it. You finish the install yourself.')
+        end
+      elseif UPD.latest then note(dim, 'Up to date')
+      elseif UPD.checked and not UPD.running then note(dim, 'No release found')
+      end
+      ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
+      if led_btn('upddev', 'Include dev builds', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
     end)
     ImGui.EndGroup(ctx)
 
@@ -3913,7 +4040,7 @@ load_agents()
 if HIBIKI_TEST then -- panel/test_panel.py drives the panel from here, without a window
   return { S = S, poll_http = poll_http, poll_stream = poll_stream, send = send, load_agents = load_agents,
     greq_card = greq_card, decode = decode, jstr = jstr, context = context, sel_tick = sel_tick, SEL = SEL,
-    ONB = ONB, REC = REC, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
+    ONB = ONB, REC = REC, UPD = UPD, DIR = DIR, q = q, F = F, layout_md = layout_md, md_layout = md_layout,
     draw_log = draw_log, truncate = truncate, frame = frame, refresh_messages = refresh_messages,
     demo_tick = demo_tick }
 end

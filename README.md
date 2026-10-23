@@ -106,13 +106,12 @@ panel's **Agent settings → Provider**.
 
 **Route A — Gamut** (desktop app, agents with skills, dashboards, connected accounts):
 
-1. Prerequisites: a container runtime ([Docker Desktop](https://docs.docker.com/desktop/), [OrbStack](https://orbstack.dev/download)
-   or [Podman](https://podman.io/get-started)) and an [Anthropic API key](https://platform.claude.com/settings/keys).
-   No sign-up: Gamut runs locally.
-2. Download Gamut — [macOS (Apple Silicon)](https://updates.gamutagents.com/download/mac) ·
+1. Download Gamut — [macOS (Apple Silicon)](https://updates.gamutagents.com/download/mac) ·
    [Windows](https://updates.gamutagents.com/download/win) · [all releases](https://github.com/SkillfulAgents/SuperAgent/releases/latest)
    ([source](https://github.com/SkillfulAgents/SuperAgent), [gamut.so](https://www.gamut.so)).
-3. Open it, add the API key, create an agent.
+2. Open it and sign in with your Gamut account. Gamut sets up its own agent containers and models; your own API keys
+   (Anthropic, OpenRouter, Bedrock, OpenAI) are optional.
+3. Create an agent.
 4. In the Hibiki panel pick **Gamut** and the agent under **Agent details**. Gamut gives MCP servers to agents one by
    one, so the panel offers **Enable REAPER for <agent>** until that agent has it (one click; it also registers the
    MCP in Gamut if setup ran before Gamut was installed). From a terminal instead:

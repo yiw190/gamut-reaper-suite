@@ -3105,7 +3105,7 @@ local function cfg_window()
       end
       if not gamut then -- Gamut not running: a download entry, marked like the install entries above
         if ImGui.Selectable(ctx, 'Gamut (desktop app)##getgamut', false) then ONB.open_url(ONB.gamut_url) end
-        if ImGui.IsItemHovered(ctx) then show_tip('Needs Docker Desktop, OrbStack or Podman · Anthropic API key') end
+        if ImGui.IsItemHovered(ctx) then show_tip('Sign in with a Gamut account · own API keys optional') end
         local _, sy1 = ImGui.GetItemRectMin(ctx)
         local sx2 = ImGui.GetItemRectMax(ctx)
         ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), sx2 - ImGui.CalcTextSize(ctx, 'download') - 2, sy1, C.marker, 'download')
@@ -4055,8 +4055,8 @@ local function frame()
         ImGui.Dummy(ctx, 0, 6)
       end
       if chip('onb_gamut', 'Download Gamut', C.text, false) then ONB.open_url(ONB.gamut_url) end
-      ImGui.TextDisabled(ctx, 'Gamut: the desktop app with agents, skills and dashboards. Needs Docker Desktop, OrbStack '
-        .. 'or Podman and an Anthropic API key; no sign-up. Once it runs, its agents appear here.')
+      ImGui.TextDisabled(ctx, 'Gamut: the desktop app with agents, skills and dashboards. Sign in with a Gamut account; '
+        .. 'it sets up its own containers and models. Once it runs, its agents appear here.')
       ImGui.PopTextWrapPos(ctx)
     else
       local cards = card_list()

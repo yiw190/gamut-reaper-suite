@@ -689,7 +689,7 @@ for _, r in ipairs(R.list) do if type(r) == 'table' and type(r.id) == 'string' t
 ---------------------------------------------------------------- change history (go back to before any reply)
 -- Undo is linear: going back to before reply X undoes X and everything above it (later replies, the user's own
 -- edits); Redo all replays the same number of steps. Lives as long as REAPER's undo history (until a restart).
-local H = { confirm = nil, last = nil, win = false }
+local H = { confirm = nil, last = nil }
 local function project_receipts()
   local proj = select(2, reaper.EnumProjects(-1, ''))
   local out = {}
@@ -727,94 +727,27 @@ local function redo_all()
   H.last = nil
 end
 
-local function history_body(list)
-  local w = ImGui.GetContentRegionAvail(ctx)
-  ImGui.TextColored(ctx, C.muted, P.truncate(select(2, project_where()) or '(unsaved project)', w))
-  if #list > 0 then ImGui.TextColored(ctx, C.muted, 'Newest first. Revert goes back to before that reply.') end
-  if H.last then
-    ImGui.Separator(ctx)
-    P.wrapped(('Went back to before the %s reply (%s).'):format(H.last.at, plural(H.last.undone, 'undo step')), C.muted)
-    if not H.last.complete then P.wrapped('The undo history ended before that reply was fully undone.', C.warn) end
-    if P.primary('Redo all##hist') then redo_all() end
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Replay every step that was undone, back to where you were.') end
-  end
-  for i, r in ipairs(list) do
-    ImGui.Separator(ctx)
-    local lines = type(r.lines) == 'table' and r.lines or {}
-    local n = tonumber(r.n) or 0
-    ImGui.Text(ctx, ('%s  ·  %s%s'):format(os.date('%H:%M', tonumber(r.at) or 0), plural(n, 'change'),
-      r.id:match('^mcp%-') and '  ·  outside the panel' or ''))
-    if lines[1] then
-      ImGui.TextColored(ctx, C.muted, P.truncate(lines[1] .. (#lines > 1 and ('  +' .. (n - 1)) or ''), w))
-      if ImGui.IsItemHovered(ctx) then P.show_tip(table.concat(lines, '\n')) end
-    end
-    if H.confirm == r.id then
-      P.wrapped((i == 1 and 'Undoes this reply and any edits you made after it.'
-        or ('Also undoes the %s after it and any edits you made since.'):format(plural(i - 1, 'later reply')))
-        .. ' Redo all brings everything back.', C.warn)
-      if P.primary('Revert##hc' .. i) then revert_to_before(r, list); H.confirm = nil end
-      ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Cancel##hc' .. i) then H.confirm = nil end
-    elseif not H.last and ImGui.Button(ctx, 'Revert to before this##hr' .. i) then
-      H.confirm = r.id
-    end
-  end
-  if #list == 0 and not H.last then
-    P.wrapped('No agent changes in this project since REAPER started. When a reply changes it, the reply shows up '
-      .. 'here with Revert.', C.muted)
-  end
-  local saved = SV.list()
-  if #saved > 0 then
-    ImGui.Dummy(ctx, 0, 6)
-    ImGui.Text(ctx, 'Saved versions')
-    ImGui.TextColored(ctx, C.muted, 'Kept after a restart. Opens as a copy in a new tab; this project stays as it is.')
-    for i, e in ipairs(saved) do
-      if i > 15 then
-        ImGui.TextColored(ctx, C.muted, ('+%d older in .hibiki/history'):format(#saved - 15))
-        break
-      end
-      ImGui.Separator(ctx)
-      local d = os.date('%m-%d %H:%M', tonumber(e.at) or 0)
-      ImGui.AlignTextToFramePadding(ctx)
-      ImGui.Text(ctx, d)
-      ImGui.SameLine(ctx)
-      ImGui.TextColored(ctx, C.muted, P.truncate(('%s · %s'):format(plural(tonumber(e.n) or 0, 'change'), tostring(e.what or '')), 220))
-      if ImGui.IsItemHovered(ctx) then P.show_tip(tostring(e.what or '') .. '\n' .. tostring(e.file)) end
-      ImGui.SameLine(ctx)
-      if ImGui.Button(ctx, 'Open as copy##sv' .. i) then SV.open(e) end
-    end
-  elseif SV.on then
-    ImGui.Dummy(ctx, 0, 6)
-    P.wrapped('Saved versions (kept after a restart) appear here after the first reply that changes this project.', C.muted)
-  end
-end
-
--- the Version history window: opened from the composer's Versions chip or Agent settings > Studio > Version history
-function M.windows()
-  if not H.win then return end
-  local rect = S.panel_rect
-  if rect then ImGui.SetNextWindowPos(ctx, rect[1] - 470, rect[2] + 40, ImGui.Cond_Appearing) end
-  ImGui.SetNextWindowSize(ctx, 450, 480, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Version history##hibiki_changes', true, ImGui.WindowFlags_NoCollapse)
-  if visible then
-    history_body(project_receipts())
-    if ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows) and ImGui.IsKeyPressed(ctx, ImGui.Key_Escape) then
-      open = false
-    end
-    ImGui.End(ctx)
-  end
-  if not open then H.win, H.confirm = false, nil end
-end
-
--- composer chip, shown once this project has agent changes (or a history revert to redo)
-function M.changes_chip()
+-- one list for Agent settings > Studio: the newest 10 replies that changed this project, from the saved versions
+-- (kept after a restart) plus this session's receipts. Revert while the reply is in the undo history, else Open the copy
+local function version_rows()
   local list = project_receipts()
-  if #list == 0 and not H.last and #SV.list() == 0 then return end
-  ImGui.SameLine(ctx, 0, 2)
-  if P.chip('changes', 'Versions', C.muted, false) then H.win, H.confirm = not H.win, nil end
-  if ImGui.IsItemHovered(ctx) then
-    P.show_tip('What agents changed in this project: go back to before any reply, or open a saved version.')
+  local rec, seen, rows = {}, {}, {}
+  for _, r in ipairs(list) do rec[r.id] = r end
+  for _, e in ipairs(SV.list()) do
+    local turn = type(e.turn) == 'string' and e.turn or nil
+    if turn then seen[turn] = true end
+    rows[#rows + 1] = { key = 'v' .. tostring(e.file), at = tonumber(e.at) or 0, what = tostring(e.what or ''),
+      n = tonumber(e.n) or 0, r = turn and rec[turn], e = e }
   end
+  for _, r in ipairs(list) do
+    if not seen[r.id] then
+      local lines = type(r.lines) == 'table' and r.lines or {}
+      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = tostring(lines[1] or ''), n = tonumber(r.n) or 0, r = r }
+    end
+  end
+  table.sort(rows, function(x, y) return x.at > y.at end)
+  for i = #rows, 11, -1 do rows[i] = nil end
+  return rows, list
 end
 
 ---------------------------------------------------------------- panel hooks
@@ -906,16 +839,56 @@ function M.settings(A)
     ImGui.AlignTextToFramePadding(ctx)
     ImGui.Text(ctx, 'Version history')
     if ImGui.IsItemHovered(ctx) then
-      P.show_tip('Every agent reply that changed this project: go back to before any of them,\n'
-        .. 'or open a version saved after a reply (kept after a restart).')
+      P.show_tip('The last 10 agent replies that changed this project.\nRevert: back to before that reply (while REAPER '
+        .. 'still has its undo history). Open: the copy saved after it, in a new tab.')
     end
-    if right_btn('history', 'Open', false) then H.win, H.confirm = true, nil end
+    local rows, list = version_rows()
+    if H.last then
+      row()
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.TextColored(ctx, A.dim, 'Went back to before ' .. H.last.at)
+      if right_btn('redoall', 'Redo all', false) then redo_all() end
+    end
+    if #rows == 0 then
+      row()
+      ImGui.TextColored(ctx, A.dim, 'Nothing yet: replies that change this project show up here.')
+    end
+    local today = os.date('%Y%m%d')
+    for i, x in ipairs(rows) do
+      row()
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.TextColored(ctx, A.dim, os.date(os.date('%Y%m%d', x.at) == today and '%H:%M' or '%m-%d', x.at))
+      ImGui.SameLine(ctx, 0, 8)
+      local label = x.r and ((H.confirm == x.key) and 'Confirm' or 'Revert') or 'Open'
+      local bw = ImGui.CalcTextSize(ctx, label) + 16
+      local cx = ImGui.GetCursorScreenPos(ctx)
+      local summary = x.what .. (x.n > 1 and ('  +' .. (x.n - 1)) or '')
+      ImGui.Text(ctx, P.truncate(summary ~= '' and summary or plural(x.n, 'change'), x0 + w - bw - 8 - cx))
+      if ImGui.IsItemHovered(ctx) then
+        local lines = x.r and type(x.r.lines) == 'table' and table.concat(x.r.lines, '\n') or x.what
+        P.show_tip(os.date('%Y-%m-%d %H:%M', x.at) .. ' · ' .. plural(x.n, 'change') .. '\n' .. lines)
+      end
+      if right_btn('ver' .. i, label, H.last ~= nil and x.r ~= nil) then
+        if not x.r then SV.open(x.e)
+        elseif H.confirm ~= x.key then H.confirm = x.key
+        else revert_to_before(x.r, list); H.confirm = nil end
+      end
+      if H.confirm == x.key then
+        row()
+        local later = 0
+        for j = 1, i - 1 do if rows[j].r then later = later + 1 end end
+        ImGui.PushTextWrapPos(ctx, x0 + w)
+        ImGui.TextColored(ctx, C.warn, (later == 0 and 'Undoes this reply' or ('Undoes this and the ' .. plural(later, 'later reply')))
+          .. ', and your own edits since. Redo all brings them back.')
+        ImGui.PopTextWrapPos(ctx)
+      end
+    end
   end)
 end
 
 function M.exit() reaper.SetExtState(EXT, 'turn', '', false) end
 
 if MT.on then pcall(MT.ensure) end
-M._R, M._MT, M._RK, M._E, M._H, M._SV = R, MT, RK, E, H, SV -- headless tests
+M._R, M._MT, M._RK, M._E, M._H, M._SV, M._rows = R, MT, RK, E, H, SV, version_rows -- headless tests
 return M
 end

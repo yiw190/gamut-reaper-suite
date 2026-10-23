@@ -4121,7 +4121,6 @@ local function frame()
       ImGui.SameLine(ctx, 0, 2)
       context_chip()
       if studio then ImGui.SameLine(ctx, 0, 2); studio.ears_chip() end
-      if studio then studio.changes_chip() end
       local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or (studio and studio.hint())
         or (S.uploading and ('Uploading ' .. S.uploading .. (S.uploading == 1 and ' file…' or ' files…')))
         or 'Enter to send'
@@ -4142,7 +4141,6 @@ local function frame()
   end
   pm('end')
   cfg_window()
-  if studio then studio.windows() end
   pm('settings')
   ImGui.PopStyleVar(ctx, #VARS)
   ImGui.PopStyleColor(ctx, #COLORS)

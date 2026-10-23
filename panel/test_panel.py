@@ -1292,26 +1292,21 @@ def test_saved_versions():
     check("saved versions: once per reply", len(p.lua_list(p.lua.globals().SAVED)) == 1)
     lst = p.lua_list(p.m.studio._SV.list())
     check("saved versions: listed newest first", len(lst) == 1 and lst[0].turn == turn)
+    rows = p.lua_list(p.m.studio._rows()[0])
+    check("version list: one row per reply, with a Revert while the receipt is live",
+          len(rows) == 1 and rows[0].what == "#3 Pad: volume -3.0 dB" and rows[0].n == 2 and rows[0].r is not None)
+    st["Hibiki/receipts"] = json.dumps([])
+    st["Hibiki/receipts_seq"] = "s2"
+    p.m.studio.tick(3003)
+    rows = p.lua_list(p.m.studio._rows()[0])
+    check("version list: after a restart (no receipt) the saved copy is still listed, to Open",
+          len(rows) == 1 and rows[0].r is None and rows[0].e is not None)
     p.m.studio._SV.open(lst[0])
     opened = p.lua_list(p.lua.globals().OPENED)
     check("saved versions: opens in a new tab as <name>_restore_<stamp>.RPP next to the project, project untouched",
           p.lua_list(p.lua.globals().CMDS2) == [40859] and len(opened) == 2 and opened[1].startswith("noprompt:" + str(proj_dir / "Song_restore_"))
           and proj not in [x.replace("noprompt:", "") for x in opened], opened)
 
-
-def test_changes_window():
-    p = studio_panel()
-    p.lua.execute("UI = {}; RET.Begin = function() return true, true end")
-    p.m.studio.windows()
-    check("changes window: closed by default", not [c for c in p.lua_list(p.lua.globals().UI) if c.name == "Begin"])
-    p.m.studio._H.win = True
-    p.m.studio.windows()
-    begins = [c.args[2] for c in p.lua_list(p.lua.globals().UI) if c.name == "Begin"]
-    check("changes window: Settings > Open draws its own window, with the empty-state text",
-          begins == ["Version history##hibiki_changes"] and any(c.name == "TextColored" for c in p.lua_list(p.lua.globals().UI)), begins)
-    p.lua.execute("RET.Begin = function() return true, false end")
-    p.m.studio.windows()
-    check("changes window: its close box closes it", p.m.studio._H.win is False)
 
 def main():
     global OS_NAME

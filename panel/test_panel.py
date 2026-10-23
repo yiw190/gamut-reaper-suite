@@ -1087,7 +1087,7 @@ def test_receipts_turn_and_revert():
     # the bridge's view of that turn: two undo points, three changes; the user edits nothing afterwards
     p.lua.execute("UNDO = {'Edit: something old', 'Hibiki %s: #4 Pizz: add ReaEQ', 'Hibiki %s: #4 Pizz: ReaEQ Gain = 3 +1'}"
                   % (turn, turn))
-    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 3, "points": 2,
+    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 3, "points": 2, "proj": "",
                                          "lines": ["#4 Pizz: add ReaEQ", "#4 Pizz: ReaEQ Freq = 3k", "#4 Pizz: ReaEQ Gain = 3"]}])
     st["Hibiki/receipts_seq"] = "1"
     p.m.studio.tick(2000)

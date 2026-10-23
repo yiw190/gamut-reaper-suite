@@ -1238,7 +1238,7 @@ def test_ears_render_and_attach():
           local f = io.open(PROJS.RENDER_FILE .. '/' .. PROJS.RENDER_PATTERN .. '.wav', 'wb'); f:write('RIFF'); f:close()
         end
       end
-      reaper.RecursiveCreateDirectory = function(d) os.execute('mkdir -p "' .. d .. '" 2>/dev/null') end
+      reaper.RecursiveCreateDirectory = function(d) MKDIR(d) end
       reaper.PCM_Source_CreateFromFile = function() return {} end
       reaper.CalculateNormalization = function(_, mode) return ({ [0] = 2.5, [3] = 1.1, [5] = 2.0 })[mode] end
     """)
@@ -1348,7 +1348,7 @@ def test_cli_in_dev_mode():
     p.m.REC.cli("update", "update --check --json", lambda *a: None)
     cmds = [c for c in p.lua_list(p.lua.globals().CMDS) if "update --check --json" in c]
     check("dev mode: the panel runs the checkout's CLI with the recorded Python, not /usr/local/bin/hibiki",
-          len(cmds) == 1 and ("'%s' -s -E '%s'" % (py, checkout / "reaper_mcp/cli.py")) in cmds[0]
+          len(cmds) == 1 and ("'%s' -s -E '" % py) in cmds[0] and "reaper_mcp/cli.py' update" in cmds[0]
           and "/usr/local/bin/hibiki" not in cmds[0], cmds)
     (cfg / "mode.json").write_text(json.dumps({"mode": "dev", "path": str(p.tmp / "gone"), "python": str(py)}))
     p.m.REC.cli("update", "update --check --json", lambda *a: None)

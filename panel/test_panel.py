@@ -1112,9 +1112,9 @@ def test_receipts_turn_and_revert():
     cards[0].draw()
     check("receipts: a user edit on top blocks the revert", len(p.lua_list(p.lua.globals().UNDO)) == 4
           and p.m.studio._R.state[turn].blocked == "Move items")
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Dismiss') ~= nil end")
+    p.lua.execute("RET.Button = function(_, label) return label:find('^Accept') ~= nil end")
     cards[0].draw()
-    check("receipts: Dismiss hides it", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+    check("receipts: Accept keeps the changes and hides the card", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
     st["Hibiki/receipts"] = json.dumps([{"id": "mcp-1", "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
                                          "lines": ["#1 Bass: mute"]}])
     st["Hibiki/receipts_seq"] = "2"

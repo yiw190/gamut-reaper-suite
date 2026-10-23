@@ -116,6 +116,8 @@ local function receipt_card(r)
       P.wrapped(('%s from earlier in the reply sit under your own edits and stayed.'):format(plural(st.partial, 'step')), C.warn)
     end
     if P.primary('Redo##rcpt') then redo(r) end
+    ImGui.SameLine(ctx)
+    if ImGui.Button(ctx, 'Close##rcpt') then R.gone[r.id] = true end
   else
     local who = r.id:match('^mcp%-') and 'An agent' or 'This reply'
     ImGui.Text(ctx, P.truncate(('%s changed %s in REAPER'):format(who, plural(n, 'thing')), w))
@@ -124,6 +126,9 @@ local function receipt_card(r)
       ImGui.TextColored(ctx, C.muted, ('+%d more'):format(n - math.min(3, #lines)))
       if ImGui.IsItemHovered(ctx) then P.show_tip(table.concat(lines, '\n')) end
     end
+    if ImGui.Button(ctx, 'Accept##rcpt') then R.gone[r.id] = true end
+    if ImGui.IsItemHovered(ctx) then P.show_tip('Keep these changes and close the card.') end
+    ImGui.SameLine(ctx)
     if P.primary('Revert##rcpt') then revert(r) end
     if ImGui.IsItemHovered(ctx) then P.show_tip('Undo exactly what this reply changed (Edit > Undo history shows each step).') end
     if st.blocked then
@@ -132,8 +137,6 @@ local function receipt_card(r)
       P.wrapped('Nothing to redo: something else was changed after the revert.', C.warn)
     end
   end
-  ImGui.SameLine(ctx)
-  if ImGui.Button(ctx, 'Dismiss##rcpt') then R.gone[r.id] = true end
 end
 
 ---------------------------------------------------------------- meter

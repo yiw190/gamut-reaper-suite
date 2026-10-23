@@ -217,7 +217,7 @@ while a composition is open and shows the pending pinyin under the input.
 - **Revert a reply.** The bridge runs every request that can change the project in one undo block labelled
   `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
   the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
-  **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
+  **Accept** (keep them, close the card) and **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
   undone (it says so and stops instead). **Redo** puts them back. Changes made outside the panel (the Gamut app, a
   CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame

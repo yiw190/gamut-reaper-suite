@@ -2794,7 +2794,7 @@ local function cfg_window()
   local function pick(id, value) S.cfg_sel[id] = value; cfg_save() end
   local agent
   for _, a in ipairs(S.agents) do if a.slug == S.agent then agent = a end end
-  local at = S.cfgwin_pos or (S.panel_rect and { S.panel_rect[1] - 12, S.panel_rect[2] + S.panel_rect[4] - 60 })
+  local at = S.cfgwin_pos or (S.panel_rect and { S.panel_rect[1], S.panel_rect[2] }) -- top right, flush with the panel's left edge
 
   local cols = {
     { ImGui.Col_WindowBg, C.win }, { ImGui.Col_TitleBg, C.win_title }, { ImGui.Col_TitleBgActive, C.win_title },
@@ -2814,7 +2814,7 @@ local function cfg_window()
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_ItemSpacing, 5, 4)
   ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameRounding, 3)
   ImGui.PushFont(ctx, F.reg, SMALL)
-  if at then ImGui.SetNextWindowPos(ctx, at[1], at[2], ImGui.Cond_Appearing, 1, 1) end
+  if at then ImGui.SetNextWindowPos(ctx, at[1], at[2], ImGui.Cond_Appearing, 1, 0) end
   local name = S.agent_name ~= '' and S.agent_name or S.agent
   local visible, open = ImGui.Begin(ctx, 'Agent settings###hibiki_cfg', true,
     ImGui.WindowFlags_NoCollapse | ImGui.WindowFlags_AlwaysAutoResize | ImGui.WindowFlags_NoTitleBar

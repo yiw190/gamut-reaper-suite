@@ -130,16 +130,15 @@ end
 -- undo
 reaper.Undo_BeginBlock = function() hit("Undo_BeginBlock") end
 reaper.Undo_EndBlock = function() hit("Undo_EndBlock") end
--- like REAPER: an EndBlock that saw no change leaves no undo point and doesn't tick the state counter
+-- like REAPER: an EndBlock that saw no change leaves no undo point, but ticks the state counter all the same
 undo_labels, state_changes, fake_changed = {}, 0, false
 reaper.Undo_BeginBlock2 = function() hit("Undo_BeginBlock2") fake_changed = false end
 reaper.Undo_EndBlock2 = function(_, label)
   hit("Undo_EndBlock2")
-  if fake_changed then
-    undo_labels[#undo_labels + 1] = label
-    state_changes = state_changes + 1
-  end
+  state_changes = state_changes + 1
+  if fake_changed then undo_labels[#undo_labels + 1] = label end
 end
+reaper.Undo_CanUndo2 = function() return undo_labels[#undo_labels] end
 reaper.GetProjectStateChangeCount = function() return state_changes end
 reaper.MarkTrackItemsDirty = function() hit("MarkTrackItemsDirty") end
 reaper.GetMediaItem_Track = function(it) return it.track end

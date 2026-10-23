@@ -1717,7 +1717,7 @@ dispatch = function(req)
 end
 
 -- one undo block per request that can change something; its changes go on the turn's receipt. An empty block
--- leaves no undo point (and no state-change tick), which is how a read-only run_lua stays off the receipt
+-- leaves no undo point, which is how a read-only run_lua stays off the receipt
 local function run_request(req)
   local func = req.func
   if func ~= "run_lua" and not receipt_wanted(func) and func ~= "batch" then return dispatch(req) end
@@ -1730,9 +1730,12 @@ local function run_request(req)
   if func == "run_lua" then note_change("script: " .. first_line(req.code), ok and type(resp) == "table" and resp.ok ~= false) end
   local first = staged[1] and staged[1].what or func
   local label = "Hibiki " .. turn .. ": " .. short(first, 70) .. (#staged > 1 and (" +" .. (#staged - 1)) or "")
-  local before = reaper.GetProjectStateChangeCount(0)
+  -- EndBlock ticks the state-change counter even when it makes no undo point, so a new point is told apart by
+  -- the top of the undo list changing; the label is made to differ from the top it would replace
+  local top = reaper.Undo_CanUndo2(0)
+  while label == top do label = label .. "·" end
   reaper.Undo_EndBlock2(0, label, -1)
-  if reaper.GetProjectStateChangeCount(0) ~= before then
+  if reaper.Undo_CanUndo2(0) ~= top then
     if #staged == 0 then note_change(func) end
     commit_receipt(turn)
   end

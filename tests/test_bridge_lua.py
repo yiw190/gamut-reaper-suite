@@ -308,6 +308,12 @@ def main() -> None:
     rec = json.loads(g.ext_state["Hibiki/receipts"])
     check("changing run_lua: receipt line with the script's first line",
           rec[-1]["n"] == 4 and rec[-1]["lines"][3] == "script: reaper.InsertTrackAtIndex(0, true)", rec)
+    lua.execute("reaper.InsertTrackAtIndex(0, true)")  # same script again: same label as the top, still a new point
+    r = rpc("run_lua", code="reaper.InsertTrackAtIndex(0, true)\nreturn 1")
+    labels = list(g.undo_labels.values())
+    check("a repeated label still counts as a new undo point", labels[-1] == labels[-2] + "·"
+          and json.loads(g.ext_state["Hibiki/receipts"])[-1]["points"] == 4, labels[-2:])
+    rpc("delete_track", [0])
     rpc("delete_track", [0])
     g.ext_state["Hibiki/turn"] = "k1.4"
     rpc("update_track", [0, {"pan": 0.5}])

@@ -91,7 +91,8 @@ begin
   begin
     Log := ExpandConstant('{localappdata}\Hibiki\logs\install.log');
     ForceDirectories(ExtractFileDir(Log));
-    if not Exec(ExpandConstant('{cmd}'), '/C ""' + ExpandConstant('{app}\python\python.exe') + '" -s -E "' +
+    { HIBIKI_USE_RELEASE: a fresh install leaves `hibiki use dev` and sets everything up from the package }
+    if not Exec(ExpandConstant('{cmd}'), '/C "set HIBIKI_USE_RELEASE=1&& "' + ExpandConstant('{app}\python\python.exe') + '" -s -E "' +
         ExpandConstant('{app}\app\reaper_mcp\cli.py') + '" setup > "' + Log + '" 2>&1"', '', SW_HIDE,
         ewWaitUntilTerminated, Rc) or (Rc <> 0) then
       SuppressibleMsgBox('Hibiki setup did not finish (exit code ' + IntToStr(Rc) + '). Details: ' + Log, mbError, MB_OK, IDOK);

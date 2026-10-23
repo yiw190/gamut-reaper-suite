@@ -364,6 +364,8 @@ def install_cli_shim(p: Paths) -> None:
     """Source checkouts get a ~/.local/bin/hibiki launcher (the pkg links /usr/local/bin/hibiki); the panel's Recover runs it."""
     if WINDOWS or PKG_ROOT in ROOT.parents or ROOT == PKG_ROOT:
         return
+    if os.environ.get("HIBIKI_NO_SHIM") or read_mode(p).get("mode") == "dev":
+        return
     shim = p.home / ".local/bin/hibiki"
     body = '#!/bin/sh\nexec %s -s -E %s "$@"\n' % (shlex.quote(sys.executable), shlex.quote(str(ROOT / "reaper_mcp/cli.py")))
     if shim.exists() and not shim.is_symlink() and shim.read_text() == body:
@@ -837,6 +839,221 @@ def agents_add(p: Paths, slugs: list, restart: bool = True) -> None:
     say("  added %s; they show up in the panel's agent picker" % ", ".join(slugs))
 
 
+# ---------- dev mode: `hibiki use dev|release` ----------
+
+CHECKOUT_FILES = ("reaper_mcp/cli.py", "reaper_mcp/bridge.lua", "panel/Hibiki.lua", "gateway/agent_gateway.py")
+
+
+def mode_file(p: Paths) -> Path:
+    return p.cfg / "mode.json"
+
+
+def read_mode(p: Paths) -> dict:
+    return load_json(mode_file(p))
+
+
+def clear_mode(p: Paths) -> bool:
+    try:
+        mode_file(p).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def pkg_root() -> Path:
+    if WINDOWS:
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData/Local") / "Programs/Hibiki"
+    return PKG_ROOT
+
+
+def pkg_python() -> Path:
+    return pkg_root() / ("python/python.exe" if WINDOWS else "python/bin/python3")
+
+
+def pkg_cli() -> Path:
+    return pkg_root() / "app/reaper_mcp/cli.py"
+
+
+def pkg_version() -> str:
+    try:
+        return (pkg_root() / "VERSION").read_text().strip()
+    except OSError:
+        return ""
+
+
+def git_state(path: Path) -> tuple:
+    def git(*args: str) -> str:
+        r = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            raise OSError(r.stderr.strip())
+        return r.stdout or ""
+    try:
+        return git("rev-parse", "--short", "HEAD").strip(), bool(git("status", "--porcelain").strip())
+    except (OSError, subprocess.SubprocessError, AttributeError):
+        return "", False
+
+
+def remove_cli_shim(p: Paths) -> bool:
+    shim = p.home / ".local/bin/hibiki"
+    try:
+        body = shim.read_text() if shim.is_file() and not shim.is_symlink() else ""
+    except OSError:
+        return False
+    if WINDOWS or not body.startswith("#!/bin/sh\nexec ") or "reaper_mcp/cli.py" not in body:
+        return False
+    shim.unlink()
+    say("  removed %s (the installed `hibiki` follows the mode now)" % shim)
+    return True
+
+
+def mode_info(p: Paths) -> dict:
+    m = read_mode(p)
+    if m.get("mode") == "dev" and m.get("path"):
+        path = Path(m["path"])
+        ok = all((path / f).is_file() for f in CHECKOUT_FILES)
+        commit, dirty = git_state(path) if ok else (m.get("commit", ""), bool(m.get("dirty")))
+        return {"mode": "dev", "path": str(path), "commit": commit or m.get("commit") or "", "dirty": dirty,
+                "python": m.get("python") or "", "at": m.get("at") or "", "missing": not ok,
+                "version": checkout_version(path) if ok else ""}
+    have = pkg_cli().is_file()
+    return {"mode": "release", "path": str(pkg_root()) if have else None, "version": pkg_version() if have else None,
+            "python": str(pkg_python()) if have else None, "installed": have}
+
+
+def checkout_version(path: Path) -> str:
+    try:
+        m = re.search(r'__version__\s*=\s*"([^"]+)"', (path / "reaper_mcp/__init__.py").read_text())
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
+
+
+def mode_line(info: dict) -> str:
+    if info["mode"] == "dev":
+        return "dev %s @ %s%s%s" % (info["path"], info["commit"] or "?", " +dirty" if info["dirty"] else "",
+                                    " (MISSING)" if info["missing"] else "")
+    if not info.get("installed"):
+        return "release (no installed package; running %s from %s)" % (__version__, ROOT)
+    return "release %s" % info["version"]
+
+
+def forward(argv: list):
+    """Called by cli.main before anything else. Returns None to run here, else an exit code (Windows); on macOS a
+    forward replaces this process."""
+    p = Paths()
+    if os.environ.get("HIBIKI_USE_RELEASE"):
+        if clear_mode(p):
+            print("hibiki: dev mode off (fresh install)", file=sys.stderr)
+        return None
+    if os.environ.get("HIBIKI_FORWARDED") or (argv[:1] == ["use"]):
+        return None
+    m = read_mode(p)
+    if m.get("mode") != "dev" or not m.get("path"):
+        return None
+    path = Path(m["path"])
+    try:
+        if path.resolve() == ROOT:
+            return None
+    except OSError:
+        pass
+    cli = path / "reaper_mcp/cli.py"
+    py = m.get("python") or sys.executable
+    if not cli.is_file() or not Path(py).exists():
+        print("hibiki: dev mode points at %s (python %s), which is gone; running the installed release instead. "
+              "`hibiki use release` makes that permanent." % (path, py), file=sys.stderr)
+        return None
+    os.environ["HIBIKI_FORWARDED"] = "1"
+    args = [py, "-s", "-E", str(cli), *argv]
+    if WINDOWS:
+        return subprocess.call(args)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(py, args)
+    return None
+
+
+def run_setup(py: str, cli: Path, a, extra_env: dict) -> int:
+    cmd = [py, "-s", "-E", str(cli), "setup"]
+    if getattr(a, "resource_path", None):
+        cmd += ["--resource-path", a.resource_path]
+    env = dict(os.environ, HIBIKI_FORWARDED="1", **extra_env)
+    env.pop("HIBIKI_USE_RELEASE", None)
+    say("$ " + " ".join(shlex.quote(c) for c in cmd))
+    return subprocess.run(cmd, env=env).returncode
+
+
+def cmd_use(a) -> int:
+    p = Paths(getattr(a, "resource_path", None))
+    target = a.target or "status"
+    if target == "dev":
+        return use_dev(p, a)
+    if target == "release":
+        return use_release(p, a)
+    info = mode_info(p)
+    if a.json:
+        print(json.dumps(info))
+        return 0
+    say("mode:    " + info["mode"])
+    if info["mode"] == "dev":
+        say("path:    %s%s" % (info["path"], "  (MISSING: the installed release runs instead)" if info["missing"] else ""))
+        say("commit:  %s%s" % (info["commit"] or "?", " +dirty" if info["dirty"] else ""))
+        say("version: %s" % (info["version"] or "?"))
+        say("since:   %s" % (info["at"] or "?"))
+    else:
+        say("path:    %s" % (info["path"] or "no installed package; running %s" % ROOT))
+        say("version: %s" % (info["version"] or __version__))
+    say("python:  %s" % (info["python"] or sys.executable))
+    return 0
+
+
+def use_dev(p: Paths, a) -> int:
+    path = Path(a.path or Path.home() / "reaper-mcp").expanduser().resolve()
+    missing = [f for f in CHECKOUT_FILES if not (path / f).is_file()]
+    if missing:
+        say("error: %s is not a Hibiki checkout (missing %s)" % (path, ", ".join(missing)))
+        return 2
+    if pkg_root().exists() and path == pkg_root().resolve() / "app":
+        say("error: %s is the installed package; use `hibiki use release`" % path)
+        return 2
+    py = str(pkg_python()) if pkg_python().exists() else sys.executable
+    commit, dirty = git_state(path)
+    write_json(mode_file(p), {"mode": "dev", "path": str(path), "python": py, "commit": commit, "dirty": dirty,
+                              "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    remove_cli_shim(p)
+    say("dev mode: %s @ %s%s (python %s)" % (path, commit or "?", " +dirty" if dirty else "", py))
+    rc = run_setup(py, path / "reaper_mcp/cli.py", a, {"HIBIKI_NO_SHIM": "1"})
+    say("")
+    if rc != 0:
+        say("setup from the checkout failed (exit %d); still in dev mode. `hibiki use release` goes back." % rc)
+        return rc
+    say("dev: %s @ %s%s" % (path, commit or "?", " +dirty" if dirty else ""))
+    say("The MCP and the gateway now run from the checkout, and every `hibiki` command (the panel's Recover and "
+        "update too) runs its code.")
+    say("REAPER still has the old bridge and panel loaded: restart REAPER to load the checkout's copies "
+        "(`hibiki recover` does not reload them).")
+    return 0
+
+
+def use_release(p: Paths, a) -> int:
+    py, cli = pkg_python(), pkg_cli()
+    if not (py.exists() and cli.is_file()):
+        say("error: no installed package; install Hibiki first (%s)" % pkg_root())
+        return 1
+    was = read_mode(p)
+    clear_mode(p)
+    remove_cli_shim(p)
+    if was.get("mode") == "dev":
+        say("dev mode off (was %s)" % was.get("path"))
+    rc = run_setup(str(py), cli, a, {})
+    say("")
+    if rc != 0:
+        say("setup from the installed package failed (exit %d)" % rc)
+        return rc
+    say("release: %s at %s" % (pkg_version() or "?", pkg_root()))
+    say("Restart REAPER to load the installed bridge and panel.")
+    return 0
+
+
 # ---------- commands ----------
 
 def cmd_setup(a) -> int:
@@ -904,6 +1121,9 @@ def cmd_doctor(a) -> int:
     def row(level: str, name: str, detail: str) -> None:
         rows.append({"level": level, "check": name, "detail": detail})
 
+    info = mode_info(p)
+    row("warn" if info["mode"] == "dev" and (info["dirty"] or info["missing"]) else "ok", "mode", mode_line(info)
+        + (" - `hibiki use release`" if info["mode"] == "dev" and info["missing"] else ""))
     row("ok", "suite", "%s at %s, python %s" % (__version__, ROOT, sys.executable))
     app = reaper_app(p)
     row("ok" if app else "FAIL", "REAPER", str(app) if app else "not installed - get it from " + REAPER_DOWNLOAD)
@@ -1031,6 +1251,8 @@ def cmd_uninstall(a) -> int:
             if stop_agent(p, label, delete=True):
                 say("removed LaunchAgent " + label)
     remove_startup(p)
+    if clear_mode(p):
+        say("dev mode off")
     for f in (p.scripts / "reaper_mcp_bridge.lua", p.scripts / "reaper_mcp_bridge.lua.bak",
               p.scripts / "reaper_mcp_bridge.lua.new"):
         if f.exists():
@@ -1489,6 +1711,8 @@ def cmd_update(a) -> int:
     out = {"current": __version__, "channel": channel, "latest": None, "tag": None, "url": None, "published": None,
            "update_available": False, "notes": ""}
     try:
+        if a.install and read_mode(Paths()).get("mode") == "dev":
+            raise UpdateError("in dev mode (%s); run `hibiki use release` first" % read_mode(Paths()).get("path"))
         if a.install and not packaged():
             raise UpdateError("running from a source checkout; install the package instead")
         rel = pick_release(fetch_releases(), channel)
@@ -1580,6 +1804,13 @@ def parser() -> argparse.ArgumentParser:
     up.add_argument("--force", action="store_true", help="--install even when already up to date")
     up.add_argument("--json", action="store_true")
     up.set_defaults(fn=cmd_update)
+    us = sub.add_parser("use", help="switch the whole install to a git checkout (dev) or back to the installed "
+                                     "package (release); no argument or `status` shows the current mode")
+    us.add_argument("target", nargs="?", choices=["dev", "release", "status"])
+    us.add_argument("--path", help="dev: the checkout (default ~/reaper-mcp)")
+    us.add_argument("--resource-path")
+    us.add_argument("--json", action="store_true")
+    us.set_defaults(fn=cmd_use)
     r = sub.add_parser("run", help=argparse.SUPPRESS)  # the Windows supervisor (started by setup and at logon)
     r.add_argument("--port", type=int, default=port())
     r.set_defaults(fn=cmd_run)

@@ -63,7 +63,15 @@ hibiki start                          # turn them back on (setup does too)
 hibiki update                         # newer release on GitHub? (--channel stable|dev, --json; dev builds default to dev)
 hibiki update --install               # download it, verify its sha256, open the installer (you finish it); source clones: git pull
 hibiki uninstall [--purge]            # --purge also deletes tokens and gateway config
+hibiki use dev [--path ~/reaper-mcp]  # testing unreleased code: run everything from a git checkout (no admin)
+hibiki use release                    # back to the installed package
+hibiki use [status] [--json]          # which one is live: release version, or checkout path @ commit
 ```
+
+`hibiki use dev` records the checkout in `~/.config/reaper-mcp/mode.json` and runs the checkout's `setup` with the
+package's Python, so the LaunchAgents, the bridge and the panel come from the checkout; every `hibiki` command
+(including the panel's Recover and update) then runs the checkout's code. Restart REAPER to load the new bridge and
+panel. `hibiki update --install` refuses in dev mode, and installing a package switches back to release.
 
 From a clone instead (the LaunchAgents then run from the clone, so keep it; re-run after `git pull`):
 

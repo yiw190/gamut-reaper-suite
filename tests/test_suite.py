@@ -273,6 +273,7 @@ def main():
     check_recover(check, suite)
     check_stop_start(check, suite)
     check_update(check, suite)
+    check_use(check, suite)
 
     httpd.shutdown()
     if failures:
@@ -607,6 +608,166 @@ def check_update(check, suite):
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+def check_use(check, suite):
+    """`hibiki use dev|release|status` and the forwarding in cli.main, with a fake package and no real setup."""
+    import contextlib
+    import io
+    from reaper_mcp import cli
+    home = Path(tempfile.mkdtemp(prefix="hb_use_"))
+    pkg = home / "pkg"
+    (pkg / "python/bin").mkdir(parents=True)
+    (pkg / "python/bin/python3").write_text("")
+    (pkg / "app/reaper_mcp").mkdir(parents=True)
+    (pkg / "app/reaper_mcp/cli.py").write_text("")
+    (pkg / "VERSION").write_text("0.5.0\n")
+    co = home / "reaper-mcp"
+    for rel in suite.CHECKOUT_FILES + ("reaper_mcp/__init__.py",):
+        (co / rel).parent.mkdir(parents=True, exist_ok=True)
+        (co / rel).write_text('__version__ = "9.9.9-dev.1"\n' if rel.endswith("__init__.py") else "")
+    shim_ = home / ".local/bin/hibiki"
+    shim_.parent.mkdir(parents=True)
+    shim_.write_text('#!/bin/sh\nexec /usr/bin/python3 -s -E /x/reaper_mcp/cli.py "$@"\n')
+    mode = home / ".config/reaper-mcp/mode.json"
+    calls, execs = [], []
+
+    class Done(Exception):
+        pass
+
+    def fake_run(cmd, **kw):
+        calls.append((list(cmd), kw))
+        if cmd[0] == "git":
+            out = "abc1234\n" if "rev-parse" in cmd else " M panel/Hibiki.lua\n"
+            return subprocess.CompletedProcess(cmd, 0, out, "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    def fake_execv(py, args):
+        execs.append((py, list(args), os.environ.get("HIBIKI_FORWARDED")))
+        raise Done()
+
+    saved = {k: getattr(suite, k) for k in ("PKG_ROOT", "ROOT")}
+    saved_run, saved_execv = suite.subprocess.run, os.execv
+    env_keys = ("HOME", "HIBIKI_FORWARDED", "HIBIKI_USE_RELEASE", "HIBIKI_NO_SHIM")
+    env_saved = {k: os.environ.get(k) for k in env_keys}
+    for k in env_keys[1:]:
+        os.environ.pop(k, None)
+    os.environ["HOME"] = str(home)
+    suite.PKG_ROOT, suite.subprocess.run, os.execv = pkg, fake_run, fake_execv
+
+    def call(fn, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = fn(list(argv))
+            except Done:
+                rc = "exec"
+        return rc, out.getvalue() + err.getvalue()
+
+    try:
+        rc, out = call(suite.main, "use", "dev", "--path", str(home / "nope"))
+        check("use dev: a folder that isn't a checkout is refused, mode unchanged", rc == 2 and not mode.exists(), out)
+
+        rc, out = call(suite.main, "use", "dev", "--path", str(co))
+        m = json.loads(mode.read_text()) if mode.exists() else {}
+        setup = [c for c in calls if c[0][0] != "git"]
+        check("use dev: mode.json records the checkout, the package python and the commit",
+              rc == 0 and m.get("mode") == "dev" and m.get("path") == str(co.resolve()) and m.get("commit") == "abc1234"
+              and m.get("dirty") is True and m.get("python") == str(pkg / "python/bin/python3") and m.get("at"), out)
+        check("use dev: runs the checkout's setup with the package python, forwarded and without a shim",
+              len(setup) == 1 and setup[0][0] == [str(pkg / "python/bin/python3"), "-s", "-E",
+                                                  str(co.resolve() / "reaper_mcp/cli.py"), "setup"]
+              and setup[0][1]["env"].get("HIBIKI_FORWARDED") == "1" and setup[0][1]["env"].get("HIBIKI_NO_SHIM") == "1",
+              str(setup))
+        check("use dev: old ~/.local/bin/hibiki shim removed", not shim_.exists(), out)
+        check("use dev: summary names the commit and says REAPER needs a restart",
+              "abc1234 +dirty" in out and "restart REAPER" in out, out)
+
+        rc, out = call(suite.main, "use", "--json")
+        st = json.loads(out) if out.startswith("{") else {}
+        check("use --json: dev, path, commit, version, python",
+              rc == 0 and st.get("mode") == "dev" and st.get("commit") == "abc1234" and st.get("version") == "9.9.9-dev.1"
+              and st.get("python") == str(pkg / "python/bin/python3") and st.get("missing") is False, out)
+
+        suite.ROOT = pkg / "app"
+        rc, out = call(cli.main, "doctor", "--json")
+        check("forward: the package's `hibiki doctor` execs the checkout's cli.py with the recorded python",
+              rc == "exec" and execs == [(str(pkg / "python/bin/python3"), [str(pkg / "python/bin/python3"), "-s", "-E",
+                                         str(co.resolve() / "reaper_mcp/cli.py"), "doctor", "--json"], "1")], str(execs))
+        os.environ.pop("HIBIKI_FORWARDED", None)
+        execs.clear()
+        rc, out = call(cli.main, "use", "--json")
+        check("forward: `use` always runs where it was called", rc == 0 and not execs and '"mode": "dev"' in out, out)
+        os.environ["HIBIKI_FORWARDED"] = "1"
+        check("forward: not again once forwarded", suite.forward(["doctor"]) is None and not execs)
+        os.environ.pop("HIBIKI_FORWARDED")
+        suite.ROOT = co.resolve()
+        check("forward: not when already running from the checkout", suite.forward(["doctor"]) is None and not execs)
+        suite.ROOT = pkg / "app"
+
+        m["path"] = str(home / "gone")
+        mode.write_text(json.dumps(m))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            r = suite.forward(["recover"])
+        check("forward: a vanished checkout warns and falls back to the installed release",
+              r is None and not execs and "gone" in err.getvalue() and "use release" in err.getvalue(), err.getvalue())
+
+        os.environ["HIBIKI_USE_RELEASE"] = "1"
+        with contextlib.redirect_stderr(io.StringIO()):
+            r = suite.forward(["setup"])
+        check("HIBIKI_USE_RELEASE (fresh install): dev mode cleared, setup runs from the package",
+              r is None and not mode.exists() and not execs)
+        os.environ.pop("HIBIKI_USE_RELEASE")
+
+        mode.write_text(json.dumps(dict(m, path=str(co.resolve()))))
+        rc, out = call(suite.main, "update", "--install", "--json")
+        j = json.loads(out) if out.startswith("{") else {}
+        check("update --install in dev mode: refused, points at `use release`",
+              rc == 1 and "dev mode" in j.get("error", "") and "hibiki use release" in j.get("error", ""), out)
+
+        calls.clear()
+        shim_.write_text('#!/bin/sh\nexec /usr/bin/python3 -s -E /x/reaper_mcp/cli.py "$@"\n')
+        rc, out = call(suite.main, "use", "release")
+        setup = [c for c in calls if c[0][0] != "git"]
+        check("use release: mode.json gone, the package's setup runs (forwarded flag set), shim removed",
+              rc == 0 and not mode.exists() and len(setup) == 1
+              and setup[0][0] == [str(pkg / "python/bin/python3"), "-s", "-E", str(pkg / "app/reaper_mcp/cli.py"), "setup"]
+              and setup[0][1]["env"].get("HIBIKI_FORWARDED") == "1" and "HIBIKI_NO_SHIM" not in setup[0][1]["env"]
+              and not shim_.exists() and "release: 0.5.0" in out, out + str(setup))
+        rc, out = call(suite.main, "use")
+        check("use (status): release with the package version", rc == 0 and "mode:    release" in out and "0.5.0" in out, out)
+
+        suite.PKG_ROOT = home / "no-pkg"
+        calls.clear()
+        rc, out = call(suite.main, "use", "release")
+        check("use release without a package: error, nothing run",
+              rc == 1 and "no installed package; install Hibiki first" in out and not calls, out)
+    finally:
+        for k, v in saved.items():
+            setattr(suite, k, v)
+        suite.subprocess.run, os.execv = saved_run, saved_execv
+        for k, v in env_saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    dev_home = Path(tempfile.mkdtemp(prefix="hb_usedoc_"))
+    (dev_home / ".config/reaper-mcp").mkdir(parents=True)
+    rc, out = run(dev_home, "doctor", "--json")
+    rows = json.loads(out[out.index("["):]) if "[" in out else []
+    check("doctor: first row is the mode (release)", rows and rows[0]["check"] == "mode"
+          and rows[0]["detail"].startswith("release"), out)
+    (dev_home / ".config/reaper-mcp/mode.json").write_text(json.dumps(
+        {"mode": "dev", "path": str(ROOT), "python": sys.executable}))
+    rc, out = run(dev_home, "doctor", "--json")
+    rows = json.loads(out[out.index("["):]) if "[" in out else []
+    check("doctor: first row is the mode (dev <checkout> @ <commit>)", rows and rows[0]["check"] == "mode"
+          and rows[0]["detail"].startswith("dev %s @ " % ROOT), out)
+    (dev_home / "Applications/REAPER.app").mkdir(parents=True)
+    rc, out = run(dev_home, "setup", "--no-connect", "--no-reaimgui")
+    check("setup in dev mode writes no ~/.local/bin/hibiki shim", not (dev_home / ".local/bin/hibiki").exists(), out)
 
 
 def main_windows():

@@ -6,20 +6,27 @@ import sys
 if not __package__:  # run by path (the .pkg's bin/hibiki): make the package importable
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "recover", "stop", "start", "update", "uninstall", "run"}  # run = the Windows supervisor
-USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | recover | stop | start | update | uninstall]
+SUITE = {"setup", "doctor", "connect", "watchdog", "agents", "recover", "stop", "start", "update", "uninstall", "use", "run"}  # run = the Windows supervisor
+USAGE = """usage: reaper-mcp [serve | http | install-bridge | version | setup | doctor | connect | watchdog | agents | recover | stop | start | update | uninstall | use]
 
   serve            stdio MCP server (the default when stdin isn't a terminal)
   http             bearer-protected HTTP front on 127.0.0.1:$REAPER_MCP_PORT (default 8787)
   install-bridge   copy the Lua bridge into REAPER's Scripts folder
   version          print the version
   setup ...        macOS / Windows: install / upgrade the whole suite for this user (see `setup -h`)
+  use dev|release  run the whole install from a git checkout, or back from the installed package
 """
 
 
 def main(argv: list | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     cmd = argv[0] if argv else ""
+    mode = os.path.join(os.path.expanduser("~"), ".config", "reaper-mcp", "mode.json")
+    if os.environ.get("HIBIKI_USE_RELEASE") or os.path.exists(mode):
+        from reaper_mcp.suite import forward
+        rc = forward(argv)
+        if rc is not None:
+            return rc
     if cmd in SUITE:
         from reaper_mcp.suite import main as suite
         return suite(argv)

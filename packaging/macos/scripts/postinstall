@@ -20,9 +20,10 @@ case "$USER_NAME" in
 esac
 USER_ID=$(id -u "$USER_NAME")
 echo "setup for $USER_NAME ($USER_ID); log: ~$USER_NAME/Library/Logs/hibiki-install.log"
-# root never creates, writes or chowns anything in the user's home: the user-side shell opens its own log
+# root never creates, writes or chowns anything in the user's home: the user-side shell opens its own log.
+# HIBIKI_USE_RELEASE: a fresh install leaves `hibiki use dev` and sets everything up from the package
 launchctl asuser "$USER_ID" sudo -u "$USER_NAME" -H /bin/sh -c \
-  'mkdir -p "$HOME/Library/Logs" && exec "$1" setup > "$HOME/Library/Logs/hibiki-install.log" 2>&1' \
+  'mkdir -p "$HOME/Library/Logs" && export HIBIKI_USE_RELEASE=1 && exec "$1" setup > "$HOME/Library/Logs/hibiki-install.log" 2>&1' \
   sh "$APP/bin/hibiki"
 rc=$?
 echo "setup exit $rc"

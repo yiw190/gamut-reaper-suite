@@ -286,7 +286,8 @@ def main() -> None:
     check("undo point carries the turn id and what changed",
           labels and labels[-1].startswith("Hibiki k1.3: #1 ") and "volume -2.0 dB" in labels[-1], labels)
     rec = json.loads(g.ext_state["Hibiki/receipts"])
-    check("receipt for the turn", rec[-1]["id"] == "k1.3" and rec[-1]["n"] == 1
+    check("receipt for the turn, with its project", rec[-1]["id"] == "k1.3" and rec[-1]["n"] == 1
+          and "proj" in rec[-1]
           and "volume -2.0 dB" in rec[-1]["lines"][0], rec)
     r = rpc("batch", [[
         {"func": "update_track", "args": [0, {"mute": True}]},

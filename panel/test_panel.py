@@ -1115,6 +1115,12 @@ def test_receipts_turn_and_revert():
     p.lua.execute("RET.Button = function(_, label) return label:find('^Dismiss') ~= nil end")
     cards[0].draw()
     check("receipts: Dismiss hides it", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+    st["Hibiki/receipts"] = json.dumps([{"id": "mcp-1", "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
+                                         "lines": ["#1 Bass: mute"]}])
+    st["Hibiki/receipts_seq"] = "2"
+    p.m.studio.tick(2002)
+    check("receipts: a receipt from another project tab is not shown here",
+          not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
 
 
 def test_meter_context():

@@ -1625,9 +1625,11 @@ local function current_turn()
 end
 
 local function commit_receipt(turn)
+  local _, proj = reaper.EnumProjects(-1, "")
   local r = receipts[#receipts]
-  if not r or r.id ~= turn then
-    r = { id = turn, at = os.time(), n = 0, points = 0, lines = {} }
+  -- undo history is per project tab, so a reply that touched two projects gets one receipt per project
+  if not r or r.id ~= turn or r.proj ~= proj then
+    r = { id = turn, proj = proj, at = os.time(), n = 0, points = 0, lines = {} }
     receipts[#receipts + 1] = r
     if #receipts > MAX_TURNS then table.remove(receipts, 1) end
   end

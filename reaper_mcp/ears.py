@@ -225,8 +225,10 @@ def summary_md(res):
     lines.append("Bands under the tilt (<= %g dB): %s" % (DIP_DB, dp))
     lines.append("Regions, dB of total energy: " + " · ".join("%s %.1f" % kv for kv in res["regions_db_of_total"].items()))
     st = res["stereo"]
-    lines.append("Stereo: correlation %.2f · side %.1f dB vs mid · below 120 Hz side %.1f dB vs mid"
-                 % (st["correlation"], st["side_minus_mid_db"], st["below_120hz_side_minus_mid_db"]))
+    def side(v):
+        return "below -60 dB vs mid" if v < -60 else "%.1f dB vs mid" % v
+    lines.append("Stereo: correlation %.2f · side %s · below 120 Hz side %s"
+                 % (st["correlation"], side(st["side_minus_mid_db"]), side(st["below_120hz_side_minus_mid_db"])))
     lv = res["level"]
     lines.append("Level: peak %.1f dBFS · RMS %.1f dBFS · crest %.1f dB · 400 ms RMS %s..%s dBFS"
                  % (lv["peak_dbfs"], lv["rms_dbfs"], lv["crest_db"], lv["rms_400ms_min"], lv["rms_400ms_max"]))

@@ -61,6 +61,8 @@ local function receipt_shown()
   if S.active then return nil end
   local r = R.list[#R.list]
   if type(r) ~= 'table' or type(r.id) ~= 'string' or R.gone[r.id] then return nil end
+  -- undo is per project tab: a receipt from another tab can't be reverted here
+  if r.proj ~= nil and r.proj ~= select(2, reaper.EnumProjects(-1, '')) then return nil end
   if r.id == R.ended then return r end
   -- changes an agent made outside this panel (the Gamut app, a CLI) show once they have settled
   if r.id:match('^mcp%-') and os.time() - (tonumber(r.at) or 0) >= 3 then return r end
@@ -250,7 +252,10 @@ function MT.lines(L)
   parts[#parts + 1] = ('LUFS-S max %.1f @ %s'):format(smax.s, bar_beat(smax.pos))
   parts[#parts + 1] = ('true peak max %.1f dBTP @ %s'):format(tmax.tp, bar_beat(tmax.pos))
   if cmin then parts[#parts + 1] = ('correlation min %.2f @ %s'):format(cmin.corr, bar_beat(cmin.pos)) end
-  if sm_n > 0 then parts[#parts + 1] = ('side %.1f dB vs mid'):format(10 * log10(sm_e / sm_n)) end
+  if sm_n > 0 then
+    local sm = 10 * log10(sm_e / sm_n)
+    parts[#parts + 1] = sm < -60 and 'side below -60 dB vs mid (mono)' or ('side %.1f dB vs mid'):format(sm)
+  end
   L[#L + 1] = head .. ': ' .. table.concat(parts, ' · ')
   if band_n > 0 then
     local b = {}

@@ -237,7 +237,8 @@ while a composition is open and shows the pending pinyin under the input.
 - **Audition rack.** An agent offers alternatives by tagging tracks `P_EXT:hibiki_var = "<group>/<n>"` (one unmuted)
   or FX on one track with `P_EXT:hibiki_fxvar` lines `"<group>/<n>\t<fx GUID>"` (one enabled). The panel shows a row
   of numbered buttons per group above the input; click or press 1–9 (panel focused) to switch, hover for the
-  loudness each variant measured while it played, **Keep** writes the request to keep the one playing.
+  loudness each variant measured while it played, **Keep n** (n = the variant playing) adds the request to keep it to
+  your draft.
 - **Ears.** With a time selection or razor area, **Ears** renders it from the master (≤ 30 s, 24-bit WAV in the
   panel's private folder, your render settings restored afterwards), reads REAPER's LUFS-I / LUFS-S max / true peak,
   runs `hibiki ears` (stdlib spectrum: 1/3-octave mid and side, tilt, bands over/under the tilt, stereo, level over

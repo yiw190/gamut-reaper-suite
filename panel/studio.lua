@@ -25,7 +25,9 @@ local function exists(path)
   if f then f:close() end
   return f ~= nil
 end
-local function plural(n, word) return ('%d %s%s'):format(n, word, n == 1 and '' or 's') end
+local function plural(n, word) -- 1 reply / 2 replies, 1 change / 2 changes
+  return ('%d %s'):format(n, n == 1 and word or (word:match('[^aeiou]y$') and (word:sub(1, -2) .. 'ies') or (word .. 's')))
+end
 
 local note = nil -- { text, till }: a short line in the composer's hint spot
 function M.note(text) note = { text = text, till = now() + 6 } end
@@ -60,6 +62,10 @@ end
 -- "Always accept": no card after a reply; every change is still a labelled undo point (Edit > Undo history)
 R.auto = reaper.GetExtState(EXT, 'receipt_auto') == '1'
 local function set_auto(on)
+  -- replies that ended before the switch count as accepted: turning review back on must not pop up an old card
+  for _, x in ipairs(R.list) do
+    if type(x) == 'table' and type(x.id) == 'string' and not R.gone[x.id] then R.gone[x.id] = tonumber(x.points) or true end
+  end
   R.auto = on
   reaper.SetExtState(EXT, 'receipt_auto', on and '1' or '0', true)
 end
@@ -67,7 +73,10 @@ end
 local function receipt_shown()
   if S.active or R.auto then return nil end
   local r = R.list[#R.list]
-  if type(r) ~= 'table' or type(r.id) ~= 'string' or R.gone[r.id] then return nil end
+  if type(r) ~= 'table' or type(r.id) ~= 'string' then return nil end
+  -- closed at N undo steps: an outside agent that keeps working under the same id brings the card back
+  local g = R.gone[r.id]
+  if g == true or (g and g >= (tonumber(r.points) or 0)) then return nil end
   -- undo is per project tab: a receipt from another tab can't be reverted here
   if r.proj ~= select(2, reaper.EnumProjects(-1, '')) then return nil end
   if r.id == R.ended then return r end
@@ -109,7 +118,10 @@ local function redo(r)
   end
   reaper.PreventUIRefresh(-1)
   reaper.UpdateArrange()
-  R.state[r.id] = n > 0 and {} or { redo_failed = true }
+  if n > 0 and n >= (st.undone or 0) then R.state[r.id] = {}
+  else -- nothing (or only part) came back: still reverted, so the card keeps Close / Redo
+    R.state[r.id] = { reverted = true, undone = (st.undone or 0) - n, partial = st.partial, redone = (st.redone or 0) + n }
+  end
 end
 
 local function receipt_card(r)
@@ -118,36 +130,45 @@ local function receipt_card(r)
   local lines = type(r.lines) == 'table' and r.lines or {}
   local w = ImGui.GetContentRegionAvail(ctx)
   if st.reverted then
-    P.wrapped(('Reverted this reply: %s undone.'):format(plural(n, 'change')), C.muted)
+    if (st.undone or 0) < (tonumber(r.points) or n) then -- partial revert or partial redo: count what is really undone
+      P.wrapped('Reverted: ' .. plural(st.undone or 0, 'undo step') .. ' undone'
+        .. ((st.redone or 0) > 0 and (' · ' .. st.redone .. ' redone') or ''))
+    else
+      P.wrapped(('Reverted: %s undone'):format(plural(n, 'change')))
+    end
     if st.partial then
-      P.wrapped(('%s from earlier in the reply sit under your own edits and stayed.'):format(plural(st.partial, 'step')), C.warn)
+      P.wrapped(('%s kept: your own edits are on top of them'):format(plural(st.partial, 'undo step')), C.warn)
     end
     if P.primary('Close##rcpt') then R.gone[r.id] = true end
     ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Redo##rcpt') then redo(r) end
+    local top = reaper.Undo_CanRedo2(0)
+    local can = top ~= nil and top:sub(1, #prefix(r.id)) == prefix(r.id) -- the user's own edit clears the redo list
+    if not can then ImGui.BeginDisabled(ctx) end
+    if ImGui.Button(ctx, 'Redo##rcpt') and can then redo(r) end
+    if not can then ImGui.EndDisabled(ctx) end
+    if not can then P.wrapped('Nothing to redo: the project changed after the revert', C.muted) end
   else
     local who = r.id:match('^mcp%-') and 'An agent' or 'This reply'
-    ImGui.Text(ctx, P.truncate(('%s changed %s in REAPER'):format(who, plural(n, 'thing')), w))
+    ImGui.Text(ctx, P.truncate(('%s made %s'):format(who, plural(n, 'change')), w))
     for i = 1, math.min(3, #lines) do ImGui.TextColored(ctx, C.muted, P.truncate(lines[i], w)) end
     if #lines > 3 or n > #lines then
       ImGui.TextColored(ctx, C.muted, ('+%d more'):format(n - math.min(3, #lines)))
       if ImGui.IsItemHovered(ctx) then P.show_tip(table.concat(lines, '\n')) end
     end
-    if P.primary('Accept##rcpt') then R.gone[r.id] = true end
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Keep these changes and close the card.') end
+    if P.primary('Accept##rcpt') then R.gone[r.id] = tonumber(r.points) or true end
     ImGui.SameLine(ctx)
     if ImGui.Button(ctx, 'Revert##rcpt') then revert(r) end
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Undo exactly what this reply changed (Edit > Undo history shows each step).') end
+    if ImGui.IsItemHovered(ctx) then P.show_tip(plural(tonumber(r.points) or n, 'undo step') .. ' · ' .. prefix(r.id) .. '…') end
     ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Always accept##rcpt') then R.gone[r.id] = true; set_auto(true) end
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip('Keep every reply\'s changes without asking. Each change stays an undo step (Cmd+Z);\n'
-        .. 'turn the card back on in Agent settings > Studio > Review changes.')
+    if ImGui.Button(ctx, 'Always accept##rcpt') then
+      R.gone[r.id] = tonumber(r.points) or true
+      set_auto(true)
+      M.note('Always accept on · Agent settings > Studio')
     end
+    if ImGui.IsItemHovered(ctx) then P.show_tip('Agent settings > Studio > Review changes after each reply') end
+    if st.blocked and (reaper.Undo_CanUndo2(0) or '') ~= st.blocked then st.blocked = nil end -- top undo step changed since
     if st.blocked then
-      P.wrapped('Your own edit is on top of the undo list ("' .. P.truncate(st.blocked, 200) .. '"). Undo it first, then Revert.', C.warn)
-    elseif st.redo_failed then
-      P.wrapped('Nothing to redo: something else was changed after the revert.', C.warn)
+      P.wrapped('Your own edit "' .. P.truncate(st.blocked, 200) .. '" is on top of the undo history: undo it first, then Revert', C.danger)
     end
   end
 end
@@ -328,7 +349,7 @@ function RK.scan()
   local by, order = {}, {}
   local function add(name, v)
     local g = by[name]
-    if not g then g = { name = name, vars = {} }; by[name] = g; order[#order + 1] = g end
+    if not g then g = { name = name, vars = {}, count = 0 }; by[name] = g; order[#order + 1] = g end
     g.vars[#g.vars + 1] = v
   end
   for i = -1, reaper.CountTracks(0) - 1 do
@@ -352,7 +373,10 @@ function RK.scan()
   end
   local groups = {}
   for _, g in ipairs(order) do
-    if #g.vars >= 2 then
+    local nums, distinct = {}, 0 -- two tracks tagged with the same number are one variant
+    for _, v in ipairs(g.vars) do if not nums[v.n] then nums[v.n] = true; distinct = distinct + 1 end end
+    g.count = distinct
+    if distinct >= 2 then
       table.sort(g.vars, function(a, b) return a.n < b.n end)
       g.active = active_of(g)
       groups[#groups + 1] = g
@@ -361,6 +385,9 @@ function RK.scan()
   RK.groups = groups
 end
 function RK.switch(g, n)
+  for _, v in ipairs(g.vars) do -- a track deleted since the last scan: rescan next frame instead of touching it
+    if reaper.ValidatePtr2(0, v.tr, 'MediaTrack*') == false then RK.at = -math.huge; return end
+  end
   reaper.PreventUIRefresh(1)
   for _, v in ipairs(g.vars) do
     local on = v.n == n
@@ -398,41 +425,65 @@ function M.rack_height()
 end
 function M.rack_row()
   if #RK.groups == 0 then return end
+  -- keys 1-9 switch one group: the one last touched among the rows shown, else the first
+  local kg = RK.groups[1]
+  for gi, x in ipairs(RK.groups) do if gi <= MAX_ROWS and x.name == RK.focus then kg = x end end
   local focused = ImGui.IsWindowFocused(ctx, ImGui.FocusedFlags_RootAndChildWindows)
-  if focused and not S.comp_active then -- keys 1-9 switch the group last touched (or the first)
-    local g = RK.groups[1]
-    for _, x in ipairs(RK.groups) do if x.name == RK.focus then g = x end end
+  local mods = ImGui.IsKeyDown(ctx, ImGui.Mod_Ctrl) or ImGui.IsKeyDown(ctx, ImGui.Mod_Super)
+    or ImGui.IsKeyDown(ctx, ImGui.Mod_Shift) or ImGui.IsKeyDown(ctx, ImGui.Mod_Alt)
+  -- not while a field takes typing (composer, a card's Other…/secret field), not with a modifier held (Cmd+1)
+  if focused and not S.comp_active and not ImGui.IsAnyItemActive(ctx) and not mods then
     for k = 1, 9 do
-      if ImGui.IsKeyPressed(ctx, ImGui.Key_1 + k - 1, false) then
-        for _, v in ipairs(g.vars) do if v.n == k then RK.switch(g, k) end end
+      if ImGui.IsKeyPressed(ctx, ImGui.Key_1 + k - 1, false) or ImGui.IsKeyPressed(ctx, ImGui.Key_Keypad1 + k - 1, false) then
+        for _, v in ipairs(kg.vars) do if v.n == k then RK.switch(kg, k); break end end
       end
     end
   end
+  local names, lw = {}, 0 -- one label column: every row's buttons start at the same x
+  for gi, g in ipairs(RK.groups) do
+    if gi > MAX_ROWS then break end
+    names[gi] = P.truncate(g.name, 110)
+    lw = math.max(lw, (ImGui.CalcTextSize(ctx, names[gi])))
+  end
+  local dim = (C.strip_text & 0xFFFFFF00) | 0x99
   for gi, g in ipairs(RK.groups) do
     if gi > MAX_ROWS then break end
     ImGui.AlignTextToFramePadding(ctx)
-    ImGui.TextColored(ctx, RK.focus == g.name and C.value or C.strip_text, P.truncate(g.name, 110))
+    ImGui.TextColored(ctx, (g == kg or #RK.groups == 1) and C.strip_text or dim, names[gi]) -- full strength = keys 1-9
     if ImGui.IsItemHovered(ctx) then
-      P.show_tip('Audition rack "' .. g.name .. '": click a number or press 1-9 to hear that variant.'
-        .. (#RK.groups > MAX_ROWS and ('\n' .. (#RK.groups - MAX_ROWS) .. ' more groups not shown.') or ''))
+      P.show_tip(g.name .. ' · ' .. plural(g.count, 'variant') .. (g == kg and ' · keys 1-9' or '')
+        .. (#RK.groups > MAX_ROWS and ('\n+' .. (#RK.groups - MAX_ROWS) .. ' groups not shown') or ''))
     end
-    for _, v in ipairs(g.vars) do
-      ImGui.SameLine(ctx, 0, 4)
-      if P.led_toggle('rk' .. gi .. '_' .. v.n, tostring(v.n), g.active == v.n) then RK.switch(g, v.n) end
-      if ImGui.IsItemHovered(ctx) then
-        local l, secs = heard(g, v.n)
-        P.show_tip(v.label .. (l and ('\nheard %.0f s on the master: %.1f LUFS (average)'):format(secs, l) or ''))
+    local gap, last = lw - (ImGui.CalcTextSize(ctx, names[gi])) + 8, nil
+    for vi, v in ipairs(g.vars) do
+      if v.n ~= last then -- one button per number (vars are sorted by n)
+        last = v.n
+        ImGui.SameLine(ctx, 0, gap)
+        gap = 4
+        if ImGui.GetContentRegionAvail(ctx) < ImGui.CalcTextSize(ctx, tostring(v.n)) + 30 + 80 then -- this button + Keep
+          local rest, seen = 0, {}
+          for j = vi, #g.vars do if not seen[g.vars[j].n] then seen[g.vars[j].n] = true; rest = rest + 1 end end
+          ImGui.AlignTextToFramePadding(ctx)
+          ImGui.TextColored(ctx, C.strip_text, '+' .. rest)
+          break
+        end
+        if P.led_toggle('rk' .. gi .. '_' .. v.n, tostring(v.n), g.active == v.n) then RK.switch(g, v.n) end
+        if ImGui.IsItemHovered(ctx) then
+          local l, secs = heard(g, v.n)
+          P.show_tip(v.label .. (l and ('\n%.1f LUFS avg · %.0f s heard'):format(l, secs) or ''))
+        end
       end
     end
     ImGui.SameLine(ctx, 0, 8)
-    if P.chip('rkkeep' .. gi, 'Keep', C.muted, false) and g.active then
-      local v
-      for _, x in ipairs(g.vars) do if x.n == g.active then v = x end end
-      S.input = ('Keep variant %d (%s) of audition group "%s": remove the other variants and their hibiki tags, '
-        .. 'then save.'):format(v.n, v.label, g.name)
+    local keep
+    for _, x in ipairs(g.vars) do if x.n == g.active then keep = x; break end end
+    if P.chip('rkkeep' .. gi, keep and ('Keep ' .. keep.n) or 'Keep', C.muted, false, not keep) then
+      local req = ('Keep variant %d (%s) of audition group "%s": remove the other variants and their hibiki tags, '
+        .. 'then save.'):format(keep.n, keep.label, g.name)
+      S.input = S.input:match('^%s*$') and req or (S.input:gsub('%s+$', '') .. '\n' .. req) -- a draft in the composer stays
       S.focus = true
     end
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Write the request to keep the variant that is playing (you send it).') end
+    if ImGui.IsItemHovered(ctx) then P.show_tip(keep and keep.label or 'No variant playing') end
   end
 end
 
@@ -472,8 +523,8 @@ local function render(s, e, dir, name)
     for k, v in pairs(set) do reaper.GetSetProjectInfo(0, k, v, true) end
     local _, targets = reaper.GetSetProjectInfo_String(0, 'RENDER_TARGETS', '', false)
     wav = (targets or ''):match('[^;]+')
-    if not wav then error('REAPER planned no file') end
-    if exists(wav) then error('would overwrite ' .. wav) end -- REAPER's overwrite prompt would block the bridge
+    if not wav then error('no render target', 0) end -- level 0: no "studio.lua:475:" prefix in the hint
+    if exists(wav) then error(name .. '.wav already exists', 0) end -- REAPER's overwrite prompt would block the bridge
     reaper.Main_OnCommand(40101, 0) -- media goes offline while REAPER is in the background; a render drops it
     reaper.Main_OnCommand(42230, 0)
   end)
@@ -509,7 +560,7 @@ function E.run(s, e, what)
   local wav, err = render(s, e, dir, name)
   if not wav then M.note('Ears: ' .. err); return end
   local m = measure(wav)
-  E.busy = true
+  E.busy, E.at, E.wav, E.label = true, now(), wav, label
   local args = { 'ears', P.q(wav), '--json', '--label', P.q(label) }
   for k, flag in pairs({ lufs_i = '--lufs-i', lufs_s_max = '--lufs-s-max', lufs_m_max = '--lufs-m-max', tp = '--tp', peak = '--peak' }) do
     if m[k] then args[#args + 1] = flag .. (' %.2f'):format(m[k]) end
@@ -521,11 +572,13 @@ function E.run(s, e, what)
     if m.tp then p[#p + 1] = ('true peak %.1f dBTP'):format(m.tp) end
     return table.concat(p, ' · ')
   end
+  local base = ('ears: %s (%s%s, %.1f s), rendered from the master: %s'):format(label, what,
+    cut and (', first ' .. MAX_EARS .. ' s') or '', e - s, nums())
+  E.base = base -- M.tick's timeout still sends REAPER's own measurements
   P.cli('ears', table.concat(args, ' '), function(code, out)
+    if not E.busy or E.wav ~= wav then return end -- timed out earlier (M.tick): the WAV is already attached
     E.busy = false
     local r = P.decode(out)
-    local base = ('ears: %s (%s%s, %.1f s), rendered from the master: %s'):format(label, what,
-      cut and (', first ' .. MAX_EARS .. ' s') or '', e - s, nums())
     if code == 0 and type(r) == 'table' and r.ok == true and type(r.png) == 'string' then
       P.add_file(r.png)
       P.add_file(r.md)
@@ -534,12 +587,12 @@ function E.run(s, e, what)
       for _, p in ipairs(type(r.peaks_over_tilt) == 'table' and r.peaks_over_tilt or {}) do
         peaks[#peaks + 1] = tostring(p.band) .. ' +' .. tostring(p.db)
       end
-      E.pending = base .. ('; tilt %s dB/oct; over the tilt: %s; spectrum, stereo and levels in the attached .md/.png')
+      E.pending = (E.pending and (E.pending .. '\n') or '') .. base .. ('; tilt %s dB/oct; over the tilt: %s; spectrum, stereo and levels in the attached .md/.png')
         :format(tostring(r.tilt_db_per_octave), #peaks > 0 and table.concat(peaks, ', ') or 'none')
       M.note('Ears: ' .. label .. ' attached')
     else
       P.add_file(wav)
-      E.pending = base .. '; the WAV is attached (no spectrum: this Hibiki has no `hibiki ears` yet)'
+      E.pending = (E.pending and (E.pending .. '\n') or '') .. base .. '; the WAV is attached (no spectrum: this Hibiki has no `hibiki ears` yet)'
       M.note('Ears: ' .. label .. ' attached as audio')
     end
   end)
@@ -548,28 +601,30 @@ end
 function M.ears_chip()
   local s, e, what = ears_range()
   local off = E.busy or not s
-  if off then ImGui.BeginDisabled(ctx) end
-  local clicked = P.chip('ears', E.busy and 'Ears…' or 'Ears', C.muted, false)
-  if off then ImGui.EndDisabled(ctx) end
-  if ImGui.IsItemHovered(ctx, ImGui.HoveredFlags_AllowWhenDisabled or 0) then
-    P.show_tip(not s and 'Ears: select a time range (or a razor area) to let the agent hear it.'
-      or ('Render the %s (master, up to %d s) and attach its loudness, spectrum and stereo picture.'):format(what, MAX_EARS))
+  local clicked = P.chip('ears', E.busy and 'Ears…' or 'Ears', C.muted, false, off)
+  if ImGui.IsItemHovered(ctx) then
+    P.show_tip(E.busy and ('Measuring ' .. (E.label or '') .. '…')
+      or not s and 'No time selection or razor area'
+      or ('%s · bars %s-%s · %.1f s · master%s'):format((what:gsub('^%l', string.upper)), bar_beat(s), bar_beat(e), e - s,
+        e - s > MAX_EARS and (' · first ' .. MAX_EARS .. ' s') or ''))
   end
-  if clicked and not off then E.run(s, e, what) end
+  if clicked then E.run(s, e, what) end
 end
 
 ---------------------------------------------------------------- rules (/remember)
 local BR = { info = nil, at = -math.huge }
 function M.command(text)
+  if text:match('^/remember%s*$') then M.note('/remember <rule>'); return true end
   local rule = text:match('^/remember%s+(.+)$')
   if not rule then return false end
   P.http_url('POST', P.gateway .. '/api/hibiki/brain', '{"add":' .. P.jstr(rule) .. '}', function(code, body)
     local r = P.decode(body)
     if code == 200 and type(r) == 'table' then
-      M.note(r.added == false and 'Already in the rules' or ('Remembered: ' .. plural(tonumber(r.count) or 0, 'rule') .. ' for the agents on this Mac'))
+      M.note(r.added == false and 'Already in agent rules' or ('Saved to agent rules (' .. (tonumber(r.count) or 0) .. ')'))
       BR.at = -math.huge
     else
-      M.note('Could not save the rule (gateway answered ' .. tostring(code) .. ')')
+      if S.input == '' then S.input = text end -- hand the rule back, like a failed send
+      M.note(code == 0 and 'Rule not saved: gateway not answering' or ('Rule not saved: gateway answered ' .. tostring(code)))
     end
   end)
   return true
@@ -585,7 +640,7 @@ end
 local function brain_edit()
   P.http_url('POST', P.gateway .. '/api/hibiki/brain', '{"ensure":true}', function(code, body)
     local r = P.decode(body)
-    if code ~= 200 or type(r) ~= 'table' or type(r.path) ~= 'string' then M.note('The gateway is not answering'); return end
+    if code ~= 200 or type(r) ~= 'table' or type(r.path) ~= 'string' then BR.info, BR.at = false, now(); return end -- the Agent rules row says it, in the window where Edit was clicked
     if P.WIN then P.win_bg('start "" notepad ' .. P.q(r.path))
     else P.sh('/usr/bin/open -t ' .. P.q(r.path) .. ' >/dev/null 2>&1 &') end
     BR.at = -math.huge
@@ -666,6 +721,16 @@ function SV.open(e)
   if not exists(rpp) then M.note('Could not unpack that version'); return end
   local stamp = e.file:match('^([%d-]+)') or os.date('%Y%m%d-%H%M%S')
   local target = dir .. SEP .. name .. '_restore_' .. stamp .. '.RPP'
+  for i = 0, 255 do -- already open: switch to that tab instead of a second copy of the same file
+    local p, path = reaper.EnumProjects(i, '')
+    if not p then break end
+    if path == target then
+      reaper.SelectProjectInstance(p)
+      if src ~= rpp then os.remove(rpp) end
+      M.note('Switched to ' .. name .. '_restore_' .. stamp)
+      return
+    end
+  end
   reaper.Main_OnCommand(40859, 0) -- new project tab
   reaper.Main_openProject('noprompt:' .. rpp) -- opened where it was saved, so relative media paths resolve
   if not exists(target) then reaper.Main_SaveProjectEx(0, target, 0) end -- rewritten for the project folder
@@ -700,6 +765,8 @@ local function project_receipts()
   return out
 end
 local function revert_to_before(r, list)
+  H.err = nil
+  if (R.state[r.id] or {}).reverted then H.err = 'Not reverted: that reply is already reverted on its card'; return end
   local pre, need = prefix(r.id), tonumber(r.points) or 1
   local seen, n = 0, 0
   reaper.PreventUIRefresh(1)
@@ -710,12 +777,20 @@ local function revert_to_before(r, list)
     reaper.Undo_DoUndo2(0)
     n = n + 1
   end
+  if seen < need then -- the reply's undo steps are not on the stack (undone by hand): put every step back
+    for _ = 1, n do if reaper.Undo_DoRedo2(0) == 0 then break end end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateArrange()
+    H.err = 'Not reverted: that reply is no longer in the undo history'
+    return
+  end
   reaper.PreventUIRefresh(-1)
   reaper.UpdateArrange()
   for _, x in ipairs(list) do R.gone[x.id] = true end -- their cards would offer reverts that no longer apply
-  H.last = { undone = n, complete = seen >= need, at = os.date('%H:%M', tonumber(r.at) or os.time()) }
+  H.last = { undone = n, proj = (reaper.EnumProjects(-1, '')), at = os.date('%H:%M', tonumber(r.at) or os.time()) }
 end
 local function redo_all()
+  if not H.last or H.last.proj ~= (reaper.EnumProjects(-1, '')) then return end -- undo is per project tab
   local n = 0
   reaper.PreventUIRefresh(1)
   while n < (H.last and H.last.undone or 0) and reaper.Undo_CanRedo2(0) do
@@ -755,18 +830,34 @@ function M.tick(t)
   if reaper.GetExtState(EXT, 'open') == 'ears' then -- like open=settings / recover: another script can press Ears
     reaper.DeleteExtState(EXT, 'open', false)
     local s, e, what = ears_range()
-    if s and not E.busy then E.run(s, e, what) else M.note('Ears: select a time range first') end
+    if E.busy then M.note('Ears: still measuring')
+    elseif s then E.run(s, e, what)
+    else M.note('Ears: no time selection or razor area') end
   end
   read_receipts()
+  if E.busy and now() - E.at > 90 then -- `hibiki ears` never answered (or Recover dropped the job): the WAV alone
+    E.busy = false
+    P.add_file(E.wav)
+    if E.base then E.pending = (E.pending and (E.pending .. '\n') or '') .. E.base .. '; the WAV is attached (no spectrum)' end
+    M.note('Ears: ' .. E.label .. ' attached as audio')
+  end
   snap_tick()
   MT.tick()
-  if t - RK.at > 1 then RK.scan() end
+  local proj = reaper.EnumProjects(-1, '')
+  if proj ~= RK.proj then -- another project tab: nothing from the last one may stay clickable
+    RK.proj = proj
+    RK.scan(); RK.stats, RK.focus = {}, nil
+    H.confirm = nil
+  elseif t - RK.at > 1 then RK.scan() end
 end
 
 function M.cards(L)
   local r = receipt_shown()
   if r then L[#L + 1] = { kind = 'studio', key = 'receipt_' .. r.id, draw = function() receipt_card(r) end } end
 end
+
+-- the Ears summary waiting for the next message (Hibiki.lua sends it alone when Context is off)
+function M.take_ears() local p = E.pending; E.pending = nil; return p end
 
 -- extra lines for the REAPER context block (sent with each message)
 function M.context_lines(L)
@@ -775,93 +866,96 @@ function M.context_lines(L)
   for _, g in ipairs(RK.groups) do
     local cur
     for _, v in ipairs(g.vars) do if v.n == g.active then cur = v end end
-    L[#L + 1] = ('audition rack "%s": %d variants, playing %s'):format(g.name, #g.vars,
+    L[#L + 1] = ('audition rack "%s": %d variants, playing %s'):format(g.name, g.count,
       cur and ('#' .. cur.n .. ' (' .. cur.label .. ')') or 'none')
   end
-  if E.pending then
-    L[#L + 1] = E.pending
-    E.pending = nil
-  end
+  local p = M.take_ears()
+  if p then L[#L + 1] = p end
 end
 
 function M.settings(A)
   A.section('Studio', A.COL)
+  if now() - (H.drawn or 0) > 0.5 then H.confirm = nil end -- the window was closed: an armed Revert doesn't wait for next time
+  H.drawn = now()
   brain_info()
   A.box('studio', A.COL, function(w, x0)
     local function row() ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx))) end
-    local function right_btn(id, text, off)
+    local function right_btn(id, text, off, on)
       local bw = ImGui.CalcTextSize(ctx, text) + 16
       ImGui.SameLine(ctx)
       ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
-      return A.light_btn(id, text, bw, false, off)
+      return A.light_btn(id, text, bw, on, off)
     end
     local function right_note(text) -- dim status at the right end of the row just drawn
       local _, y1 = ImGui.GetItemRectMin(ctx)
       local _, y2 = ImGui.GetItemRectMax(ctx)
       local tw = ImGui.CalcTextSize(ctx, text)
-      ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), x0 + w - tw - 4, (y1 + y2 - ImGui.GetTextLineHeight(ctx)) / 2, A.dim, text)
+      ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), x0 + w - tw, (y1 + y2 - ImGui.GetTextLineHeight(ctx)) / 2, A.dim, text)
     end
     if A.checkbox('review', 'Review changes after each reply', not R.auto, w) then set_auto(not R.auto) end
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip('After a reply that changed REAPER, a card lists the changes with Accept / Revert.\n'
-        .. 'Off = always accept (each change is still an undo step).')
-    end
     row()
     if A.checkbox('meter', 'Measure playback', MT.on, w) then
       MT.on = not MT.on
       reaper.SetExtState(EXT, 'meter', MT.on and '1' or '0', true)
       MT.ensure()
     end
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip('Hibiki Meter on the master\'s monitoring FX (never rendered): loudness, true peak, bands and stereo '
-        .. 'of what you play go into the context.')
-    end
-    if MT.on then right_note(MT.running() and 'measuring' or MT.status) end
+    if ImGui.IsItemHovered(ctx) then P.show_tip('Hibiki_Meter.jsfx · master monitoring FX (not rendered)') end
+    if MT.on then right_note(MT.running() and 'running' or MT.status) end
     row()
     if A.checkbox('snapshots', 'Save a version after each reply', SV.on, w) then
       SV.on = not SV.on
       reaper.SetExtState(EXT, 'snapshots', SV.on and '1' or '0', true)
     end
+    local _, _, hist = project_where()
     if ImGui.IsItemHovered(ctx) then
-      P.show_tip('After a reply that changed the project, a copy of it goes to .hibiki/history next to the .RPP\n'
-        .. '(about 40 KB, no audio; the newest 200 are kept). Open them from Version history.')
+      P.show_tip(hist and (hist .. '\n~40 KB each, no audio · newest ' .. MAX_SNAPS .. ' kept') or 'project not saved')
     end
+    if SV.on and not hist then right_note('not saved') end
     row()
     ImGui.AlignTextToFramePadding(ctx)
     local info = BR.info
-    ImGui.Text(ctx, info and ('Rules for agents · ' .. plural(tonumber(info.count) or 0, 'rule')) or 'Rules for agents')
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip('One rules file for every agent on this Mac (Codex, Claude Code, Kimi, Gemini...). '
-        .. 'Type  /remember <rule>  in the chat to add one.' .. (info and info.path and ('\n' .. info.path) or ''))
-    end
+    ImGui.Text(ctx, info and ('Agent rules: ' .. (tonumber(info.count) or 0))
+      or (info == false and 'Agent rules: gateway not answering' or 'Agent rules'))
+    if ImGui.IsItemHovered(ctx) and info and info.path then P.show_tip(info.path) end
     if right_btn('brainedit', 'Edit', info == false) then brain_edit() end
+    ImGui.Dummy(ctx, 0, 4)
     row()
     ImGui.AlignTextToFramePadding(ctx)
     ImGui.Text(ctx, 'Version history')
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip('The last 10 agent replies that changed this project.\nRevert: back to before that reply (while REAPER '
-        .. 'still has its undo history). Open: the copy saved after it, in a new tab.')
-    end
     local rows, list = version_rows()
-    if H.last then
+    local here = (reaper.EnumProjects(-1, ''))
+    if H.last and H.last.proj == here and not reaper.Undo_CanRedo2(0) then H.last = nil end -- edited since: nothing to redo
+    local went = H.last ~= nil and H.last.proj == here
+    if went then
       row()
       ImGui.AlignTextToFramePadding(ctx)
-      ImGui.TextColored(ctx, A.dim, P.truncate('Went back to before ' .. H.last.at, w - 80))
+      ImGui.TextColored(ctx, A.dim, P.truncate('Went back to before ' .. H.last.at, w - ImGui.CalcTextSize(ctx, 'Redo all') - 24))
       if right_btn('redoall', 'Redo all', false) then redo_all() end
+    end
+    if H.err then
+      row()
+      ImGui.PushTextWrapPos(ctx, x0 + w)
+      ImGui.TextColored(ctx, C.razor, H.err)
+      ImGui.PopTextWrapPos(ctx)
     end
     if #rows == 0 then
       row()
       ImGui.PushTextWrapPos(ctx, x0 + w)
-      ImGui.TextColored(ctx, A.dim, 'No agent changes to this project yet.')
+      ImGui.TextColored(ctx, A.dim, 'No agent changes to this project yet')
       ImGui.PopTextWrapPos(ctx)
     end
     local today = os.date('%Y%m%d')
+    local tcol = math.max((ImGui.CalcTextSize(ctx, '00:00')), (ImGui.CalcTextSize(ctx, '00-00'))) + 8 -- time column
     for i, x in ipairs(rows) do
       row()
       ImGui.AlignTextToFramePadding(ctx)
       ImGui.TextColored(ctx, A.dim, os.date(os.date('%Y%m%d', x.at) == today and '%H:%M' or '%m-%d', x.at))
-      ImGui.SameLine(ctx, 0, 8)
-      local label = x.r and ((H.confirm == x.key) and 'Confirm' or 'Revert') or 'Open'
+      ImGui.SameLine(ctx, 0, 0)
+      ImGui.SetCursorScreenPos(ctx, x0 + tcol, select(2, ImGui.GetCursorScreenPos(ctx)))
+      local later = 0
+      for j = 1, i - 1 do if rows[j].r then later = later + 1 end end
+      local armed = H.confirm == x.key
+      local label = x.r and (armed and ('Revert ' .. plural(later + 1, 'reply')) or 'Revert') or 'Open'
       local bw = ImGui.CalcTextSize(ctx, label) + 16
       local cx = ImGui.GetCursorScreenPos(ctx)
       local summary = x.what .. (x.n > 1 and ('  +' .. (x.n - 1)) or '')
@@ -870,18 +964,15 @@ function M.settings(A)
         local lines = x.r and type(x.r.lines) == 'table' and table.concat(x.r.lines, '\n') or x.what
         P.show_tip(os.date('%Y-%m-%d %H:%M', x.at) .. ' · ' .. plural(x.n, 'change') .. '\n' .. lines)
       end
-      if right_btn('ver' .. i, label, H.last ~= nil and x.r ~= nil) then
+      if right_btn('ver' .. i, label, (went or S.active) and x.r ~= nil, armed) then
         if not x.r then SV.open(x.e)
-        elseif H.confirm ~= x.key then H.confirm = x.key
+        elseif not armed then H.confirm, H.err = x.key, nil
         else revert_to_before(x.r, list); H.confirm = nil end
       end
-      if H.confirm == x.key then
+      if armed then
         row()
-        local later = 0
-        for j = 1, i - 1 do if rows[j].r then later = later + 1 end end
         ImGui.PushTextWrapPos(ctx, x0 + w)
-        ImGui.TextColored(ctx, C.warn, (later == 0 and 'Undoes this reply' or ('Undoes this and the ' .. plural(later, 'later reply')))
-          .. ', and your own edits since. Redo all brings them back.')
+        ImGui.TextColored(ctx, C.razor, 'Your own edits since ' .. os.date('%H:%M', x.at) .. ' go too · Redo all restores everything')
         ImGui.PopTextWrapPos(ctx)
       end
     end

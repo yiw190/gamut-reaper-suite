@@ -819,7 +819,7 @@ local function sel_pills(proj)
     local num = reaper.TimeMap_GetTimeSigAtTime(proj, t0)
     local qn = reaper.TimeMap2_timeToQN(proj, t1) - reaper.TimeMap2_timeToQN(proj, t0)
     local bars = qn / (num or 4)
-    return ('%s – %s  (%s bar%s)'):format(pos(t0), pos(t1),
+    return ('%s–%s  (%s bar%s)'):format(spos(t0), spos(t1),
       math.abs(bars - math.floor(bars + 0.5)) < 1e-6 and math.floor(bars + 0.5) or ('%.2f'):format(bars), bars == 1 and '' or 's')
   end
   local function chords(t0, t1)
@@ -827,7 +827,7 @@ local function sel_pills(proj)
     local _, nm, nr = reaper.CountProjectMarkers(proj)
     for i = 0, (nm or 0) + (nr or 0) - 1 do
       local _, isr, p0, _, name, num = reaper.EnumProjectMarkers3(proj, i)
-      if not isr and p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 and #out < 12 then out[#out + 1] = num .. ' ' .. name end
+      if not isr and p0 >= t0 - 1e-9 and p0 < t1 - 1e-9 and #out < 12 then out[#out + 1] = spos(p0) .. ' ' .. name end
     end
     return #out > 0 and ('\n' .. table.concat(out, ' · ')) or ''
   end
@@ -846,7 +846,7 @@ local function sel_pills(proj)
       for sa, sb in v:gmatch('(%S+) (%S+) "[^"]*"') do
         local a, b = tonumber(sa), tonumber(sb)
         rz.t0, rz.t1 = math.min(rz.t0 or a, a), math.max(rz.t1 or b, b)
-        if #lines < 12 then lines[#lines + 1] = ('#%d %s   %s – %s'):format(i + 1, tn, pos(a), pos(b)) end
+        if #lines < 12 then lines[#lines + 1] = ('#%d %s   %s–%s'):format(i + 1, tn, spos(a), spos(b)) end
       end
     end
   end
@@ -1343,6 +1343,9 @@ local function send()
   if S.ctx_level > 0 then
     local ctx_text = context(true)
     payload = CTX_OPEN .. '\n' .. CTX_NOTE .. '\n' .. ctx_text .. '\n' .. CTX_CLOSE .. '\n\n' .. text
+  elseif studio and studio.take_ears then -- Context off: an Ears summary still goes with the message its files go with
+    local e = studio.take_ears()
+    if e then payload = CTX_OPEN .. '\n' .. e .. '\n' .. CTX_CLOSE .. '\n\n' .. text end
   end
   if #S.files == 0 then return deliver(payload, text, text) end
   -- upload the attachments first, then send the message with Gamut's "[Attached files:]" block
@@ -1379,6 +1382,7 @@ end
 local function reset_view()
   stream_stop()
   S.gen = S.gen + 1 -- late callbacks from the previous view check this and drop their result
+  if S.active and studio then studio.turn_end() end -- the abandoned reply's changes still get their card
   S.msgs, S.live, S.queued, S.active, S.err, S.waiting, S.sessions, S.sess_at = {}, {}, {}, false, nil, false, {}, 0
   S.win_from = nil
   S.perms, S.greqs, S.gans, S.card_h, S.creating, S.cfg_pending = {}, {}, {}, {}, false, false
@@ -1400,9 +1404,8 @@ local function iso_age(iso)
   local t = os.time({ year = tonumber(y), month = tonumber(mo), day = tonumber(d), hour = tonumber(h),
     min = tonumber(mi), sec = tonumber(se), isdst = false })
   local a = os.time(os.date('!*t')) - t
-  if a < 3600 then return math.max(1, a // 60) .. 'm'
-  elseif a < 86400 then return a // 3600 .. 'h'
-  else return a // 86400 .. 'd' end
+  local at = os.time() - a -- back to a local epoch: a clock time, not an age that ticks
+  return os.date(os.date('%Y%m%d', at) == os.date('%Y%m%d') and '%H:%M' or '%m-%d', at)
 end
 
 local function load_sessions()
@@ -1717,6 +1720,7 @@ do
     if S.active and S.sid ~= '' then stop() end
     stream_stop()
     S.gen = S.gen + 1
+    if S.active and studio then studio.turn_end() end -- the abandoned reply's changes still get their card
     S.active, S.waiting, S.perms, S.err, S.creating, S.uploading = false, false, {}, nil, false, false
     REC.running, REC.lines, REC.at = true, nil, reaper.time_precise()
     REC.job = REC.cli('recover', 'recover --json', finished)
@@ -1822,7 +1826,7 @@ do
         or 'Installer opened — finish it in the Installer window, then restart REAPER'
       put('at', '')
     else
-      UPD.msg = 'Already up to date'
+      UPD.msg = 'Up to date'
     end
   end
   function UPD.start(kind)
@@ -2650,11 +2654,7 @@ local function tool_lane(labels, id, holder)
   local x1, y1 = ImGui.GetCursorScreenPos(ctx)
   ImGui.InvisibleButton(ctx, '##lane_' .. id, w, lh + 2)
   local dl = ImGui.GetWindowDrawList(ctx)
-  local cy, s = y1 + 1 + lh / 2, 0.8 -- prompt glyph ">_"
-  ImGui.DrawList_AddLine(dl, x1 + 1, cy - 3 * s, x1 + 4 * s + 1, cy, C.muted, 1.3)
-  ImGui.DrawList_AddLine(dl, x1 + 4 * s + 1, cy, x1 + 1, cy + 3 * s, C.muted, 1.3)
-  ImGui.DrawList_AddLine(dl, x1 + 6, cy + 3 * s, x1 + 11, cy + 3 * s, C.muted, 1.3)
-  ImGui.DrawList_AddText(dl, x1 + 16, y1 + 1, C.muted, c.text)
+  ImGui.DrawList_AddText(dl, x1, y1 + 1, C.muted, c.text) -- plain text, flush with the reply
   ImGui.PopFont(ctx)
   if ImGui.IsItemHovered(ctx) and #labels > 1 then
     local seq = {}
@@ -2679,29 +2679,31 @@ local function face_col()
   return ImGui.IsItemActive(ctx) and C.btn_down or (ImGui.IsItemHovered(ctx) and C.btn_hover or C.btn)
 end
 
--- DAW button; col = C.accent marks a toggle that is on (blue label), chevron=false for toggles/plain buttons
-local function chip(id, label, col, with_chevron)
+-- DAW button; col = C.accent marks a toggle that is on (blue label), chevron=false for toggles/plain buttons;
+-- off = disabled: flat face, dimmed label, no click (BeginDisabled does not dim draw-list drawing)
+local function chip(id, label, col, with_chevron, off)
   local chev = with_chevron ~= false
+  local h = ImGui.GetFrameHeight(ctx) - 2 -- base font, like the pills and the header buttons
   ImGui.PushFont(ctx, font_for(label), FONT_SIZE)
   local tw = ImGui.CalcTextSize(ctx, label)
-  local h = ImGui.GetFrameHeight(ctx) - 2
   local w = tw + 18 + (chev and 14 or 0)
   local clicked = ImGui.InvisibleButton(ctx, '##chip_' .. id, w, h)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
   local dl = ImGui.GetWindowDrawList(ctx)
-  bevel(dl, x1, y1, x1 + w, y1 + h, face_col())
+  bevel(dl, x1, y1, x1 + w, y1 + h, off and C.btn or face_col())
   local tc = col == C.accent and C.value or (col == C.text and C.field_text or C.btn_text)
+  if off then tc = alpha(tc, 0x66) end
   ImGui.DrawList_AddText(dl, x1 + 9, y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2, tc, label)
   ImGui.PopFont(ctx)
-  if chev then chevron(x1 + w, y1, y1 + h, C.btn_text) end
-  return clicked
+  if chev then chevron(x1 + w, y1, y1 + h, off and alpha(C.btn_text, 0x66) or C.btn_text) end
+  return clicked and not off
 end
 
 -- on/off button like the mixer's FX button: bevelled face, label, a small LED bar on the right (lit = on)
 local function led_toggle(id, label, on)
+  local h = ImGui.GetFrameHeight(ctx) - 2 -- base font, like chip()
   ImGui.PushFont(ctx, font_for(label), FONT_SIZE)
   local tw = ImGui.CalcTextSize(ctx, label)
-  local h = ImGui.GetFrameHeight(ctx) - 2
   local w = tw + 30
   local clicked = ImGui.InvisibleButton(ctx, '##led_' .. id, w, h)
   local x1, y1 = ImGui.GetItemRectMin(ctx)
@@ -2800,7 +2802,7 @@ local function agent_picker()
   local ty = y1 + (h - ImGui.GetTextLineHeight(ctx)) / 2
   ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + h, ImGui.IsItemHovered(ctx) and C.btn_down or C.field, RND)
   chevron(x1 + w, y1, y1 + h, C.lane_text)
-  if ImGui.IsItemHovered(ctx) then show_tip('Settings: provider, agent, model, context') end
+  if ImGui.IsItemHovered(ctx) then show_tip('Agent settings') end
   if clicked then
     S.cfgwin = not S.cfgwin
     S.cfgwin_pos = nil
@@ -2859,7 +2861,8 @@ local function header()
       ImGui.SameLine(ctx)
     end
     local bx = hx + hw - right - 1
-    ImGui.DrawList_AddRectFilled(dl, bx - 4, hy - 4 + 1, hx + hw + 4 - 1, hy + hh - 4 - 1, C.field, RND_STRIP - 1)
+    -- 1 px inside the strip's top/right/bottom: two equal anti-aliased curves leave a light fringe
+    ImGui.DrawList_AddRectFilled(dl, bx - 4, hy - 3, hx + hw + 3, hy + hh - 5, C.field, RND_STRIP - 1, ImGui.DrawFlags_RoundCornersRight)
     ImGui.SetCursorScreenPos(ctx, bx, hy + 1)
     if S.active then
       if icon_button('stop', 'stop', C.danger, 'Stop') then stop() end
@@ -2913,7 +2916,7 @@ local function cfg_window()
 
   local cols = {
     { ImGui.Col_WindowBg, C.win }, { ImGui.Col_TitleBg, C.win_title }, { ImGui.Col_TitleBgActive, C.win_title },
-    { ImGui.Col_Text, C.win_text }, { ImGui.Col_TextDisabled, shade(C.win_text, 0x50) },
+    { ImGui.Col_Text, C.win_text }, { ImGui.Col_TextDisabled, shade(C.win_text, 0x30) },
     { ImGui.Col_Border, C.win_line }, { ImGui.Col_Separator, C.win_line },
     { ImGui.Col_FrameBg, C.win_field }, { ImGui.Col_FrameBgHovered, 0xFFFFFFFF }, { ImGui.Col_FrameBgActive, 0xFFFFFFFF },
     { ImGui.Col_PopupBg, C.win_field }, { ImGui.Col_Button, C.win_btn }, { ImGui.Col_ButtonHovered, 0xFFFFFFFF },
@@ -2937,7 +2940,7 @@ local function cfg_window()
   if visible then
     local dl = ImGui.GetWindowDrawList(ctx)
     local fh = ImGui.GetFrameHeight(ctx)
-    local COL, GAP, LW = 290, 12, 52 -- column width, gutter, label column
+    local COL, GAP, LW = 290, 12, 60 -- column width, gutter, label column
     do -- title bar like a macOS window: traffic lights (red closes), centred bold title, drag anywhere to move
       local wx, wy = ImGui.GetWindowPos(ctx)
       local ww = ImGui.GetWindowSize(ctx)
@@ -3013,18 +3016,6 @@ local function cfg_window()
       end
       ImGui.DrawList_AddText(dl, bx + 20, cy + (fh - ImGui.GetTextLineHeight(ctx)) / 2, C.win_text, text)
       return hit
-    end
-    local function led_btn(id, text, on)
-      local w = ImGui.CalcTextSize(ctx, text) + 26
-      local clicked = ImGui.InvisibleButton(ctx, '##led_' .. id, w, fh)
-      local x1, y1 = ImGui.GetItemRectMin(ctx)
-      local face = ImGui.IsItemHovered(ctx) and 0xFFFFFFFF or C.win_btn
-      ImGui.DrawList_AddRectFilled(dl, x1, y1, x1 + w, y1 + fh, face, 3)
-      ImGui.DrawList_AddRect(dl, x1, y1, x1 + w, y1 + fh, C.win_line, 3)
-      ImGui.DrawList_AddText(dl, x1 + 7, y1 + (fh - ImGui.GetTextLineHeight(ctx)) / 2, C.win_text, text)
-      local lx, ly = x1 + w - 10, y1 + fh / 2 - 4.5
-      ImGui.DrawList_AddRectFilled(dl, lx, ly, lx + 3.5, ly + 9, on and C.led or C.win_line, 1.5)
-      return clicked
     end
     local function combo(o, key, w)
       local id, cur = cur_of(o)
@@ -3125,9 +3116,13 @@ local function cfg_window()
         local t = ONB.installing == x.key and 'installing…' or 'install'
         ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), sx2 - ImGui.CalcTextSize(ctx, t) - 2, sy1, C.marker, t)
       end
-      if ImGui.Selectable(ctx, 'Gamut (desktop app)##getgamut', false) and not provs[1] then ONB.open_url(ONB.gamut_url) end
-      if ImGui.IsItemHovered(ctx) then show_tip('Opens the Gamut download. It needs Docker Desktop, OrbStack or Podman '
-        .. 'and an Anthropic API key; no sign-up.') end
+      if not gamut then -- Gamut not running: a download entry, marked like the install entries above
+        if ImGui.Selectable(ctx, 'Gamut (desktop app)##getgamut', false) then ONB.open_url(ONB.gamut_url) end
+        if ImGui.IsItemHovered(ctx) then show_tip('Needs Docker Desktop, OrbStack or Podman · Anthropic API key') end
+        local _, sy1 = ImGui.GetItemRectMin(ctx)
+        local sx2 = ImGui.GetItemRectMax(ctx)
+        ImGui.DrawList_AddText(ImGui.GetWindowDrawList(ctx), sx2 - ImGui.CalcTextSize(ctx, 'download') - 2, sy1, C.marker, 'download')
+      end
       ImGui.EndCombo(ctx)
     end
     ImGui.Dummy(ctx, 0, 2)
@@ -3169,8 +3164,8 @@ local function cfg_window()
         if state ~= '' then
           ImGui.SameLine(ctx, 0, 8)
           local dx, dy = ImGui.GetCursorScreenPos(ctx)
-          ImGui.DrawList_AddCircleFilled(dl, dx + 3, dy + fh / 2, 3, col)
-          ImGui.SetCursorScreenPos(ctx, dx + 9, dy)
+          ImGui.DrawList_AddCircleFilled(dl, dx + 4, dy + fh / 2, 3, col)
+          ImGui.SetCursorScreenPos(ctx, dx + 12, dy)
           ImGui.TextDisabled(ctx, state)
         end
         ImGui.SameLine(ctx)
@@ -3183,7 +3178,7 @@ local function cfg_window()
         end
         if ImGui.IsItemHovered(ctx) and cur.acp and not need then
           show_tip(resume and ('Opens this chat in Terminal:\n' .. resume)
-            or (S.sid == '' and 'Send a message first.' or (cur.name .. ' has no command-line app on this Mac to open the chat in.')))
+            or (S.sid == '' and 'No chat yet' or (cur.name .. ': no CLI on this Mac')))
         end
         local function row(lbl, draw) label(lbl, x0); draw(w - LW) end
         if not cur.acp then
@@ -3256,7 +3251,7 @@ local function cfg_window()
     local P = {}
     for _, p_ in ipairs(SEL.pills or {}) do P[#P + 1] = p_ end
     table.sort(P, function(a, b) return (SEL.at[a.k] or -1) > (SEL.at[b.k] or -1) end)
-    if #P == 0 then ImGui.TextDisabled(ctx, 'Nothing selected in REAPER.') end
+    if #P == 0 then ImGui.TextDisabled(ctx, 'Nothing selected') end
     for n, p_ in ipairs(P) do
       if n > 4 then break end
       box('sel_' .. p_.k, COL, function(w, x0)
@@ -3303,13 +3298,13 @@ local function cfg_window()
         ImGui.Text(ctx, UPD.latest .. ' available' .. (d and (' (' .. d .. ')') or ''))
         if right_btn('updinstall', 'Install', UPD.running ~= nil) then UPD.start('install') end
         if ImGui.IsItemHovered(ctx) and not UPD.running then
-          show_tip('Downloads the installer, checks its sha256 and opens it. You finish the install yourself.')
+          show_tip(UPD.latest .. ' · download .pkg · check sha256 · open it')
         end
       elseif UPD.latest then note(dim, 'Up to date')
       elseif UPD.checked and not UPD.running then note(dim, 'No release found')
       end
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
-      if led_btn('upddev', 'Include release candidates', UPD.dev()) then UPD.set_dev(not UPD.dev()) end
+      if checkbox('upddev', 'Include release candidates', UPD.dev(), w) then UPD.set_dev(not UPD.dev()) end
       ImGui.Dummy(ctx, 0, 4)
       ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
       ImGui.AlignTextToFramePadding(ctx)
@@ -3320,7 +3315,7 @@ local function cfg_window()
       ImGui.SetCursorScreenPos(ctx, x0 + w - bw, select(2, ImGui.GetCursorScreenPos(ctx)))
       if light_btn('recover', bt, bw, false, REC.running) then REC.start() end
       if ImGui.IsItemHovered(ctx) and not REC.running then
-        show_tip('Stops the reply, restarts the connection, runs  hibiki recover  and reloads this chat.')
+        show_tip('Stop reply · reconnect · hibiki recover · reload chat')
       end
       if REC.lines then
         ImGui.SetCursorScreenPos(ctx, x0, select(2, ImGui.GetCursorScreenPos(ctx)))
@@ -3411,8 +3406,7 @@ local function context_chip()
     reaper.SetExtState(EXT, 'ctx_level', tostring(S.ctx_level), true)
   end
   if ImGui.IsItemHovered(ctx) then
-    show_tip(on and ('Sent with every message:\n' .. chip_text():gsub(' · ', '\n') .. '\n\nClick: off')
-      or 'No REAPER context is sent.\n\nClick: on')
+    show_tip(on and ('Sent with each message:\n' .. chip_text():gsub(' · ', '\n')) or 'Off')
   end
 end
 
@@ -3436,8 +3430,9 @@ local function cards_height(L)
 end
 local function primary(label)
   push_btn(C.accent, alpha(C.accent, 0xDD), alpha(C.accent, 0xBB), 0xFFFFFFFF)
+  ImGui.PushStyleColor(ctx, ImGui.Col_Border, C.accent) -- inside card(): only the secondary buttons get the grey edge
   local clicked = ImGui.Button(ctx, label)
-  ImGui.PopStyleColor(ctx, 4)
+  ImGui.PopStyleColor(ctx, 5)
   return clicked
 end
 local function wrapped(text, col)
@@ -3472,7 +3467,7 @@ local function question_card(q)
       local label = sval(type(o) == 'table' and o.label) or ('Option ' .. oi)
       local on = st.sel[qi][label] == true
       if on then ImGui.PushStyleColor(ctx, ImGui.Col_Text, C.accent) end
-      if ImGui.Selectable(ctx, (on and '●  ' or '○  ') .. label .. '##q' .. id .. '_' .. qi .. '_' .. oi, on) then
+      if ImGui.Selectable(ctx, label .. '##q' .. id .. '_' .. qi .. '_' .. oi, on) then
         if qq.multiSelect == true then st.sel[qi][label] = (not on) or nil else st.sel[qi] = { [label] = true } end
       end
       if on then ImGui.PopStyleColor(ctx) end
@@ -3596,6 +3591,11 @@ local function card(c)
   local who = S.agent_name ~= '' and S.agent_name or S.agent
   ImGui.PushStyleColor(ctx, ImGui.Col_ChildBg, C.panel)
   ImGui.PushStyleColor(ctx, ImGui.Col_Border, C.border)
+  -- secondary buttons get a face and an edge: Col_Button is C.panel, the card's own fill
+  ImGui.PushStyleColor(ctx, ImGui.Col_Button, C.btn)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonHovered, C.btn_hover)
+  ImGui.PushStyleColor(ctx, ImGui.Col_ButtonActive, C.btn_down)
+  ImGui.PushStyleVar(ctx, ImGui.StyleVar_FrameBorderSize, 1)
   ImGui.SetNextWindowSizeConstraints(ctx, 0, 0, 100000, 340)
   local open = ImGui.BeginChild(ctx, 'card_' .. c.key, 0, 0, CHILD_BORDERS | ImGui.ChildFlags_AutoResizeY)
   if open then
@@ -3611,11 +3611,10 @@ local function card(c)
         if allow and not primed then primed = true; clicked = primary(label) else clicked = ImGui.Button(ctx, label) end
         if clicked then answer_perm(c.p, sval(o.optionId)) end
       end
-      if #c.p.options == 0 and ImGui.Button(ctx, 'Dismiss##' .. c.p.id) then answer_perm(c.p, nil) end
+      if #c.p.options == 0 and ImGui.Button(ctx, 'Deny##' .. c.p.id) then answer_perm(c.p, nil) end
     elseif c.kind == 'auth' then
       if S.auth.waiting then
         wrapped('Finish the ' .. who .. ' login in ' .. (S.auth.terminal and 'the Terminal window' or 'your browser'))
-        ImGui.TextDisabled(ctx, 'This card closes by itself once you are in.')
       else
         wrapped(who .. ' is not connected yet')
         for k, m in ipairs(S.auth.methods) do
@@ -3635,7 +3634,7 @@ local function card(c)
     elseif c.kind == 'studio' then
       c.draw()
     elseif c.kind == 'reaper' then
-      wrapped(who .. " can't use REAPER yet: Gamut gives MCP servers to agents one by one")
+      wrapped(who .. " can't use REAPER yet")
       if primary((ONB.busy[S.agent] and 'Enabling…' or 'Enable REAPER for ' .. who) .. '##enreaper') and not ONB.busy[S.agent] then
         ONB.enable_reaper(S.agent)
       end
@@ -3648,7 +3647,8 @@ local function card(c)
     local _, h = ImGui.GetItemRectSize(ctx)
     S.card_h[c.key] = h
   end
-  ImGui.PopStyleColor(ctx, 2)
+  ImGui.PopStyleVar(ctx)
+  ImGui.PopStyleColor(ctx, 5)
 end
 
 local spin = { '·  ', '·· ', '···', ' ··', '  ·', '   ' }
@@ -4009,7 +4009,11 @@ local function frame()
     reaper.SetExtState(EXT, DOCK_FLAG, '1', true)
   end
   ImGui.SetNextWindowSize(ctx, 420, 680, ImGui.Cond_FirstUseEver)
-  local visible, open = ImGui.Begin(ctx, 'Hibiki', true, ImGui.WindowFlags_NoCollapse)
+  -- the chat view sizes itself (log child + composer): no window scrollbar, no wheel nudge; onboarding still scrolls
+  local wflags = ImGui.WindowFlags_NoCollapse
+  -- unless last frame's cards left the log under 60 px: then the window scrolls so the input and card buttons stay reachable
+  if S.agent ~= '' and S.chat_fits ~= false then wflags = wflags | ImGui.WindowFlags_NoScrollbar | ImGui.WindowFlags_NoScrollWithMouse end
+  local visible, open = ImGui.Begin(ctx, 'Hibiki', true, wflags)
   if visible then
     local px, py = ImGui.GetWindowPos(ctx)
     local pw, ph = ImGui.GetWindowSize(ctx)
@@ -4051,15 +4055,14 @@ local function frame()
                 and not ONB.installing then
               ONB.install(x.key)
             end
-            if ImGui.IsItemHovered(ctx) then show_tip(x.description .. '\nNode and the CLI go into ~/.local/node, no admin '
-              .. 'rights; you log in with its own account once it is installed.') end
+            if ImGui.IsItemHovered(ctx) then show_tip(x.description .. '\n~/.local/node · no admin rights · own login') end
           end
         end
         if any then ImGui.TextDisabled(ctx, 'A coding-agent CLI with its own login. One click, about a minute.') end
         if ONB.err then ImGui.TextColored(ctx, C.danger, ONB.err) end
         ImGui.Dummy(ctx, 0, 6)
       elseif ONB.installable == false then
-        ImGui.TextColored(ctx, C.warn, "Hibiki's gateway isn't answering. Run  hibiki doctor  in a terminal.")
+        ImGui.TextColored(ctx, C.warn, 'Gateway not answering · hibiki doctor')
         ImGui.Dummy(ctx, 0, 6)
       end
       if chip('onb_gamut', 'Download Gamut', C.text, false) then ONB.open_url(ONB.gamut_url) end
@@ -4076,6 +4079,7 @@ local function frame()
       end
       local composer_h = 98 + cards_height(cards) + (#S.files > 0 and 30 or 0)
         + (sel_row_visible() and ImGui.GetFrameHeightWithSpacing(ctx) or 0) + (studio and studio.rack_height() or 0)
+      S.chat_fits = select(2, ImGui.GetContentRegionAvail(ctx)) - composer_h >= 60
       S.sel_clicked = false
       if ImGui.BeginChild(ctx, 'log', 0, -composer_h, 0, ImGui.WindowFlags_NoScrollWithMouse) then
         scroll_engine()
@@ -4088,14 +4092,14 @@ local function frame()
         local _, cy = ImGui.GetCursorScreenPos(ctx)
         local wx, wy = ImGui.GetWindowPos(ctx)
         local ww, wh = ImGui.GetWindowSize(ctx)
-        ImGui.DrawList_AddRectFilled(ImGui.GetWindowDrawList(ctx), wx + 6, cy - 3, wx + ww - 6, wy + wh - 6, C.strip, RND_STRIP)
+        ImGui.DrawList_AddRectFilled(ImGui.GetWindowDrawList(ctx), wx + 6, cy - 4, wx + ww - 6, wy + wh - 6, C.strip, RND_STRIP)
       end
 
       for _, c in ipairs(cards) do card(c) end
       for n, f in ipairs(S.files) do -- attachments waiting to be sent; click to remove
         if n > 1 then ImGui.SameLine(ctx, 0, 4) end
         if chip('file' .. n, f.name .. '  ×', C.text, false) then table.remove(S.files, n); break end
-        if ImGui.IsItemHovered(ctx) then show_tip(f.path .. '\nClick to remove') end
+        if ImGui.IsItemHovered(ctx) then show_tip(f.path) end
       end
       if studio then studio.rack_row() end
       sel_row()
@@ -4136,23 +4140,25 @@ local function frame()
         local ok, fn = reaper.GetUserFileNameForRead('', 'Attach a file', '')
         if ok then add_file(fn) end
       end
-      if ImGui.IsItemHovered(ctx) then show_tip('Attach a file (or drop files on the panel)') end
-      ImGui.SameLine(ctx, 0, 2)
+      ImGui.SameLine(ctx, 0, 4)
       context_chip()
-      if studio then ImGui.SameLine(ctx, 0, 2); studio.ears_chip() end
-      local hint = (S.ime and #S.ime > 0) and ('pinyin: ' .. S.ime) or (studio and studio.hint())
+      if studio then ImGui.SameLine(ctx, 0, 4); studio.ears_chip() end
+      local hint = (S.ime and #S.ime > 0) and ('Pinyin: ' .. S.ime) or (studio and studio.hint())
         or (S.uploading and ('Uploading ' .. S.uploading .. (S.uploading == 1 and ' file…' or ' files…')))
         or 'Enter to send'
       ImGui.PushFont(ctx, font_for(hint), FONT_SIZE) -- measure and draw in the same font
-      local hw = ImGui.CalcTextSize(ctx, hint)
       ImGui.SameLine(ctx)
+      local full_hint = hint
+      hint = truncate(hint, ImGui.GetContentRegionAvail(ctx) - 4) -- a long note (a path, an error) stays inside the strip
+      local hw = ImGui.CalcTextSize(ctx, hint)
       local gap = ImGui.GetContentRegionAvail(ctx) - hw
       if gap > 0 then ImGui.SetCursorPosX(ctx, ImGui.GetCursorPosX(ctx) + gap) end
       ImGui.AlignTextToFramePadding(ctx)
       ImGui.TextColored(ctx, (S.ime and #S.ime > 0) and C.field or C.strip_text, hint)
       ImGui.PopFont(ctx)
       if ImGui.IsItemHovered(ctx) then
-        show_tip('Enter send · Shift+Enter newline · Cmd+L toggle · right-click a message to copy')
+        show_tip(hint ~= full_hint and full_hint or 'Enter send\nShift+Enter new line\nCmd+C copy selection\n'
+          .. 'Right-click copy message\n/remember <rule> add an agent rule\nCmd+L show/hide')
       end
     end
     pm('composer')

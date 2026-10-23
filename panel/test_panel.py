@@ -1011,10 +1011,10 @@ def test_update_auto_check():
     p.S.cfgwin_was = False
     _settings(p)
     check("auto: a check under 24 h old is not repeated", not _update_jobs(p), _update_jobs(p))
-    _settings(p, "##led_upddev")
+    _settings(p, "##cb_upddev")
     jobs = _update_jobs(p)
     ext = dict(p.lua.globals().EXT_STATE)
-    check("release candidates LED: persisted and re-checks with --channel dev",
+    check("release candidates checkbox: persisted and re-checks with --channel dev",
           ext.get("Hibiki/upd_dev") == "1" and len(jobs) == 1 and "--channel dev" in jobs[0], (ext.get("Hibiki/upd_dev"), jobs))
 
 
@@ -1188,7 +1188,7 @@ def test_remember_command():
           and brain[0].body == {"add": "example rule three"}
           and not find(reqs, "POST", "/sessions/s1/messages") and p.S.input == "")
     p.reply(brain[0], 200, {"added": True, "count": 3, "path": "/x/rules.md"})
-    check("remember: confirms in the hint line", "3 rules" in (p.m.studio.hint() or ""), p.m.studio.hint())
+    check("remember: confirms in the hint line", "(3)" in (p.m.studio.hint() or ""), p.m.studio.hint())
 
 
 def test_ears_render_and_attach():

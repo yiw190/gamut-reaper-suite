@@ -31,6 +31,14 @@ POLL = float(os.environ.get("REAPER_MCP_POLL", "0.015"))
 FAST_POLL = 0.002
 FAST_POLL_WINDOW = 0.25
 RENDER_TIMEOUT = float(os.environ.get("REAPER_MCP_RENDER_TIMEOUT", "300"))
+RUN_LUA_MAX_TIMEOUT = 600
+
+
+def _run_lua_timeout(a):
+    t = a.get("timeout")
+    if t is None:
+        return None
+    return max(1.0, min(float(t), RUN_LUA_MAX_TIMEOUT))
 
 INSTRUCTIONS = (
     "Drive REAPER. Time is beats (quarter notes), track/item indices are 0-based. "
@@ -158,7 +166,9 @@ class Bridge:
                 if time.monotonic() >= deadline:
                     if self._busy():
                         raise BridgeError(
-                            "Timed out waiting for REAPER to finish the previous request."
+                            "Timed out waiting for REAPER to finish the previous request "
+                            "(a long run_lua / render is still running). Do not resend it; "
+                            "call status again in a few seconds."
                         )
                     self._refuse()
                 time.sleep(POLL)
@@ -209,7 +219,10 @@ class Bridge:
             if withdrawn:
                 raise BridgeError("REAPER did not pick up the request in time (a modal dialog open?). "
                                   "It was withdrawn and will not run.")
-            raise BridgeError("Timed out waiting for REAPER to finish the request; it may still complete.")
+            raise BridgeError("Timed out waiting for REAPER to finish the request; it may still complete. "
+                              "Do not resend it: call status until REAPER is free. For slow work pass a "
+                              "longer timeout (run_lua timeout=...), or start host commands in the "
+                              "background (io.popen('cmd > log 2>&1 &')) and poll the log.")
         finally:
             self._unlock(fd)
 
@@ -239,6 +252,8 @@ def _props(a, keys):
     return {k: a[k] for k in keys if k in a}
 
 
+SEND_PROPS = ("volume_db", "pan", "mute", "mode", "src_channel", "dst_channel")
+
 NOTE = {
     "type": "object",
     "properties": {
@@ -267,7 +282,8 @@ CC = {
 
 tool(
     "status",
-    "Check the Lua bridge and return project tempo, play state, and tracks. Call first. "
+    "Check the Lua bridge and return project tempo, play state, tracks, any_solo, master_mute and dirty "
+    "(unsaved changes). Call first; clear a lingering solo before rendering. "
     "detail=true adds arrangement facts (time signature, length in beats, markers, "
     "MIDI vs audio per track) without guessing chords.",
     obj({"detail": {"type": "boolean"}}),
@@ -355,7 +371,9 @@ tool(
 tool(
     "fx",
     "Track FX. action: list | add | params | set | delete | bypass | move | preset. "
-    "track_index -1 is the master. set value is 0..1 (REAPER normalized).",
+    "track_index -1 is the master. set takes value 0..1 (REAPER normalized) or formatted: the value as the "
+    "plugin displays it (number in its unit, e.g. -18 for dB, 4 for 4:1, 120 for ms; or a label like "
+    "\"3.2k\"), resolved by searching the display text. set returns the formatted value actually set.",
     obj({
         "action": {"type": "string",
                    "enum": ["list", "add", "params", "set", "delete", "bypass", "move", "preset"]},
@@ -364,6 +382,7 @@ tool(
         "fx_name": {"type": "string"},
         "param": {"type": ["string", "integer"]},
         "value": {"type": "number"},
+        "formatted": {"type": ["string", "number"]},
         "enabled": {"type": "boolean"},
         "dest_index": {"type": "integer", "minimum": 0},
         "preset": {"type": "string"},
@@ -373,7 +392,8 @@ tool(
         "add": lambda: b.call("add_track_fx", [a["track_index"], a["fx_name"]]),
         "params": lambda: b.call("get_fx_params", [a["track_index"], a["fx_index"]]),
         "set": lambda: b.call("set_fx_param",
-                              [a["track_index"], a["fx_index"], a["param"], a["value"]]),
+                              [a["track_index"], a["fx_index"], a["param"], a.get("value"),
+                               a.get("formatted")]),
         "delete": lambda: b.call("delete_track_fx", [a["track_index"], a["fx_index"]]),
         "bypass": lambda: b.call("set_fx_enabled",
                                  [a["track_index"], a["fx_index"], a.get("enabled", False)]),
@@ -387,7 +407,10 @@ tool(
 tool(
     "send",
     "Track sends. action: list | add | delete | update. "
-    "track_index is the source (-1 master). dest_index is the destination track.",
+    "track_index is the source (-1 master). dest_index is the destination track. "
+    "add/update take volume_db, pan, mute, mode (post_fader | pre_fader | pre_fx) and channel routing: "
+    "src_channel / dst_channel = first channel of the stereo pair, 0-based (dst_channel 2 = channels 3/4, a "
+    "compressor's sidechain input; the destination's channel count is raised to fit).",
     obj({
         "action": {"type": "string", "enum": ["list", "add", "delete", "update"]},
         "track_index": {"type": "integer", "minimum": -1},
@@ -396,13 +419,17 @@ tool(
         "volume_db": {"type": "number"},
         "pan": {"type": "number", "minimum": -1, "maximum": 1},
         "mute": {"type": "boolean"},
+        "mode": {"type": "string", "enum": ["post_fader", "pre_fader", "pre_fx"]},
+        "src_channel": {"type": "integer", "minimum": 0, "maximum": 62},
+        "dst_channel": {"type": "integer", "minimum": 0, "maximum": 62},
     }, ["action", "track_index"]),
     lambda b, a: {
         "list": lambda: b.call("list_sends", [a["track_index"]]),
-        "add": lambda: b.call("add_send", [a["track_index"], a["dest_index"]]),
+        "add": lambda: b.call("add_send", [a["track_index"], a["dest_index"],
+                                           _props(a, SEND_PROPS) or None]),
         "delete": lambda: b.call("delete_send", [a["track_index"], a["send_index"]]),
         "update": lambda: b.call("update_send", [a["track_index"], a["send_index"],
-                                                 _props(a, ("volume_db", "pan", "mute"))]),
+                                                 _props(a, SEND_PROPS)]),
     }[a["action"]](),
 )
 
@@ -445,12 +472,14 @@ tool(
     "Track envelopes. action: list | get | set. "
     "name is REAPER envelope name (Volume, Pan, Mute, ...). "
     "set replaces all points. value is the envelope's value; Volume is linear gain (1.0 = 0 dB, "
-    "0.5 = -6 dB), also on fader-scaled envelopes.",
+    "0.5 = -6 dB), also on fader-scaled envelopes. unit=db reads/writes volume-type envelopes "
+    "(Volume, Trim Volume, send Volume) in dB. set re-activates an envelope left inactive (ACT 0).",
     obj({
         "action": {"type": "string", "enum": ["list", "get", "set"]},
         "track_index": {"type": "integer", "minimum": -1},
         "name": {"type": "string"},
         "envelope_index": {"type": "integer", "minimum": 0},
+        "unit": {"type": "string", "enum": ["gain", "db"]},
         "points": {"type": "array", "items": {
             "type": "object",
             "properties": {
@@ -466,10 +495,11 @@ tool(
     lambda b, a: {
         "list": lambda: b.call("list_envelopes", [a["track_index"]]),
         "get": lambda: b.call("get_envelope",
-                              [a["track_index"], a.get("name", a.get("envelope_index", 0))]),
+                              [a["track_index"], a.get("name", a.get("envelope_index", 0)),
+                               a.get("unit")]),
         "set": lambda: b.call("set_envelope",
                               [a["track_index"], a.get("name", a.get("envelope_index", 0)),
-                               a.get("points") or []]),
+                               a.get("points") or [], a.get("unit")]),
     }[a["action"]](),
 )
 
@@ -509,7 +539,12 @@ tool(
     "Render. No undo. Long timeout. "
     "bounds: project | time_selection | custom | items. "
     "Default: the master mix. stems=true renders the selected tracks as stems instead (pass track_indices to "
-    "select them). path is the output folder; the file name comes from pattern.",
+    "select them). path is the output folder; the file name comes from pattern. "
+    "Sets all media online (action 40101) first unless media_online=false. Refuses when a target file "
+    "already exists (REAPER's overwrite prompt would hang the bridge) and when tracks are soloed (pass "
+    "allow_solo=true, or solo_indices / mute_indices to solo/mute tracks for this render only; they are "
+    "restored afterwards). Returns files [{path, bytes, length_sec, peak_db, lufs_i}] and warnings "
+    "(near-silent, missing file, master muted); measure=false skips the loudness scan.",
     obj({
         "path": {"type": "string"},
         "bounds": {"type": "string",
@@ -521,6 +556,11 @@ tool(
         "sample_rate": {"type": "integer", "minimum": 1},
         "channels": {"type": "integer", "minimum": 1},
         "pattern": {"type": "string"},
+        "solo_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "mute_indices": {"type": "array", "items": {"type": "integer", "minimum": 0}},
+        "allow_solo": {"type": "boolean"},
+        "media_online": {"type": "boolean"},
+        "measure": {"type": "boolean"},
     }),
     lambda b, a: b.call("render_project", [a.get("path"), {
         "bounds": a.get("bounds") or "project",
@@ -531,6 +571,11 @@ tool(
         "sample_rate": a.get("sample_rate"),
         "channels": a.get("channels"),
         "pattern": a.get("pattern"),
+        "solo_indices": a.get("solo_indices"),
+        "mute_indices": a.get("mute_indices"),
+        "allow_solo": a.get("allow_solo"),
+        "media_online": a.get("media_online"),
+        "measure": a.get("measure"),
     }], timeout=RENDER_TIMEOUT),
 )
 
@@ -552,9 +597,12 @@ tool(
 tool(
     "run_lua",
     "Run a Lua snippet inside REAPER (`reaper` in scope). Use return to send a value. "
-    "Best for multi-step work that would otherwise be many round-trips.",
-    obj({"code": {"type": "string"}}, ["code"]),
-    lambda b, a: b.call("run_lua", code=a["code"]),
+    "Best for multi-step work that would otherwise be many round-trips. Errors carry the failing line. "
+    "timeout (seconds, default 10, max 600) is for slow work; REAPER is frozen meanwhile, so start long "
+    "host commands in the background (io.popen('cmd > log 2>&1 &')) and poll instead.",
+    obj({"code": {"type": "string"},
+         "timeout": {"type": "number", "minimum": 1, "maximum": RUN_LUA_MAX_TIMEOUT}}, ["code"]),
+    lambda b, a: b.call("run_lua", code=a["code"], timeout=_run_lua_timeout(a)),
 )
 
 tool(

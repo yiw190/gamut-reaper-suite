@@ -9,3 +9,5 @@ build/
 *.tmp
 .mcp.json
 uv.lock
+docs/demo/src/node_modules/
+docs/demo/out/

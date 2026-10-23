@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.5.0-rc.4"
+local VERSION = "0.5.0-rc.5"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -377,6 +377,37 @@ local function vol_db(t)
   return 20 * math.log(vol) / math.log(10)
 end
 
+local function db_of(gain)
+  if not gain or gain <= 0 then return -150 end
+  return 20 * math.log(gain) / math.log(10)
+end
+
+-- I_SOLO can read 0 while REAPER still solos (UI solo state), so trust AnyTrackSolo when it exists.
+local function any_solo()
+  if reaper.AnyTrackSolo then return reaper.AnyTrackSolo(0) and true or false end
+  for i = 0, reaper.CountTracks(0) - 1 do
+    if reaper.GetMediaTrackInfo_Value(reaper.GetTrack(0, i), "I_SOLO") ~= 0 then return true end
+  end
+  return false
+end
+
+local function soloed_tracks()
+  local out = {}
+  for i = 0, reaper.CountTracks(0) - 1 do
+    local t = reaper.GetTrack(0, i)
+    if reaper.GetMediaTrackInfo_Value(t, "I_SOLO") ~= 0 then
+      local _, name = reaper.GetTrackName(t)
+      out[#out + 1] = string.format("%d %s", i, name)
+    end
+  end
+  return out
+end
+
+local function set_solo(t, on)
+  if reaper.SetTrackUISolo then reaper.SetTrackUISolo(t, on and 1 or 0, 0) end
+  reaper.SetMediaTrackInfo_Value(t, "I_SOLO", on and 2 or 0) -- 2 = solo in place
+end
+
 function DSL.ping()
   return { ret = { pong = true, version = VERSION, reaper = reaper.GetAppVersion() } }
 end
@@ -422,7 +453,11 @@ function DSL.get_project_summary(detail)
     cursor_seconds = reaper.GetCursorPosition(),
     track_count = n,
     tracks = tracks,
+    -- a lingering solo or a muted master silently changes every render; surface both
+    any_solo = any_solo(),
+    master_mute = reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "B_MUTE") == 1,
   }
+  if reaper.IsProjectDirty then ret.dirty = reaper.IsProjectDirty(0) ~= 0 end
   if detail then
     local num, denom = 4, 4
     if reaper.TimeMap_GetTimeSigAtTime then
@@ -766,20 +801,89 @@ function DSL.get_fx_params(ti, fxi)
   return { ret = out }
 end
 
-function DSL.set_fx_param(ti, fxi, param, value)
-  local t = track_at(ti)
-  local pidx = param
-  if type(param) == "string" then
-    pidx = -1
-    for i = 0, reaper.TrackFX_GetNumParams(t, fxi) - 1 do
-      local _, pn = reaper.TrackFX_GetParamName(t, fxi, i, "")
-      if pn:lower() == param:lower() then pidx = i break end
-    end
-    if pidx < 0 then error("no param named " .. param) end
+local function fx_param_index(t, fxi, param)
+  if type(param) ~= "string" then return param end
+  local n = reaper.TrackFX_GetNumParams(t, fxi)
+  for i = 0, n - 1 do
+    local _, pn = reaper.TrackFX_GetParamName(t, fxi, i, "")
+    if pn:lower() == param:lower() then return i end
   end
-  reaper.TrackFX_SetParam(t, fxi, pidx, value)
+  error("no param named " .. param .. " (fx params lists the " .. n .. " names)")
+end
+
+-- Display text of a normalized value, without moving the knob when the API allows it.
+local function fx_format(t, fxi, pidx, v)
+  if reaper.TrackFX_FormatParamValueNormalized then
+    local ok, s = reaper.TrackFX_FormatParamValueNormalized(t, fxi, pidx, v, "")
+    if ok and s and s ~= "" then return s end
+  end
+  reaper.TrackFX_SetParamNormalized(t, fxi, pidx, v)
+  local _, s = reaper.TrackFX_GetFormattedParamValue(t, fxi, pidx, "")
+  return s
+end
+
+-- "-12.0 dB" -> -12, "4.0:1" -> 4, "inf" / "inf:1" -> math.huge, "-inf dB" -> -math.huge
+local function display_number(s)
+  s = tostring(s or ""):lower()
+  local sign, rest = s:match("^%s*([-+]?)%s*(.*)$")
+  if rest:sub(1, 3) == "inf" then return sign == "-" and -math.huge or math.huge end
+  return tonumber(s:match("[-+]?%d*%.?%d+"))
+end
+
+-- Find the normalized value whose display is `target` (a number in the display unit, or a label).
+local function resolve_formatted(t, fxi, pidx, target)
+  local want = type(target) == "number" and target or display_number(target)
+  if type(target) == "string" then
+    -- exact label first: JS enums ("3.2k", "Blown Capacitor 4") and switches
+    local lt, partial = target:lower(), nil
+    for k = 0, 1000 do
+      local v = k / 1000
+      local shown = fx_format(t, fxi, pidx, v):lower()
+      if shown == lt then return v end
+      if not partial and want == nil and shown:find(lt, 1, true) then partial = v end
+    end
+    if want == nil then
+      if partial then return partial end
+      error("no value of this param displays as '" .. target .. "'")
+    end
+  end
+  local lo, hi = 0.0, 1.0
+  local flo, fhi = display_number(fx_format(t, fxi, pidx, lo)), display_number(fx_format(t, fxi, pidx, hi))
+  if flo == nil or fhi == nil then error("param display is not numeric; pass value (0..1) instead") end
+  local rising = fhi >= flo
+  local mn, mx = math.min(flo, fhi), math.max(flo, fhi)
+  if want < mn - 1e-9 or want > mx + 1e-9 then
+    error(("formatted %s is outside this param's range %s..%s"):format(tostring(target),
+      fx_format(t, fxi, pidx, rising and 0 or 1), fx_format(t, fxi, pidx, rising and 1 or 0)))
+  end
+  for _ = 1, 50 do
+    local mid = (lo + hi) / 2
+    local f = display_number(fx_format(t, fxi, pidx, mid))
+    if f == nil then break end
+    if (f < want) == rising then lo = mid else hi = mid end
+  end
+  local dlo = math.abs((display_number(fx_format(t, fxi, pidx, lo)) or 0) - want)
+  local dhi = math.abs((display_number(fx_format(t, fxi, pidx, hi)) or 0) - want)
+  return dlo <= dhi and lo or hi
+end
+
+function DSL.set_fx_param(ti, fxi, param, value, formatted)
+  local t = track_at(ti)
+  local pidx = fx_param_index(t, fxi, param)
+  local n = reaper.TrackFX_GetNumParams(t, fxi)
+  if type(pidx) ~= "number" or pidx < 0 or pidx >= n then
+    error(("no param %s (fx has %d params)"):format(tostring(param), n))
+  end
+  if formatted ~= nil then
+    reaper.TrackFX_SetParamNormalized(t, fxi, pidx, resolve_formatted(t, fxi, pidx, formatted))
+  elseif type(value) == "number" then
+    reaper.TrackFX_SetParam(t, fxi, pidx, value)
+  else
+    error("fx set needs value (0..1) or formatted (display value, e.g. -12 for dB, 4 for 4:1, or a label)")
+  end
   local v = reaper.TrackFX_GetParam(t, fxi, pidx)
-  return { ret = { param_index = pidx, value = v } }
+  local _, shown = reaper.TrackFX_GetFormattedParamValue(t, fxi, pidx, "")
+  return { ret = { param_index = pidx, value = v, formatted = shown } }
 end
 
 function DSL.delete_track_fx(ti, fxi)
@@ -817,6 +921,9 @@ function DSL.set_fx_preset(ti, fxi, preset)
   return { ret = { preset = name } }
 end
 
+local SEND_MODES = { post_fader = 0, pre_fx = 1, pre_fader = 3 }
+local SEND_MODE_NAMES = { [0] = "post_fader", [1] = "pre_fx", [2] = "pre_fader", [3] = "pre_fader" }
+
 function DSL.list_sends(ti)
   local t = track_at(ti)
   local out = {}
@@ -831,24 +938,64 @@ function DSL.list_sends(ti)
         dest_index = math.floor(reaper.GetMediaTrackInfo_Value(dest, "IP_TRACKNUMBER") - 1)
       end
     end
-    local vol = reaper.GetTrackSendInfo_Value(t, 0, i, "D_VOL")
-    local db = (vol <= 0) and -150 or (20 * math.log(vol) / math.log(10))
-    out[#out + 1] = {
+    local rec = {
       send_index = i,
       dest_index = dest_index,
-      volume_db = db,
+      volume_db = db_of(reaper.GetTrackSendInfo_Value(t, 0, i, "D_VOL")),
       pan = reaper.GetTrackSendInfo_Value(t, 0, i, "D_PAN"),
       mute = reaper.GetTrackSendInfo_Value(t, 0, i, "B_MUTE") == 1,
+      mode = SEND_MODE_NAMES[math.floor(reaper.GetTrackSendInfo_Value(t, 0, i, "I_SENDMODE"))] or "post_fader",
     }
+    local src = math.floor(reaper.GetTrackSendInfo_Value(t, 0, i, "I_SRCCHAN"))
+    local dst = math.floor(reaper.GetTrackSendInfo_Value(t, 0, i, "I_DSTCHAN"))
+    if src ~= 0 then rec.src_channel = src end -- omitted when 0 (channels 1/2)
+    if dst ~= 0 then rec.dst_channel = dst end
+    out[#out + 1] = rec
   end
   return { ret = out }
 end
 
-function DSL.add_send(ti, dest_index)
+-- volume/pan/mute plus routing: src_channel / dst_channel are the first channel of the stereo pair, 0-based
+-- (dst_channel 2 = channels 3/4, the sidechain input of ReaComp & co.); mode post_fader | pre_fader | pre_fx.
+local function apply_send_props(t, send_index, props)
+  props = props or {}
+  if props.volume_db ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_VOL", 10 ^ (props.volume_db / 20))
+  end
+  if props.pan ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_PAN", props.pan)
+  end
+  if props.mute ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "B_MUTE", props.mute and 1 or 0)
+  end
+  if props.mode ~= nil then
+    local m = SEND_MODES[props.mode]
+    if not m then error("send mode must be post_fader, pre_fader or pre_fx") end
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "I_SENDMODE", m)
+  end
+  if props.src_channel ~= nil then
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "I_SRCCHAN", props.src_channel)
+  end
+  if props.dst_channel ~= nil then
+    -- the destination needs the channels to exist, or REAPER folds the send back down
+    local dest = reaper.GetTrackSendInfo_Value(t, 0, send_index, "P_DESTTRACK")
+    if dest then
+      local need = props.dst_channel + 2
+      if need % 2 == 1 then need = need + 1 end
+      if reaper.GetMediaTrackInfo_Value(dest, "I_NCHAN") < need then
+        reaper.SetMediaTrackInfo_Value(dest, "I_NCHAN", need)
+      end
+    end
+    reaper.SetTrackSendInfo_Value(t, 0, send_index, "I_DSTCHAN", props.dst_channel)
+  end
+end
+
+function DSL.add_send(ti, dest_index, props)
   local src = track_at(ti)
   local dest = track_at(dest_index)
   local idx = reaper.CreateTrackSend(src, dest)
   if idx < 0 then error("could not create send") end
+  apply_send_props(src, idx, props)
   return { ret = { send_index = idx, dest_index = dest_index } }
 end
 
@@ -861,16 +1008,11 @@ end
 
 function DSL.update_send(ti, send_index, props)
   local t = track_at(ti)
-  props = props or {}
-  if props.volume_db ~= nil then
-    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_VOL", 10 ^ (props.volume_db / 20))
+  local n = reaper.GetTrackNumSends(t, 0)
+  if type(send_index) ~= "number" or send_index < 0 or send_index >= n then
+    error(("no send at index %s (track has %d sends)"):format(tostring(send_index), n))
   end
-  if props.pan ~= nil then
-    reaper.SetTrackSendInfo_Value(t, 0, send_index, "D_PAN", props.pan)
-  end
-  if props.mute ~= nil then
-    reaper.SetTrackSendInfo_Value(t, 0, send_index, "B_MUTE", props.mute and 1 or 0)
-  end
+  apply_send_props(t, send_index, props)
   return { ret = true }
 end
 
@@ -984,13 +1126,41 @@ local function envelope_at(ti, name_or_index)
     return env
   end
   local env = reaper.GetTrackEnvelopeByName(t, tostring(name_or_index))
-  if not env then error("no envelope named " .. tostring(name_or_index)) end
+  if not env then
+    local names = {}
+    for i = 0, reaper.CountTrackEnvelopes(t) - 1 do
+      local _, nm = reaper.GetEnvelopeName(reaper.GetTrackEnvelope(t, i), "")
+      names[#names + 1] = nm
+    end
+    error("no envelope named " .. tostring(name_or_index) .. " on this track (has: "
+      .. (#names > 0 and table.concat(names, ", ") or "none")
+      .. "). Show it first, e.g. action 40406 Volume / 40407 Pan with the track selected.", 0)
+  end
   return env
 end
 
 -- Point values come back raw, and a fader-scaled volume envelope (REAPER 6+ default) stores fader positions
--- (0 dB = 716.2), so convert both ways: the tool speaks gain (Volume 1.0 = 0 dB) for every scaling mode.
-function DSL.get_envelope(ti, name_or_index)
+-- (0 dB = 716.2), so convert both ways: the tool speaks gain (Volume 1.0 = 0 dB) for every scaling mode,
+-- or dB with unit="db" (Volume, Trim Volume, send volume).
+local function to_unit(v, unit)
+  if unit == "db" then return db_of(v) end
+  return v
+end
+
+local function from_unit(v, unit)
+  if unit == "db" then
+    if v <= -150 then return 0 end
+    return 10 ^ (v / 20)
+  end
+  return v
+end
+
+local function check_unit(unit)
+  if unit ~= nil and unit ~= "gain" and unit ~= "db" then error("unit must be gain or db") end
+end
+
+function DSL.get_envelope(ti, name_or_index, unit)
+  check_unit(unit)
   local env = envelope_at(ti, name_or_index)
   local _, name = reaper.GetEnvelopeName(env, "")
   local mode = reaper.GetEnvelopeScalingMode(env)
@@ -1000,28 +1170,52 @@ function DSL.get_envelope(ti, name_or_index)
     if ok then
       pts[#pts + 1] = {
         beats = time_to_beats(time),
-        value = reaper.ScaleFromEnvelopeMode(mode, value),
+        value = to_unit(reaper.ScaleFromEnvelopeMode(mode, value), unit),
         shape = shape,
         tension = tension,
         selected = selected,
       }
     end
   end
-  return { ret = { name = name, points = pts } }
+  local ret = { name = name, points = pts }
+  if unit then ret.unit = unit end
+  return { ret = ret }
 end
 
-function DSL.set_envelope(ti, name_or_index, points)
+-- Envelopes made from a chunk can come up ACT 0: the points read back fine but nothing plays.
+local function ensure_active(env)
+  if not (reaper.GetEnvelopeStateChunk and reaper.SetEnvelopeStateChunk) then return false end
+  local ok, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+  if not ok or not chunk then return false end
+  local fixed, n = chunk:gsub("\nACT 0", "\nACT 1", 1)
+  if n == 0 then return false end
+  reaper.SetEnvelopeStateChunk(env, fixed, false)
+  return true
+end
+
+function DSL.set_envelope(ti, name_or_index, points, unit)
+  check_unit(unit)
   local env = envelope_at(ti, name_or_index)
   local mode = reaper.GetEnvelopeScalingMode(env)
   points = points or {}
+  for i, p in ipairs(points) do
+    if type(p) ~= "table" or type(p.beats or p.time) ~= "number" or type(p.value) ~= "number" then
+      error("point #" .. i .. " needs numeric beats and value")
+    end
+    if p.beats and p.beats < 0 then error("point #" .. i .. " is before the project start (beats < 0)") end
+  end
   reaper.DeleteEnvelopePointRange(env, -math.huge, math.huge)
   for _, p in ipairs(points) do
     reaper.InsertEnvelopePoint(env, beats_to_time(p.beats or p.time or 0),
-      reaper.ScaleToEnvelopeMode(mode, p.value or 0), p.shape or 0, p.tension or 0, p.selected and true or false, true)
+      reaper.ScaleToEnvelopeMode(mode, from_unit(p.value or 0, unit)), p.shape or 0, p.tension or 0,
+      p.selected and true or false, true)
   end
   reaper.Envelope_SortPoints(env)
+  local activated = ensure_active(env)
   refresh_arrange()
-  return { ret = { n_points = reaper.CountEnvelopePoints(env) } }
+  local ret = { n_points = reaper.CountEnvelopePoints(env) }
+  if activated then ret.activated = true end
+  return { ret = ret }
 end
 
 function DSL.set_time_selection(sb, eb)
@@ -1061,6 +1255,49 @@ function DSL.save_project(path)
   return { ret = { saved = true, path = proj, copy = false } }
 end
 
+local function split_targets(s)
+  local out = {}
+  for f in tostring(s or ""):gmatch("[^;]+") do out[#out + 1] = f end
+  return out
+end
+
+local function file_size(p)
+  local f = io.open(p, "rb")
+  if not f then return nil end
+  local n = f:seek("end")
+  f:close()
+  return n
+end
+
+-- Length, sample peak and integrated loudness of a rendered file, measured by REAPER itself
+-- (CalculateNormalization returns the gain that would bring the file to 0 on that scale).
+local function measure_file(p)
+  local m = {}
+  if not reaper.PCM_Source_CreateFromFile then return m end
+  local src = reaper.PCM_Source_CreateFromFile(p)
+  if not src then return m end
+  if reaper.GetMediaSourceLength then
+    local len = reaper.GetMediaSourceLength(src)
+    if type(len) == "number" then m.length_sec = len end
+  end
+  if reaper.CalculateNormalization then
+    local g_peak = reaper.CalculateNormalization(src, 2, 0, 0, 0)
+    local g_lufs = reaper.CalculateNormalization(src, 0, 0, 0, 0)
+    -- digital silence needs "infinite" gain: report it as -150 so the near-silent check still fires
+    local function level(g)
+      if type(g) ~= "number" or g ~= g or g <= 0 then return nil end
+      if g == math.huge or g > 1e7 then return -150 end
+      return -db_of(g)
+    end
+    m.peak_db = level(g_peak)
+    m.lufs_i = level(g_lufs)
+  end
+  if reaper.PCM_Source_Destroy then reaper.PCM_Source_Destroy(src) end
+  return m
+end
+
+local SILENT_PEAK_DB = -60
+
 function DSL.render_project(path, opts)
   opts = opts or {}
   if path and path ~= "" then
@@ -1071,6 +1308,10 @@ function DSL.render_project(path, opts)
   if bounds == "custom" then flag = 0
   elseif bounds == "time_selection" then flag = 2
   elseif bounds == "items" then flag = 4 -- selected media items (3 would be all project regions)
+  end
+  if bounds == "custom" then
+    local sb, eb = opts.start_beats or 0, opts.end_beats or 0
+    if eb <= sb then error(("bounds=custom needs end_beats > start_beats (got %s..%s)"):format(sb, eb)) end
   end
   reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", flag, true)
   if bounds == "custom" then
@@ -1100,8 +1341,95 @@ function DSL.render_project(path, opts)
   if opts.pattern and opts.pattern ~= "" then
     reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", opts.pattern, true)
   end
-  reaper.Main_OnCommand(42230, 0)
-  return { ret = { rendered_to = path or "(project render path)", bounds = bounds, stems = opts.stems and true or false } }
+
+  -- Temporary solo / mute for this render only (null tests, stage renders); restored afterwards.
+  local snapshot
+  local solo_list, mute_list = opts.solo_indices, opts.mute_indices
+  if (solo_list and #solo_list > 0) or (mute_list and #mute_list > 0) then
+    snapshot = {}
+    for i = 0, reaper.CountTracks(0) - 1 do
+      local t = reaper.GetTrack(0, i)
+      snapshot[#snapshot + 1] = { t = t, solo = reaper.GetMediaTrackInfo_Value(t, "I_SOLO"),
+                                  mute = reaper.GetMediaTrackInfo_Value(t, "B_MUTE") }
+    end
+    if solo_list and #solo_list > 0 then
+      for _, s in ipairs(snapshot) do set_solo(s.t, false) end
+      for _, i in ipairs(solo_list) do set_solo(track_at(i), true) end
+    end
+    for _, i in ipairs(mute_list or {}) do reaper.SetMediaTrackInfo_Value(track_at(i), "B_MUTE", 1) end
+  end
+  local function restore()
+    if not snapshot then return end
+    for _, s in ipairs(snapshot) do
+      if reaper.SetTrackUISolo then reaper.SetTrackUISolo(s.t, s.solo ~= 0 and 1 or 0, 0) end
+      reaper.SetMediaTrackInfo_Value(s.t, "I_SOLO", s.solo)
+      reaper.SetMediaTrackInfo_Value(s.t, "B_MUTE", s.mute)
+    end
+    snapshot = nil
+  end
+
+  local ok, res = pcall(function()
+    local warnings = {}
+    -- A lingering solo turns a "full mix" bounce into a few parts at -30..-40 dB.
+    if not opts.stems and not (solo_list and #solo_list > 0) and not opts.allow_solo and any_solo() then
+      local who = soloed_tracks()
+      error("tracks are soloed (" .. (#who > 0 and table.concat(who, ", ") or "UI solo") .. "): the render "
+        .. "would hold only those. Clear solo (track update solo=false), or pass solo_indices for a "
+        .. "deliberate solo render, or allow_solo=true.", 0)
+    end
+    if reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "B_MUTE") == 1 then
+      warnings[#warnings + 1] = "master track is muted"
+    end
+    -- Audio goes offline while REAPER is in the background (pref offlineinact); a render then drops it.
+    if opts.media_online ~= false then reaper.Main_OnCommand(40101, 0) end
+
+    local targets = {}
+    local _, tl = reaper.GetSetProjectInfo_String(0, "RENDER_TARGETS", "", false)
+    targets = split_targets(tl)
+    -- An existing target makes REAPER ask "overwrite?" in a modal, which hangs the bridge.
+    local clash = {}
+    for _, f in ipairs(targets) do
+      if reaper.file_exists(f) then clash[#clash + 1] = f end
+    end
+    if #clash > 0 then
+      error("refusing to render over existing file(s): " .. table.concat(clash, "; ")
+        .. " (REAPER's overwrite prompt would block the bridge). Use a new pattern or delete them.", 0)
+    end
+    if opts.stems and opts.track_indices and #targets > 0 and #targets ~= #opts.track_indices then
+      warnings[#warnings + 1] = ("stems: REAPER planned %d file(s) for %d track(s)"):format(#targets, #opts.track_indices)
+    end
+
+    reaper.Main_OnCommand(42230, 0)
+
+    local files = {}
+    for _, f in ipairs(targets) do
+      local rec = { path = f }
+      local size = file_size(f)
+      if not size then
+        rec.missing = true
+        warnings[#warnings + 1] = "not written: " .. f
+      else
+        rec.bytes = size
+        if opts.measure ~= false then
+          for k, v in pairs(measure_file(f)) do rec[k] = v end
+          if rec.peak_db and rec.peak_db < SILENT_PEAK_DB then
+            warnings[#warnings + 1] = ("near-silent: %s peaks at %.1f dBFS"):format(f, rec.peak_db)
+          end
+        end
+        if opts.stems and f:match("[/\\][^/\\]*Master[^/\\]*$") then
+          warnings[#warnings + 1] = "stems=true but REAPER rendered the master mix: " .. f
+        end
+      end
+      files[#files + 1] = rec
+    end
+    local ret = { rendered_to = path or "(project render path)", bounds = bounds,
+                  stems = opts.stems and true or false, files = files }
+    if #warnings > 0 then ret.warnings = warnings end
+    return ret
+  end)
+  restore()
+  if not ok then error(res, 0) end
+  return { ret = res }
 end
 
 function DSL.create_bus(name, source_indices)
@@ -1154,15 +1482,31 @@ local function tidy_err(msg)
   return msg
 end
 
+-- "lua:12: attempt to index a nil value" -> append the offending source line so the fix is obvious.
+local function with_line(msg, code)
+  local n = tonumber(msg:match("^lua:(%d+):"))
+  if not n or type(code) ~= "string" then return msg end
+  local i = 0
+  for raw in (code .. "\n"):gmatch("([^\n]*)\n") do
+    i = i + 1
+    if i == n then
+      local line = raw:gsub("^%s+", "")
+      if #line > 160 then line = line:sub(1, 157) .. "..." end
+      return msg .. "  [line " .. n .. ": " .. line .. "]"
+    end
+  end
+  return msg
+end
+
 dispatch = function(req)
   local func = req.func
   if func == "run_lua" then
     local chunk, cerr = load(req.code, "mcp_run_lua", "t",
       setmetatable({ reaper = reaper, json = json, to_handle = to_handle,
                      handles = handles }, { __index = _G }))
-    if not chunk then return { ok = false, error = tidy_err(cerr) } end
+    if not chunk then return { ok = false, error = with_line(tidy_err(cerr), req.code) } end
     local ok, ret = pcall(chunk)
-    if not ok then return { ok = false, error = tidy_err(ret) } end
+    if not ok then return { ok = false, error = with_line(tidy_err(ret), req.code) } end
     return { ok = true, ret = ret }
   end
 

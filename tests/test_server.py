@@ -97,6 +97,85 @@ def check_batch_timeout():
     assert calls[2] == {"func": "save_project", "args": ["/tmp/song.RPP"]}, calls[2]
     return True
 
+
+class _Recorder:
+    """Stands in for Bridge: records what a tool builder would send to the bridge."""
+
+    def __init__(self):
+        self.sent = []
+
+    def call(self, func, args=None, code=None, timeout=None):
+        self.sent.append({"func": func, "args": args, "code": code, "timeout": timeout})
+        return None
+
+
+def _build(name, arguments):
+    from reaper_mcp import server
+    rec = _Recorder()
+    server.TOOL_INDEX[name]["_builder"](rec, arguments)
+    return rec.sent[-1]
+
+
+def check_tool_params():
+    """Optional params added from the 2026-10-22 tool-call audit reach the bridge; old calls are unchanged."""
+    from reaper_mcp import server
+    names = {t["name"] for t in server.TOOLS}
+    assert names == {"status", "transport", "track", "midi", "fx", "send", "item", "envelope", "project",
+                     "render", "action", "reaper_call", "run_lua", "batch"}, names  # frozen set
+    c = _build("fx", {"action": "set", "track_index": 0, "fx_index": 1, "param": "Ratio", "formatted": "4"})
+    assert c["func"] == "set_fx_param" and c["args"] == [0, 1, "Ratio", None, "4"], c
+    c = _build("fx", {"action": "set", "track_index": 0, "fx_index": 1, "param": 2, "value": 0.5})
+    assert c["args"] == [0, 1, 2, 0.5, None], c
+    c = _build("send", {"action": "add", "track_index": 3, "dest_index": 5, "dst_channel": 2, "mode": "pre_fader"})
+    assert c["args"] == [3, 5, {"dst_channel": 2, "mode": "pre_fader"}], c
+    c = _build("send", {"action": "add", "track_index": 3, "dest_index": 5})
+    assert c["args"] == [3, 5, None], c
+    c = _build("send", {"action": "update", "track_index": 3, "send_index": 0, "src_channel": 0, "volume_db": -3})
+    assert c["args"] == [3, 0, {"volume_db": -3, "src_channel": 0}], c
+    c = _build("envelope", {"action": "set", "track_index": 1, "name": "Trim Volume",
+                            "points": [{"beats": 0, "value": -3}], "unit": "db"})
+    assert c["args"] == [1, "Trim Volume", [{"beats": 0, "value": -3}], "db"], c
+    c = _build("envelope", {"action": "get", "track_index": 1, "name": "Volume"})
+    assert c["args"] == [1, "Volume", None], c
+    c = _build("render", {"path": "/tmp/r", "pattern": "a", "solo_indices": [2], "mute_indices": [4],
+                          "allow_solo": True, "media_online": False, "measure": False})
+    opts = c["args"][1]
+    assert opts["solo_indices"] == [2] and opts["mute_indices"] == [4] and opts["allow_solo"] is True
+    assert opts["media_online"] is False and opts["measure"] is False and c["timeout"] == server.RENDER_TIMEOUT, c
+    c = _build("run_lua", {"code": "return 1"})
+    assert c["code"] == "return 1" and c["timeout"] is None, c
+    c = _build("run_lua", {"code": "return 1", "timeout": 120})
+    assert c["timeout"] == 120.0, c
+    c = _build("run_lua", {"code": "return 1", "timeout": 99999})
+    assert c["timeout"] == server.RUN_LUA_MAX_TIMEOUT, c
+    schema = server.TOOL_INDEX["run_lua"]["inputSchema"]
+    assert schema["properties"]["timeout"]["maximum"] == server.RUN_LUA_MAX_TIMEOUT
+    return True
+
+
+def check_timeout_hints():
+    """A request REAPER is still running says 'do not resend' instead of inviting a duplicate."""
+    from reaper_mcp import server
+    d = tempfile.mkdtemp(prefix="reaper_ipc_busy_")
+    prev = os.environ.get("REAPER_MCP_IPC_DIR")
+    os.environ["REAPER_MCP_IPC_DIR"] = d
+    try:
+        b = server.Bridge()
+        open(b.heart, "w").close()
+        open(b.busy, "w").close()
+        try:
+            b.call("ping", timeout=0.2)
+        except server.BridgeError as e:
+            msg = str(e)
+        else:
+            return False
+        return "Do not resend" in msg and "status" in msg
+    finally:
+        if prev is None:
+            os.environ.pop("REAPER_MCP_IPC_DIR", None)
+        else:
+            os.environ["REAPER_MCP_IPC_DIR"] = prev
+
 FAKE_CHILD = r"""
 import json, sys, time
 for line in sys.stdin:
@@ -275,6 +354,8 @@ def main():
         pyproject = open(os.path.join(ROOT, "pyproject.toml"), encoding="utf-8").read()
         check("pyproject version matches the package", 'version = "%s"' % __version__ in pyproject)
         check("batch inherits the render timeout", check_batch_timeout())
+        check("audit params reach the bridge; tool set stays frozen", check_tool_params())
+        check("busy timeout says do not resend", check_timeout_hints())
         check("lua json encoder handles mixed utf-8",
               "utf8_len" in src and "is_cont" in src)
         check("python reads mailbox as utf-8 replace", check_invalid_utf8_response())

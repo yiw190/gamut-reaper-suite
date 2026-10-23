@@ -144,7 +144,7 @@ token. Gamut connects over the HTTP service, so it needs the full setup. Keep th
 python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.4 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0-rc.5 ready`.
 
 MCP client config (any client that runs stdio servers):
 
@@ -256,6 +256,15 @@ REAPER is busy or hung, and the watchdog restarts a hung one. `--json` prints `{
 ## Tools
 
 `status` `transport` `track` `midi` `fx` `send` `item` `envelope` `project` `render` `action` `reaper_call` `run_lua` `batch`
+
+Behaviour worth knowing (all optional parameters; older calls work unchanged):
+
+- `status` also returns `any_solo` (REAPER's own solo state, which can differ from a track's `I_SOLO`), `master_mute` and `dirty`.
+- `render` runs action 40101 (set all media online) first (`media_online=false` skips it), refuses when a target file already exists (REAPER's overwrite prompt would block the bridge) and when tracks are soloed (`allow_solo=true`, or `solo_indices` / `mute_indices` to solo/mute tracks for this render only; they are restored afterwards). It returns `files: [{path, bytes, length_sec, peak_db, lufs_i}]` and `warnings` (near-silent, file not written, master muted, stems that came out as the master). `measure=false` skips the loudness scan.
+- `fx set` takes `formatted` instead of `value`: the value as the plugin shows it (`-18` for dB, `4` for 4:1, `inf`, or a label such as `3.2k`). It searches the display text and returns the `formatted` value it actually set.
+- `send add|update` take `mode` (`post_fader` / `pre_fader` / `pre_fx`) and `src_channel` / `dst_channel`, the first channel of a stereo pair counted from 0 (`dst_channel=2` = channels 3/4, a compressor's sidechain input). The destination track gets more channels if it needs them.
+- `envelope get|set` take `unit=db` for volume-type envelopes. `set` turns an inactive (`ACT 0`) envelope back on and rejects points that have no `value`.
+- `run_lua` takes `timeout` (seconds, at most 600). Errors quote the failing source line. REAPER is frozen while a snippet runs, so start long host commands in the background and poll their log.
 
 ## Tests
 

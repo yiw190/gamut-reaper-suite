@@ -82,13 +82,6 @@ def _poll_wait(started: float) -> float:
     return FAST_POLL if (time.monotonic() - started) < FAST_POLL_WINDOW else POLL
 
 
-def real_patch_text(patch) -> str:
-    if not isinstance(patch, dict):
-        return ""
-    lines = [patch[k] for k in ("message", "warning") if isinstance(patch.get(k), str)]
-    return "\n".join(lines)
-
-
 class Bridge:
     def __init__(self) -> None:
         self.dir = default_ipc_dir()
@@ -98,7 +91,6 @@ class Bridge:
         self.busy = os.path.join(self.dir, "busy")
         self.mutex = os.path.join(self.dir, "ipc.mutex")
         self.timeout = float(os.environ.get("REAPER_MCP_TIMEOUT", "10"))
-        self.notices = []  # real_patch reports of the current tool call, shown to the agent next to the result
         os.makedirs(self.dir, mode=0o700, exist_ok=True)  # the mailbox accepts run_lua: keep it private
 
     def _heartbeat_ok(self) -> bool:
@@ -211,14 +203,8 @@ class Bridge:
                         os.remove(self.resp)
                     except OSError:
                         pass
-                    patch = data.get("real_patch")
                     if not data.get("ok", False):
-                        err = data.get("error", "unknown bridge error")
-                        if patch:
-                            err += "\n" + real_patch_text(patch)
-                        raise BridgeError(err)
-                    if patch:
-                        self.notices.append(patch)
+                        raise BridgeError(data.get("error", "unknown bridge error"))
                     return data.get("ret")
                 time.sleep(_poll_wait(started))
             # Not picked up: withdraw it, or REAPER would run it later on its own (a retry would run it twice).
@@ -739,18 +725,13 @@ def handle_request(bridge, msg):
         spec = TOOL_INDEX.get(name)
         if not spec:
             return make_error(rid, -32602, f"unknown tool: {name}")
-        notices = getattr(bridge, "notices", None)
-        if isinstance(notices, list):
-            del notices[:]
         try:
             ret = spec["_builder"](bridge, args)
             text = json.dumps(ret, ensure_ascii=False, separators=(",", ":")) \
                 if not isinstance(ret, str) else ret
-            content = [{"type": "text", "text": text}]
-            notes = "\n".join(t for t in map(real_patch_text, notices or []) if t)
-            if notes:
-                content.append({"type": "text", "text": notes})
-            return make_result(rid, {"content": content})
+            return make_result(rid, {
+                "content": [{"type": "text", "text": text}],
+            })
         except Exception as e:  # noqa: BLE001 - BridgeError and builder errors alike go back as tool errors
             text = "missing argument: %s" % e.args[0] if isinstance(e, KeyError) else str(e)
             return make_result(rid, {

@@ -301,12 +301,6 @@ def fake_bridge(bridge_dir, stop):
             else:
                 ret = {"echo": func, "args": payload.get("args")}
             out = {"id": payload.get("id"), "ok": True, "ret": ret}
-            code = payload.get("code") or ""
-            if func == "run_lua" and code.startswith("dls"):
-                out["real_patch"] = {"offlined": [{"track": 2, "track_name": "Strings", "fx": 1}],
-                                     "message": "real patch: set the new DLSMusicDevice on track 2 (Strings) offline."}
-                if code == "dls-fail":
-                    out["ok"], out["error"] = False, "lua:2: boom"
             tmp = resp + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(out, f)
@@ -448,21 +442,6 @@ def main():
         body = json.loads(r["result"]["content"][0]["text"])  # the fake bridge echoes funcs, it doesn't run Lua
         check("batch: a bad slot doesn't abort the rest", not r["result"].get("isError")
               and len(body) == 2 and body[0]["echo"] == "run_lua")
-
-        r = rpc(proc, {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
-                       "params": {"name": "run_lua", "arguments": {"code": "dls"}}})
-        content = r["result"]["content"]
-        check("real_patch: result text unchanged, report appended as its own line",
-              json.loads(content[0]["text"]) == 1 and len(content) == 2
-              and content[1]["text"].startswith("real patch: set the new DLSMusicDevice"))
-        r = rpc(proc, {"jsonrpc": "2.0", "id": 15, "method": "tools/call",
-                       "params": {"name": "status", "arguments": {}}})
-        check("real_patch: the next call does not repeat it", len(r["result"]["content"]) == 1)
-        r = rpc(proc, {"jsonrpc": "2.0", "id": 16, "method": "tools/call",
-                       "params": {"name": "run_lua", "arguments": {"code": "dls-fail"}}})
-        text = r["result"]["content"][0]["text"]
-        check("real_patch on a failed call rides on the error text", r["result"].get("isError")
-              and text.startswith("lua:2: boom") and "real patch: set the new" in text)
 
         rpc(proc, {"jsonrpc": "2.0", "method": "ping"})
         rpc(proc, {"jsonrpc": "2.0", "method": "tools/call", "params": {"name": "status", "arguments": {}}})

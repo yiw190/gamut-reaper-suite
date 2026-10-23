@@ -130,84 +130,6 @@ def json_checks(lupa, check) -> None:
           and bad(js, b'"ab\\') is not None and bad(js, b'"\\u00e9') is not None)
 
 
-def real_patch_checks(lua, g, rpc, check) -> None:
-    """One live DLSMusicDevice per project: a second is refused up front or set offline right after the call."""
-    lua.execute("""
-        tracks = { new_track("GM DLS"), new_track("Piano"), new_track("Strings") }
-        for _, t in ipairs(tracks) do t.selected = false end
-    """)
-
-    def fx(ti):
-        lst = g.tracks[ti + 1]["fxlist"]
-        if lst is None:
-            return []
-        return [(lst[i]["name"], bool(lst[i]["offline"])) for i in range(1, len(lst) + 1)]
-
-    r = rpc("get_project_summary", [False])
-    check("status: dls_instances 0 and no warnings on an empty project",
-          r["ret"].get("dls_instances") == 0 and "warnings" not in r["ret"], r)
-
-    r = rpc("add_track_fx", [0, "DLSMusicDevice"])
-    check("first DLS add is allowed", r.get("ok") and "DLSMusicDevice" in r["ret"]["name"]
-          and "real_patch" not in r, r)
-    r = rpc("add_track_fx", [1, "ReaComp"])
-    check("non-DLS FX unaffected", r.get("ok") and r["ret"]["name"] == "ReaComp" and "real_patch" not in r, r)
-
-    r = rpc("add_track_fx", [1, "AU: DLSMusicDevice (Apple)"])
-    err = r.get("error") or ""
-    check("fx add of a second DLS is refused", r.get("ok") is False and err.startswith("real patch:")
-          and "track 0 (GM DLS)" in err and "parallel" in err and fx(1) == [("ReaComp", False)], r)
-    r = rpc("batch", [[{"func": "add_track_fx", "args": [2, "DLSMusicDevice"]},
-                       {"func": "add_track_fx", "args": [2, "ReaEQ"]}]])
-    check("batch: second DLS slot refused, the rest runs", r.get("ok")
-          and "real patch" in (r["ret"][0].get("error") or "") and r["ret"][1]["name"] == "ReaEQ"
-          and fx(2) == [("ReaEQ", False)], r)
-
-    r = rpc("run_lua", code="local t = reaper.GetTrack(0, 2)\n"
-            "reaper.TrackFX_AddByName(t, 'DLSMusicDevice', false, 1)\nreturn 'done'")
-    rp = r.get("real_patch") or {}
-    check("run_lua adding a second DLS: new one offlined, ret kept, real_patch in the response",
-          r.get("ok") and r.get("ret") == "done"
-          and rp.get("offlined") == [{"track": 2, "track_name": "Strings", "fx": 1}]
-          and "Kept the one on track 0 (GM DLS)" in rp.get("message", "") and "send" in rp.get("message", "")
-          and fx(2)[1] == ("AU: DLSMusicDevice (Apple)", True) and fx(0) == [("AU: DLSMusicDevice (Apple)", False)], r)
-    rec = json.loads(g.ext_state["Hibiki/receipts"])
-    check("the receipt notes the offlined instance", any("real patch" in ln for ln in rec[-1]["lines"]), rec[-1])
-    r = rpc("get_project_summary", [False])
-    check("status counts online instances only", r["ret"].get("dls_instances") == 1 and "warnings" not in r["ret"], r)
-
-    r = rpc("run_lua", code="reaper.TrackFX_SetOffline(reaper.GetTrack(0, 2), 1, false)\nerror('boom')")
-    rp = r.get("real_patch") or {}
-    check("failing run_lua that re-enabled one still gets patched and reported",
-          r.get("ok") is False and "boom" in (r.get("error") or "") and rp.get("offlined")
-          and fx(2)[1][1] is True, r)
-
-    lua.execute("tracks[1].selected = true")
-    r = rpc("action", [40062])
-    rp = r.get("real_patch") or {}
-    check("duplicate track (40062): the copy's DLS goes offline",
-          r.get("ok") and r.get("ret") is True and g.tracks[2]["name"] == "GM DLS"
-          and rp.get("offlined") == [{"track": 1, "track_name": "GM DLS", "fx": 0}]
-          and fx(1) == [("AU: DLSMusicDevice (Apple)", True)] and fx(0)[0][1] is False, r)
-
-    lua.execute("""
-        tracks = { new_track("A"), new_track("B"), new_track("C") }
-        tracks[1].fxlist = { new_fx("AU: DLSMusicDevice (Apple)") }
-        tracks[2].fxlist = { new_fx("My GM", "AU: DLSMusicDevice (Apple)") }
-    """)
-    r = rpc("get_project_summary", [False])
-    w = (r["ret"].get("warnings") or [""])[0]
-    check("status: two online at load (one renamed) -> dls_instances 2 + warning",
-          r["ret"].get("dls_instances") == 2 and "track 1 (B)" in w and "crash" in w, r)
-    r = rpc("update_track", [2, {"pan": 0.2}])
-    rp = r.get("real_patch") or {}
-    check("loaded with two online: warning only, nothing offlined",
-          r.get("ok") and "warning" in rp and "offlined" not in rp
-          and fx(0)[0][1] is False and fx(1)[0][1] is False, r)
-    r = rpc("add_track_fx", [2, "ReaComp"])
-    check("non-DLS add still works on such a project", r.get("ok") and r["ret"]["name"] == "ReaComp", r)
-
-
 def main() -> None:
     try:
         import lupa
@@ -722,8 +644,6 @@ def main() -> None:
     r = rpc("run_lua", code="local a = 1\nlocal t = nil\nreturn t.x")
     check("run_lua runtime error quotes the failing line",
           r.get("ok") is False and "[line 3: return t.x]" in (r.get("error") or ""), r)
-
-    real_patch_checks(lua, g, rpc, check)
 
     json_checks(lupa, check)
 

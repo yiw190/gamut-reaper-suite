@@ -592,6 +592,100 @@ local function brain_edit()
   end)
 end
 
+---------------------------------------------------------------- saved versions (survive a REAPER restart)
+-- After a reply that changed the project, a copy of the project as it is (saved or not) goes to
+-- <project folder>/.hibiki/history/<name>/<stamp>.RPP(.gz) with a line in index.jsonl. Main_SaveProjectEx to another
+-- path keeps the open project's path and dirty state (checked on REAPER 7.79). No media is copied: ~40 KB a version.
+local SV = { done = {}, cache = nil, cache_key = nil, on = reaper.GetExtState(EXT, 'snapshots') ~= '0' }
+local SEP = P.WIN and '\\' or '/'
+local MAX_SNAPS = 200
+local function project_where()
+  local _, path = reaper.EnumProjects(-1, '')
+  if not path or path == '' then return nil end
+  local dir, file = path:match('^(.*)[/\\]([^/\\]+)$')
+  if not dir then return nil end
+  local name = file:gsub('%.[Rr][Pp][Pp]$', '')
+  return dir, name, dir .. SEP .. '.hibiki' .. SEP .. 'history' .. SEP .. name
+end
+
+function SV.snap(r)
+  SV.done[r.id] = true
+  local dir, name, hd = project_where()
+  if not dir then return end
+  reaper.RecursiveCreateDirectory(hd, 0)
+  local stamp = os.date('%Y%m%d-%H%M%S')
+  local file = hd .. SEP .. stamp .. '.RPP'
+  if exists(file) then return end
+  reaper.Main_SaveProjectEx(0, file, 0)
+  if not exists(file) then return end
+  local lines = type(r.lines) == 'table' and r.lines or {}
+  local f = io.open(hd .. SEP .. 'index.jsonl', 'ab')
+  if f then
+    f:write('{"file":', P.jstr(stamp .. '.RPP' .. (P.WIN and '' or '.gz')), ',"at":', tostring(os.time()),
+      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(lines[1] or ''), '}\n')
+    f:close()
+  end
+  if not P.WIN then -- compress, and keep the newest MAX_SNAPS, in the background
+    P.sh('( /usr/bin/gzip -9 -f ' .. P.q(file) .. '; cd ' .. P.q(hd) .. ' && /bin/ls -t | /usr/bin/grep "\\.RPP\\.gz$" | '
+      .. '/usr/bin/tail -n +' .. (MAX_SNAPS + 1) .. ' | while read f; do /bin/rm -f "$f"; done ) >/dev/null 2>&1 &')
+  end
+  SV.cache_key = nil
+end
+
+-- newest first, only versions whose file is still there
+function SV.list()
+  local _, _, hd = project_where()
+  if not hd then return {} end
+  if SV.cache_key == hd and SV.cache then return SV.cache end
+  local out = {}
+  local f = io.open(hd .. SEP .. 'index.jsonl', 'rb')
+  if f then
+    for line in f:lines() do
+      local e = P.decode(line)
+      if type(e) == 'table' and type(e.file) == 'string' and e.file:match('^[%w._-]+$')
+          and (exists(hd .. SEP .. e.file) or exists(hd .. SEP .. e.file:gsub('%.gz$', ''))) then
+        table.insert(out, 1, e)
+      end
+    end
+    f:close()
+  end
+  SV.cache, SV.cache_key = out, hd
+  return out
+end
+
+-- open a saved version in a new tab as <name>_restore_<stamp>.RPP next to the project; the project itself is untouched
+function SV.open(e)
+  local dir, name, hd = project_where()
+  if not dir then return end
+  local src = hd .. SEP .. e.file
+  local rpp = src:gsub('%.gz$', '')
+  if not exists(rpp) then
+    if P.WIN or not exists(src) then M.note('That version is gone'); return end
+    P.sh('/usr/bin/gunzip -c ' .. P.q(src) .. ' > ' .. P.q(rpp))
+  end
+  if not exists(rpp) then M.note('Could not unpack that version'); return end
+  local stamp = e.file:match('^([%d-]+)') or os.date('%Y%m%d-%H%M%S')
+  local target = dir .. SEP .. name .. '_restore_' .. stamp .. '.RPP'
+  reaper.Main_OnCommand(40859, 0) -- new project tab
+  reaper.Main_openProject('noprompt:' .. rpp) -- opened where it was saved, so relative media paths resolve
+  if not exists(target) then reaper.Main_SaveProjectEx(0, target, 0) end -- rewritten for the project folder
+  if exists(target) then reaper.Main_openProject('noprompt:' .. target) end
+  if src ~= rpp then os.remove(rpp) end
+  M.note('Opened ' .. name .. '_restore_' .. stamp .. ' in a new tab')
+end
+
+local function snap_tick()
+  if not SV.on or S.active then return end
+  local r = R.list[#R.list]
+  if type(r) ~= 'table' or type(r.id) ~= 'string' or SV.done[r.id] then return end
+  if r.proj ~= select(2, reaper.EnumProjects(-1, '')) or (tonumber(r.n) or 0) == 0 then return end
+  -- a panel reply right after it ends; changes from outside the panel once they have settled for 10 s
+  if r.id == R.ended or (r.id:match('^mcp%-') and os.time() - (tonumber(r.at) or 0) >= 10) then SV.snap(r) end
+end
+-- receipts already there when the panel starts were snapshotted by an earlier run (or predate this feature)
+read_receipts()
+for _, r in ipairs(R.list) do if type(r) == 'table' and type(r.id) == 'string' then SV.done[r.id] = true end end
+
 ---------------------------------------------------------------- change history (go back to before any reply)
 -- Undo is linear: going back to before reply X undoes X and everything above it (later replies, the user's own
 -- edits); Redo all replays the same number of steps. Lives as long as REAPER's undo history (until a restart).
@@ -668,19 +762,42 @@ local function history_popup(list)
     end
   end
   if #list == 0 then ImGui.TextDisabled(ctx, 'No agent changes in this project yet.') end
+  local saved = SV.list()
+  if #saved > 0 then
+    ImGui.Dummy(ctx, 0, 6)
+    ImGui.Text(ctx, 'Saved versions')
+    ImGui.TextColored(ctx, C.muted, 'Kept after a restart. Opens as a copy in a new tab; this project stays as it is.')
+    for i, e in ipairs(saved) do
+      if i > 15 then
+        ImGui.TextColored(ctx, C.muted, ('+%d older in .hibiki/history'):format(#saved - 15))
+        break
+      end
+      ImGui.Separator(ctx)
+      local d = os.date('%m-%d %H:%M', tonumber(e.at) or 0)
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.Text(ctx, d)
+      ImGui.SameLine(ctx)
+      ImGui.TextColored(ctx, C.muted, P.truncate(('%s · %s'):format(plural(tonumber(e.n) or 0, 'change'), tostring(e.what or '')), 220))
+      if ImGui.IsItemHovered(ctx) then P.show_tip(tostring(e.what or '') .. '\n' .. tostring(e.file)) end
+      ImGui.SameLine(ctx)
+      if ImGui.Button(ctx, 'Open as copy##sv' .. i) then SV.open(e); ImGui.CloseCurrentPopup(ctx) end
+    end
+  end
   ImGui.EndPopup(ctx)
 end
 
 -- composer chip, shown once this project has agent changes (or a history revert to redo)
 function M.changes_chip()
   local list = project_receipts()
-  if #list == 0 and not H.last and not H.open_req then return end
+  if #list == 0 and not H.last and not H.open_req and #SV.list() == 0 then return end
   ImGui.SameLine(ctx, 0, 2)
   if P.chip('changes', 'Changes', C.muted, false) or H.open_req then
     H.open_req, H.confirm = false, nil
     ImGui.OpenPopup(ctx, 'hibiki_changes')
   end
-  if ImGui.IsItemHovered(ctx) then P.show_tip('What agents changed in this project; go back to before any reply.') end
+  if ImGui.IsItemHovered(ctx) then
+    P.show_tip('What agents changed in this project: go back to before any reply, or open a saved version.')
+  end
   history_popup(list)
 end
 
@@ -692,6 +809,7 @@ function M.tick(t)
     if s and not E.busy then E.run(s, e, what) else M.note('Ears: select a time range first') end
   end
   read_receipts()
+  snap_tick()
   MT.tick()
   if t - RK.at > 1 then RK.scan() end
 end
@@ -751,6 +869,15 @@ function M.settings(A)
     end
     if MT.on then right_note(MT.running() and 'measuring' or MT.status) end
     row()
+    if A.checkbox('snapshots', 'Save a version after each reply', SV.on, w) then
+      SV.on = not SV.on
+      reaper.SetExtState(EXT, 'snapshots', SV.on and '1' or '0', true)
+    end
+    if ImGui.IsItemHovered(ctx) then
+      P.show_tip('After a reply that changed the project, a copy of it goes to .hibiki/history next to the .RPP\n'
+        .. '(about 40 KB, no audio; the newest 200 are kept). Open them from Changes.')
+    end
+    row()
     ImGui.AlignTextToFramePadding(ctx)
     local info = BR.info
     ImGui.Text(ctx, info and ('Agent rules (' .. (tonumber(info.count) or 0) .. ')') or 'Agent rules')
@@ -770,6 +897,6 @@ end
 function M.exit() reaper.SetExtState(EXT, 'turn', '', false) end
 
 if MT.on then pcall(MT.ensure) end
-M._R, M._MT, M._RK, M._E, M._H = R, MT, RK, E, H -- headless tests
+M._R, M._MT, M._RK, M._E, M._H, M._SV = R, MT, RK, E, H, SV -- headless tests
 return M
 end

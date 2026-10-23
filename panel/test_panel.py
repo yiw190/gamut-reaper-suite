@@ -1249,6 +1249,55 @@ def test_ears_render_and_attach():
           "ears: bars 6.1-8.1 (time selection, 4.0 s)" in body and "LUFS-I -8.0" in body and "3.15k +4.1" in body, body[-500:])
 
 
+
+def test_saved_versions():
+    if OS_NAME.startswith("Win"):
+        return  # the paths use \ there, which this host's filesystem can't take; the logic is the same
+    p = studio_panel()
+    st = p.lua.globals().EXT_STATE
+    proj_dir = p.tmp / "Song"
+    proj_dir.mkdir()
+    proj = str(proj_dir / "Song.RPP")
+    p.lua.globals().PROJ_PATH = proj
+    p.lua.execute(r"""
+      reaper.EnumProjects = function() return 0, PROJ_PATH end
+      SAVED, OPENED, CMDS2 = {}, {}, {}
+      reaper.Main_SaveProjectEx = function(_, path) SAVED[#SAVED + 1] = path; local f = io.open(path, 'wb'); f:write('<REAPER_PROJECT\n>'); f:close() end
+      reaper.Main_openProject = function(path) OPENED[#OPENED + 1] = path end
+      reaper.Main_OnCommand = function(id) CMDS2[#CMDS2 + 1] = id end
+      reaper.RecursiveCreateDirectory = function(d) os.execute('mkdir -p "' .. d .. '"') end
+    """)
+    p.type_and_send("thin the pad")
+    turn = st["Hibiki/turn"]
+    st["Hibiki/receipts"] = json.dumps([{"id": turn, "proj": proj, "at": 1, "n": 2, "points": 1,
+                                         "lines": ["#3 Pad: volume -3.0 dB", "#3 Pad: add ReaEQ"]}])
+    st["Hibiki/receipts_seq"] = "s1"
+    p.m.studio.tick(3000)
+    check("saved versions: nothing while the reply runs", len(p.lua_list(p.lua.globals().SAVED)) == 0)
+    p.sse({"type": "session_idle"})
+    p.requests()
+    p.m.studio.tick(3001)
+    saved = p.lua_list(p.lua.globals().SAVED)
+    hist = proj_dir / ".hibiki/history/Song"
+    check("saved versions: one copy of the project in .hibiki/history after the reply",
+          len(saved) == 1 and saved[0].startswith(str(hist)) and saved[0].endswith(".RPP"), saved)
+    index = (hist / "index.jsonl").read_text().splitlines()
+    e = json.loads(index[0])
+    check("saved versions: index line with the reply and what changed",
+          len(index) == 1 and e["turn"] == turn and e["n"] == 2 and e["what"] == "#3 Pad: volume -3.0 dB", index)
+    cmds = [c for c in p.lua_list(p.lua.globals().CMDS) if "gzip -9" in c]
+    check("saved versions: compressed and pruned to the newest 200 in the background",
+          len(cmds) == 1 and "tail -n +201" in cmds[0] and cmds[0].rstrip().endswith("&"), cmds)
+    p.m.studio.tick(3002)
+    check("saved versions: once per reply", len(p.lua_list(p.lua.globals().SAVED)) == 1)
+    lst = p.lua_list(p.m.studio._SV.list())
+    check("saved versions: listed newest first", len(lst) == 1 and lst[0].turn == turn)
+    p.m.studio._SV.open(lst[0])
+    opened = p.lua_list(p.lua.globals().OPENED)
+    check("saved versions: opens in a new tab as <name>_restore_<stamp>.RPP next to the project, project untouched",
+          p.lua_list(p.lua.globals().CMDS2) == [40859] and len(opened) == 2 and opened[1].startswith("noprompt:" + str(proj_dir / "Song_restore_"))
+          and proj not in [x.replace("noprompt:", "") for x in opened], opened)
+
 def main():
     global OS_NAME
     try:

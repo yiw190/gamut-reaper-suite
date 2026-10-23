@@ -221,7 +221,12 @@ while a composition is open and shows the pending pinyin under the input.
   undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Studio → Review changes off) stops the cards;
   every change is still a labelled undo step. **Changes** (composer, or Agent settings → Studio → Agent changes) lists every reply
   that changed this project (last 30) and goes back to before any of them: undo is linear, so later replies and your
-  own edits since are undone too (it says so first); **Redo all** replays them. Lives as long as REAPER's undo history. Changes made outside the panel (the Gamut app, a
+  own edits since are undone too (it says so first); **Redo all** replays them. Lives as long as REAPER's undo history.
+- **Saved versions.** After a reply that changed the project, a copy of it (saved or not; `Main_SaveProjectEx` to
+  another path leaves the open project's path and dirty state alone) goes to `<project folder>/.hibiki/history/<name>/`
+  as `<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media, the newest 200 kept. **Changes** lists
+  them after a restart too; **Open as copy** opens one in a new tab as `<name>_restore_<stamp>.RPP` next to the
+  project. Agent settings → Studio → Save a version after each reply turns it off. Changes made outside the panel (the Gamut app, a
   CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
   every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,

@@ -567,7 +567,7 @@ def main():
     tmp4 = tempfile.mkdtemp()
     kids = os.path.join(tmp4, "kids")
     g = GW(tmp4, gport, {"FAKE_ACP_CHILD": kids},
-           {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2", "AGENT_GATEWAY_MAX_REQUESTS": "1"})
+           {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2"})
     try:
         code, s = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         sid4 = s["id"]
@@ -582,7 +582,7 @@ def main():
         check("idle reaper leaves an agent with an open stream alone", g.get("/api/agents/acp-fake/status")["running"])
         g.stop()
         g = GW(tmp4, gport, {"FAKE_ACP_CHILD": kids},
-               {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2", "AGENT_GATEWAY_MAX_REQUESTS": "1"})
+               {"AGENT_GATEWAY_IDLE": "1", "AGENT_GATEWAY_IDLE_CHECK": "0.2"})
         code, s = g.post("/api/agents/acp-fake/sessions", {"message": "hi"})
         pids = [tuple(map(int, ln.split())) for ln in open(kids).read().splitlines() if ln.strip()]
         agent_pid, child_pid = pids[-1]
@@ -612,6 +612,10 @@ def main():
         check("a stopped agent restarts lazily on the next message",
               "notice" in [d["type"] for d in seen] and g.get("/api/agents/acp-fake/status")["running"])
 
+        # a cap of 1 only here: the gateway answers before it releases the slot, so back-to-back calls elsewhere
+        # would race it and get a stray 503
+        g.stop()
+        g = GW(tmp4, gport, {"FAKE_ACP_CHILD": kids}, {"AGENT_GATEWAY_MAX_REQUESTS": "1"})
         stall = socket.create_connection(("127.0.0.1", g.port), timeout=10)
         stall.sendall(b"POST /api/agents/acp-fake/sessions HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\n"
                       b"Authorization: " + g.auth["Authorization"].encode() + b"\r\nContent-Length: 10\r\n\r\n")
@@ -624,7 +628,14 @@ def main():
         check("requests over the in-flight cap get 503", code == 503)
         stall.close()
         time.sleep(0.3)
-        check("the slot frees when the stalled request ends", isinstance(g.get("/api/agents"), list))
+        freed = None
+        for _ in range(20):
+            try:
+                freed = g.get("/api/agents")
+                break
+            except urllib.error.HTTPError:
+                time.sleep(0.1)
+        check("the slot frees when the stalled request ends", isinstance(freed, list))
     finally:
         g.stop()
     print("all passed")

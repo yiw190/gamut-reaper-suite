@@ -450,6 +450,148 @@ def main() -> None:
           all(int(g.reaper.GetMediaTrackInfo_Value(s, "B_MAINSEND")) == 0 for s in srcs)
           and int(g.reaper.GetMediaTrackInfo_Value(bus, "B_MAINSEND")) == 1)
 
+    # --- render: preflight, overwrite guard, temporary solo, measured outputs ----
+    out_dir = tempfile.mkdtemp()
+    lua.execute("""
+        for _, t in ipairs(tracks) do t.solo = false t.mute = false end
+        renders = {}
+        fake_gain = 2.0
+    """)
+    clear()
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "mix1"}])
+    ret = r.get("ret") or {}
+    f0 = (ret.get("files") or [{}])[0]
+    check("render sets media online (40101) before rendering", r.get("ok") and count("cmd.40101") == 1
+          and count("cmd.42230") == 1, r)
+    check("render reports the file it wrote, with size, length, peak and LUFS",
+          f0.get("path") == out_dir + "/mix1.wav" and f0.get("bytes", 0) > 0 and f0.get("length_sec") == 2.0
+          and abs(f0.get("peak_db", 0) + 6.0206) < 1e-3 and abs(f0.get("lufs_i", 0) + 6.0206) < 1e-3, f0)
+    check("clean render has no warnings", "warnings" not in ret, ret)
+
+    clear()
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "mix1"}])
+    check("render refuses an existing target instead of hitting the overwrite prompt",
+          r.get("ok") is False and "existing file" in (r.get("error") or "") and count("cmd.42230") == 0, r)
+
+    lua.execute("tracks[1].solo = true")
+    clear()
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "mix2"}])
+    check("render refuses while a track is soloed and names it",
+          r.get("ok") is False and "soloed" in (r.get("error") or "") and count("cmd.42230") == 0, r)
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "mix2", "allow_solo": True}])
+    check("allow_solo=true renders anyway", r.get("ok"), r)
+    lua.execute("tracks[1].solo = false")
+
+    n_tr = len(g.tracks)
+    lua.execute("tracks[2].mute = true")
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "solo_render",
+                                         "solo_indices": [0], "mute_indices": [2]}])
+    seen = g.renders[len(g.renders)]
+    check("solo_indices / mute_indices apply during the render",
+          r.get("ok") and seen[1]["solo"] is True and all(seen[i]["solo"] is False for i in range(2, n_tr + 1))
+          and seen[3]["mute"] is True, r)
+    check("solo / mute are restored after the render",
+          all(not g.tracks[i]["solo"] for i in range(1, n_tr + 1)) and g.tracks[2]["mute"] is True
+          and not g.tracks[3]["mute"], [(g.tracks[i]["solo"], g.tracks[i]["mute"]) for i in range(1, n_tr + 1)])
+    lua.execute("tracks[2].mute = false")
+
+    lua.execute("fake_gain = 10000")
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "quiet"}])
+    check("near-silent render is flagged", r.get("ok") and any("near-silent" in w for w in r["ret"].get("warnings", [])), r)
+    lua.execute("fake_gain = math.huge")
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "silent"}])
+    f0 = (r.get("ret", {}).get("files") or [{}])[0]
+    check("digitally silent render reads -150 dB and is flagged", r.get("ok") and f0.get("peak_db") == -150
+          and any("near-silent" in w for w in r["ret"].get("warnings", [])), r)
+    lua.execute("fake_gain = 2.0")
+
+    r = rpc("render_project", [out_dir, {"bounds": "custom", "start_beats": 8, "end_beats": 8}])
+    check("custom bounds need end > start", r.get("ok") is False and "end_beats" in (r.get("error") or ""), r)
+
+    clear()
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "noon", "media_online": False, "measure": False}])
+    f0 = (r.get("ret", {}).get("files") or [{}])[0]
+    check("media_online=false skips 40101; measure=false skips the scan",
+          r.get("ok") and count("cmd.40101") == 0 and "peak_db" not in f0 and f0.get("bytes", 0) > 0, r)
+
+    lua.execute('tracks[1].name = "Kick"')
+    r = rpc("render_project", [out_dir, {"bounds": "project", "pattern": "stem_$track", "stems": True,
+                                         "track_indices": [0]}])
+    files = [f["path"] for f in r.get("ret", {}).get("files", [])]
+    check("stems render reports the per-track file", r.get("ok") and files == [out_dir + "/stem_Kick.wav"], r)
+
+    r = rpc("get_project_summary")
+    st = r.get("ret") or {}
+    check("status reports any_solo, master_mute and dirty",
+          st.get("any_solo") is False and st.get("master_mute") is False and st.get("dirty") is False, st)
+    lua.execute("ui_solo = true")
+    check("status any_solo sees a UI solo that I_SOLO hides", rpc("get_project_summary")["ret"]["any_solo"] is True)
+    lua.execute("ui_solo = false")
+
+    # --- fx set by displayed value -----------------------------------
+    lua.execute("tracks[1].fx = true tracks[1].fxp = {}")
+    r = rpc("set_fx_param", [0, 0, "Threshold", None, -18])
+    check("fx set formatted=-18 lands on -18.0 dB", r.get("ok") and r["ret"]["formatted"] == "-18.0", r)
+    r = rpc("set_fx_param", [0, 0, "Ratio", None, 4])
+    check("fx set formatted ratio 4 lands on 4.0:1, not inf/99", r.get("ok") and r["ret"]["formatted"] == "4.0:1", r)
+    r = rpc("set_fx_param", [0, 0, 1, None, "inf"])
+    check("fx set formatted 'inf' reaches the top of the range", r.get("ok") and r["ret"]["formatted"] == "inf", r)
+    r = rpc("set_fx_param", [0, 0, "Mode", None, "4"])
+    check("fx set formatted enum label matches exactly ('4', not 'Blown Capacitor 4')",
+          r.get("ok") and r["ret"]["formatted"] == "4", r)
+    r = rpc("set_fx_param", [0, 0, "Threshold", None, 12])
+    check("fx set formatted out of range is an error with the range",
+          r.get("ok") is False and "outside" in (r.get("error") or ""), r)
+    r = rpc("set_fx_param", [0, 0, "Threshold", 0.5])
+    check("fx set value still works and returns formatted", r.get("ok") and r["ret"]["formatted"] == "-30.0", r)
+    r = rpc("set_fx_param", [0, 0, "Threshold"])
+    check("fx set without value or formatted is a clear error", r.get("ok") is False and "formatted" in (r.get("error") or ""), r)
+
+    # --- sends: sidechain routing ---------------------------------------
+    lua.execute("""
+        tracks[#tracks + 1] = new_track("KickSrc")
+        tracks[#tracks + 1] = new_track("Bass")
+    """)
+    ks, bs = len(g.tracks) - 2, len(g.tracks) - 1
+    r = rpc("add_send", [ks, bs, {"dst_channel": 2, "mode": "pre_fader", "volume_db": -6}])
+    snd = g.tracks[ks + 1]["sends"][1]
+    check("add_send routes to channels 3/4 and widens the destination to 4 channels",
+          r.get("ok") and int(snd["I_DSTCHAN"]) == 2 and int(g.tracks[bs + 1]["nchan"]) == 4
+          and int(snd["I_SENDMODE"]) == 3 and abs(float(snd["vol"]) - 10 ** (-6 / 20)) < 1e-9, r)
+    r = rpc("list_sends", [ks])
+    s0 = (r.get("ret") or [{}])[0]
+    check("list_sends shows dst_channel and mode", s0.get("dst_channel") == 2 and s0.get("mode") == "pre_fader"
+          and "src_channel" not in s0, s0)
+    r = rpc("update_send", [ks, 5, {"mute": True}])
+    check("update_send on a missing send is an error", r.get("ok") is False and "no send" in (r.get("error") or ""), r)
+    r = rpc("add_send", [ks, bs, {"mode": "sideways"}])
+    check("bad send mode is an error", r.get("ok") is False, r)
+
+    # --- envelopes in dB, inactive envelopes come back on ---------------
+    lua.execute("""
+        tracks[#tracks + 1] = new_track("Trimmed")
+        tracks[#tracks].envelopes = { { name = "Trim Volume", scaling = 1, points = {},
+                                        chunk = "<VOLENV3\\nACT 0 -1\\nVIS 1 1 1\\n>" } }
+    """)
+    tv = len(g.tracks) - 1
+    r = rpc("set_envelope", [tv, "Trim Volume", [{"beats": 0, "value": 0}, {"beats": 4, "value": -6}], "db"])
+    env = g.tracks[tv + 1]["envelopes"][1]
+    check("set_envelope unit=db re-activates an ACT 0 envelope",
+          r.get("ok") and r["ret"].get("activated") is True and "ACT 1" in env["chunk"], r)
+    r = rpc("get_envelope", [tv, "Trim Volume", "db"])
+    vals = [p["value"] for p in r.get("ret", {}).get("points", [])]
+    check("get_envelope unit=db round-trips dB", r.get("ok") and len(vals) == 2 and abs(vals[0]) < 1e-9
+          and abs(vals[1] + 6) < 1e-9, r)
+    r = rpc("set_envelope", [tv, "Trim Volume", [{"beats": 0}]])
+    check("set_envelope rejects a point without value", r.get("ok") is False and "point #1" in (r.get("error") or ""), r)
+    r = rpc("get_envelope", [tv, "Volume"])
+    check("missing envelope error lists what the track has", r.get("ok") is False and "Trim Volume" in (r.get("error") or ""), r)
+
+    # --- run_lua errors point at the line ---------------------------------
+    r = rpc("run_lua", code="local a = 1\nlocal t = nil\nreturn t.x")
+    check("run_lua runtime error quotes the failing line",
+          r.get("ok") is False and "[line 3: return t.x]" in (r.get("error") or ""), r)
+
     json_checks(lupa, check)
 
     # --- the bridge is still responsive -------------------------------

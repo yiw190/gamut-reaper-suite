@@ -71,6 +71,7 @@ reaper.GetMediaTrackInfo_Value = function(t, key)
     return 0
   end
   if key == "B_MAINSEND" then return t.mainsend == false and 0 or 1 end
+  if key == "I_NCHAN" then return t.nchan or 2 end
   return 0.0
 end
 reaper.SetMediaTrackInfo_Value = function(t, key, v)
@@ -79,6 +80,7 @@ reaper.SetMediaTrackInfo_Value = function(t, key, v)
   if key == "B_MUTE" then t.mute = (v == 1) end
   if key == "I_SOLO" then t.solo = (v ~= 0) end
   if key == "B_MAINSEND" then t.mainsend = (v ~= 0) end
+  if key == "I_NCHAN" then t.nchan = v end
 end
 reaper.GetSetMediaTrackInfo_String = function(t, key, v)
   if key == "P_NAME" then t.name = v end
@@ -211,10 +213,57 @@ end
 reaper.SetTrackSelected = function(t, sel)
   t.selected = sel and true or false
 end
+-- render settings and a fake 42230 that writes the planned files
+proj_info, proj_str = {}, {}
+fake_gain = 2.0          -- CalculateNormalization result: 2.0 = peak/LUFS at -6 dB
+renders = {}             -- solo/mute state seen by each 42230
+reaper.GetSetProjectInfo = function(_, key, v, set)
+  if set then proj_info[key] = v end
+  return proj_info[key] or 0
+end
+local function render_targets()
+  local dir = proj_str.RENDER_FILE or "/tmp"
+  local pat = proj_str.RENDER_PATTERN or "untitled"
+  local out = {}
+  if proj_info.RENDER_SETTINGS == 2 then
+    for _, t in ipairs(tracks) do
+      if t.selected then out[#out + 1] = dir .. "/" .. pat:gsub("%$track", t.name) .. ".wav" end
+    end
+  else
+    out[1] = dir .. "/" .. pat:gsub("%$track", "Master") .. ".wav"
+  end
+  return out
+end
+reaper.GetSetProjectInfo_String = function(_, key, v, set)
+  if key == "RENDER_TARGETS" then return true, table.concat(render_targets(), ";") end
+  if set then proj_str[key] = v end
+  return true, proj_str[key] or ""
+end
+reaper.AnyTrackSolo = function()
+  for _, t in ipairs(tracks) do if t.solo then return true end end
+  return ui_solo == true
+end
+reaper.SetTrackUISolo = function(t, solo) hit("SetTrackUISolo") t.solo = solo ~= 0 end
+reaper.IsProjectDirty = function() return project_dirty or 0 end
+reaper.PCM_Source_CreateFromFile = function(p) return { path = p } end
+reaper.GetMediaSourceLength = function() return 2.0 end
+reaper.CalculateNormalization = function() return fake_gain end
+reaper.PCM_Source_Destroy = function() hit("PCM_Source_Destroy") end
+
 reaper.Main_OnCommand = function(id)
   hit("Main_OnCommand")
+  hit("cmd." .. tostring(id))
   if id == 40297 then
     for _, t in ipairs(tracks) do t.selected = false end
+  end
+  if id == 42230 then
+    local state = {}
+    for i, t in ipairs(tracks) do state[i] = { solo = t.solo or false, mute = t.mute or false } end
+    renders[#renders + 1] = state
+    for _, f in ipairs(render_targets()) do
+      local h = io.open(f, "wb")
+      if h then h:write("RIFFfake") h:close() end
+    end
   end
 end
 -- like REAPER: the item goes in at the edit cursor, items stay sorted by position, a new track goes after the
@@ -251,7 +300,12 @@ reaper.Main_SaveProjectEx = function(_, path, flags)
   saved = { path = path, flags = flags }
   written[path] = true
 end
-reaper.file_exists = function(path) return written[path] == true end
+reaper.file_exists = function(path)
+  if written[path] then return true end
+  local h = io.open(path, "rb")
+  if h then h:close() return true end
+  return false
+end
 
 -- sends / envelopes / fx
 reaper.GetTrackNumSends = function(t) return #t.sends end
@@ -261,11 +315,21 @@ reaper.GetTrackSendInfo_Value = function(t, _, i, key)
   if key == "D_PAN" then return s.pan or 0.0 end
   if key == "B_MUTE" then return s.mute and 1 or 0 end
   if key == "P_DESTTRACK" then return s.dest end
-  return 0
+  return s[key] or 0
 end
+reaper.SetTrackSendInfo_Value = function(t, _, i, key, v)
+  local s = t.sends[i + 1]
+  if key == "D_VOL" then s.vol = v
+  elseif key == "D_PAN" then s.pan = v
+  elseif key == "B_MUTE" then s.mute = (v == 1)
+  else s[key] = v end
+  return true
+end
+reaper.GetEnvelopeStateChunk = function(env) return true, env.chunk or "<VOLENV2\nACT 1 -1\n>" end
+reaper.SetEnvelopeStateChunk = function(env, chunk) env.chunk = chunk return true end
 reaper.CountTrackEnvelopes = function(t) return #t.envelopes end
 reaper.GetTrackEnvelope = function(t, i) return t.envelopes[i + 1] end
-reaper.GetEnvelopeName = function() return true, "Volume" end
+reaper.GetEnvelopeName = function(env) return true, (env and env.name) or "Volume" end
 reaper.CountEnvelopePoints = function(env) return #env.points end
 reaper.GetEnvelopePoint = function(env, i)
   local p = env.points[i + 1]
@@ -301,7 +365,29 @@ reaper.CreateTrackSend = function(src, dest)
   src.sends[#src.sends + 1] = { dest = dest }
   return #src.sends - 1
 end
-reaper.TrackFX_GetCount = function() return 0 end
+-- FX: one fake compressor per track that has t.fx = true. Param 0 Threshold (-60..0 dB), 1 Ratio (1:1..inf, like
+-- ReaComp's), 2 Mode (enum labels).
+local MODES = { "Off", "Blown Capacitor 4", "4" }
+local function fx_display(p, v)
+  if p == 0 then return string.format("%.1f", -60 + 60 * v) end
+  if p == 1 then
+    if v >= 1 then return "inf" end
+    return string.format("%.1f:1", 1 / (1 - v))
+  end
+  return MODES[math.min(3, math.floor(v * 3) + 1)]
+end
+reaper.TrackFX_GetCount = function(t) return t.fx and 1 or 0 end
+reaper.TrackFX_GetNumParams = function(t) return t.fx and 3 or 0 end
+reaper.TrackFX_GetParamName = function(_, _, p) return true, ({ "Threshold", "Ratio", "Mode" })[p + 1] end
+reaper.TrackFX_FormatParamValueNormalized = function(_, _, p, v) hit("FormatParamValueNormalized") return true, fx_display(p, v) end
+reaper.TrackFX_SetParamNormalized = function(t, _, p, v)
+  t.fxp = t.fxp or {}
+  t.fxp[p] = v
+  return true
+end
+reaper.TrackFX_SetParam = reaper.TrackFX_SetParamNormalized
+reaper.TrackFX_GetParam = function(t, _, p) return (t.fxp or {})[p] or 0, 0, 1 end
+reaper.TrackFX_GetFormattedParamValue = function(t, _, p) return true, fx_display(p, (t.fxp or {})[p] or 0) end
 
 -- Count heartbeat writes without touching the real API.
 local real_open = io.open

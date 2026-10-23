@@ -9,7 +9,7 @@
   Load via Actions > Load ReaScript and keep it running.
 ]]
 
-local VERSION = "0.5.0"
+local VERSION = "0.5.1-dev.1"
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 
 local function log(s)
@@ -1560,7 +1560,7 @@ os.remove(RESP)
 os.remove(TMP)
 os.remove(BUSY)
 touch_heartbeat()
-reaper.ShowConsoleMsg("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR .. "\n")
+log("reaper-mcp bridge " .. VERSION .. " ready\n  " .. DIR) -- no console window on every launch; `hibiki doctor` / ping report the version
 
 local function handle_mailbox()
   local raw = read_file(REQ)

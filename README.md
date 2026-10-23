@@ -58,6 +58,8 @@ hibiki recover                        # restart the MCP + gateway, drop stuck pa
 hibiki connect gamut|claude-desktop|claude-code|cursor [--remove]
 hibiki agents add codex claude kimi   # ACP agents for the panel (Node goes in ~/.local/node)
 hibiki watchdog on|off                # relaunch REAPER after crashes, for an unattended Mac
+hibiki stop                           # turn the background services off; they stay off after login
+hibiki start                          # turn them back on (setup does too)
 hibiki uninstall [--purge]            # --purge also deletes tokens and gateway config
 ```
 
@@ -144,7 +146,7 @@ token. Gamut connects over the HTTP service, so it needs the full setup. Keep th
 python3 -m reaper_mcp install-bridge
 ```
 
-Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. Console: `reaper-mcp bridge 0.5.0 ready`.
+Then in REAPER: **Actions → Load ReaScript → `reaper_mcp_bridge.lua` → Run**. It starts silently (no console window); `hibiki doctor` shows the bridge version and heartbeat. Set `REAPER_MCP_DEBUG=1` to log to the ReaScript console.
 
 MCP client config (any client that runs stdio servers):
 

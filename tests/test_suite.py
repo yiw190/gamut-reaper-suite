@@ -271,6 +271,7 @@ def main():
           and calls[1][-1].startswith("@minimax-ai/code@") and "--ignore-scripts" not in calls[1], str(calls))
 
     check_recover(check, suite)
+    check_stop_start(check, suite)
 
     httpd.shutdown()
     if failures:
@@ -363,6 +364,67 @@ def check_recover(check, suite):
           steps.get("REAPER bridge", {}).get("ok") is False and "stale" in steps["REAPER bridge"]["detail"]
           and not any("REAPER" in " ".join(c) and ("kill" in c[0]) for c in calls))
     check("recover: MCP + gateway up -> ok", steps.get("MCP http", {}).get("ok") and steps.get("agent gateway", {}).get("ok"))
+
+
+def check_stop_start(check, suite):
+    """`hibiki stop` / `start` with launchctl faked: services off and disabled across logins, then restored."""
+    import contextlib
+    import io
+    home = Path(tempfile.mkdtemp(prefix="grs_stop_"))
+    la = home / "Library/LaunchAgents"
+    la.mkdir(parents=True)
+    for label in (suite.MCP_LABEL, suite.GW_LABEL, suite.WD_LABEL):
+        (la / (label + ".plist")).write_bytes(b"x")
+    calls = []
+    state = {suite.MCP_LABEL: True, suite.GW_LABEL: True, suite.WD_LABEL: False}
+
+    def fake_launchctl(*args):
+        calls.append(list(args))
+        label = args[-1].split("/")[-1].replace(".plist", "")
+        if args[0] == "bootout":
+            state[label] = False
+        if args[0] == "bootstrap":
+            state[label] = True
+        return 0
+
+    saved = {k: getattr(suite, k) for k in ("no_launchd", "domain", "wait_http", "WINDOWS", "loaded", "launchctl",
+                                             "service_pid", "kill_pids")}
+    env_saved = os.environ.get("HOME")
+    os.environ["HOME"] = str(home)
+    suite.no_launchd, suite.domain, suite.WINDOWS = (lambda: False), (lambda: "gui/501"), False
+    suite.launchctl = fake_launchctl
+    suite.loaded = lambda label: state.get(label, False)
+    suite.service_pid = lambda label: 0
+    suite.kill_pids = lambda pids: 0
+    suite.wait_http = lambda url, seconds=10: all(state[x] for x in (suite.MCP_LABEL, suite.GW_LABEL))
+    out = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out):
+            rc1 = suite.main(["stop"])
+            marker = json.loads((home / ".config/reaper-mcp/stopped.json").read_text())
+            after_stop = dict(state)
+            with contextlib.redirect_stdout(io.StringIO()) as rec:
+                rc_rec = suite.main(["recover", "--json"])
+            calls_stop = list(calls)
+            rc2 = suite.main(["start"])
+    finally:
+        for k, v in saved.items():
+            setattr(suite, k, v)
+        os.environ["HOME"] = env_saved
+    check("stop: every installed service booted out and disabled for later logins",
+          rc1 == 0 and not any(after_stop.values())
+          and all(["disable", "gui/501/" + x] in calls_stop for x in (suite.MCP_LABEL, suite.GW_LABEL, suite.WD_LABEL)),
+          str(calls_stop))
+    check("stop: remembers what was running (watchdog was off)",
+          sorted(marker.get("running", [])) == sorted([suite.MCP_LABEL, suite.GW_LABEL]), str(marker))
+    r = json.loads(rec.getvalue() or "{}")
+    check("recover after stop: refuses and points at `hibiki start`, restarts nothing",
+          rc_rec == 1 and r.get("ok") is False and "hibiki start" in r["steps"][0]["detail"]
+          and not any(c[0] in ("kickstart", "bootstrap") for c in calls_stop), rec.getvalue())
+    check("start: enables and bootstraps only what was running, clears the marker",
+          rc2 == 0 and state[suite.MCP_LABEL] and state[suite.GW_LABEL] and not state[suite.WD_LABEL]
+          and ["enable", "gui/501/" + suite.MCP_LABEL] in calls
+          and not (home / ".config/reaper-mcp/stopped.json").exists(), str(calls[len(calls_stop):]))
 
 
 def main_windows():

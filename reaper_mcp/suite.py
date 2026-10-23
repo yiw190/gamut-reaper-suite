@@ -40,6 +40,7 @@ LEGACY_LABELS = {"com.yitian.reaper-mcp": MCP_LABEL, "com.yitian.reaper-watchdog
                  "com.gamut-reaper-suite.reaper-mcp": MCP_LABEL, "com.gamut-reaper-suite.agent-gateway": GW_LABEL,
                  "com.gamut-reaper-suite.reaper-watchdog": WD_LABEL}
 GW_PORT = 47892
+TUNNEL_LABEL = LABEL + "cloudflared"  # scripts/macos-host-bootstrap.sh
 
 WINDOWS = sys.platform == "win32"
 IMGUI_VERSION = "0.10.0.5"
@@ -257,11 +258,17 @@ def start_agent(p: Paths, label: str, args: list, env: dict | None = None, **ext
     stop_agent(p, label)
     with open(p.plist(label), "wb") as f:
         plistlib.dump(body, f)
+    bootstrap(p, label, log)
+
+
+def bootstrap(p: Paths, label: str, log: str) -> bool:
+    launchctl("enable", "%s/%s" % (domain(), label))  # undo `hibiki stop`, which disables the label across logins
     for attempt in range(5):
         if launchctl("bootstrap", domain(), str(p.plist(label))) == 0:
-            return
+            return True
         time.sleep(1 + attempt)
     say("  launchctl bootstrap %s failed; see %s" % (label, log))
+    return False
 
 
 def wait_http(url: str, seconds: float = 10) -> bool:
@@ -851,6 +858,7 @@ def cmd_setup(a) -> int:
     install_cli_shim(p)
     say("Services")
     ensure_token(p)
+    stopped_file(p).unlink(missing_ok=True)  # setup turns everything on again, like `hibiki start`
     if WINDOWS:
         gateway_config(p)
         ok = win_services_start(p)
@@ -912,6 +920,10 @@ def cmd_doctor(a) -> int:
     row("ok" if imgui_installed(p) else "warn", "ReaImGui", "installed" if imgui_installed(p)
         else "missing (binary or %s): the panel needs it - run setup" % p.imgui_shim)
     row_startup(p, row)
+    stopped = is_stopped(p)
+    if stopped:
+        row("warn", "services", "stopped with `hibiki stop` (%s) - `hibiki start` turns them back on"
+            % load_json(stopped_file(p)).get("at", "?"))
     if not p.token.exists():
         row("FAIL", "token", "%s missing" % p.token)
     elif WINDOWS:  # NTFS ACLs, not mode bits: the token sits in the user's profile
@@ -921,10 +933,10 @@ def cmd_doctor(a) -> int:
         row("ok" if mode == 0o600 else "warn", "token", "%s mode %o" % (p.token, mode))
     if WINDOWS:
         auto = win_autostart()
-        row("ok" if str(ROOT) in auto else "FAIL", "autostart", "HKCU Run \"%s\"" % RUN_VALUE if str(ROOT) in auto
+        row("ok" if str(ROOT) in auto else ("warn" if stopped and not auto else "FAIL"), "autostart", "HKCU Run \"%s\"" % RUN_VALUE if str(ROOT) in auto
             else ("points at another install - run setup" if auto else "missing - run setup"))
         pid = win_supervisor_pid(p)
-        row("ok" if pid else "FAIL", "supervisor", "pid %d" % pid if pid else
+        row("ok" if pid else ("warn" if stopped else "FAIL"), "supervisor", "pid %d" % pid if pid else
             "not running - see %s, then run setup" % (p.logs / "supervisor.log"))
         row("ok", "watchdog", "macOS only")
     else:
@@ -932,12 +944,16 @@ def cmd_doctor(a) -> int:
             if label == WD_LABEL and not p.plist(label).exists():
                 row("ok", label, "off (optional)")
                 continue
+            if stopped and not loaded(label):
+                row("warn", label, "stopped (`hibiki start` turns it back on)")
+                continue
             row("ok" if loaded(label) else "FAIL", label, "loaded" if loaded(label) else "not loaded")
         for old in LEGACY_LABELS:
             if p.plist(old).exists():
                 row("warn", old, "old LaunchAgent still installed - run setup")
     up = wait_http("http://127.0.0.1:%d/healthz" % port(), 0)
-    row("ok" if up else "FAIL", "MCP http", "127.0.0.1:%d %s" % (port(), "answers" if up else "no answer"))
+    row("ok" if up else ("warn" if stopped else "FAIL"), "MCP http", "127.0.0.1:%d %s" % (
+        port(), "answers" if up else ("stopped" if stopped else "no answer")))
     gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT, 0)
     row("ok" if gw else "warn", "agent gateway", "127.0.0.1:%d %s" % (GW_PORT, "answers" if gw else "no answer"))
     row_heartbeat(p, row)
@@ -1172,6 +1188,85 @@ def repair_files(p: Paths) -> tuple:
     return True, "restored " + ", ".join(fixed) if fixed else "all present"
 
 
+# ---------- stop / start ----------
+
+def stopped_file(p: Paths) -> Path:
+    return p.cfg / "stopped.json"
+
+
+def is_stopped(p: Paths) -> bool:
+    return stopped_file(p).exists()
+
+
+def stop_labels(p: Paths) -> list:
+    return [label for label in (MCP_LABEL, GW_LABEL, WD_LABEL, TUNNEL_LABEL) if p.plist(label).exists()]
+
+
+def cmd_stop(a) -> int:
+    """Turn the background services off and keep them off across logins, until `hibiki start` (or setup)."""
+    p = Paths()
+    p.cfg.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        was = win_services_stop(p, forget=True)
+        write_json(stopped_file(p), {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "windows": True}, 0o600)
+        say("stopped: MCP and agent gateway%s; autostart at logon off" % ("" if was else " (were not running)"))
+    else:
+        labels = stop_labels(p)
+        running = [label for label in labels if loaded(label)]
+        old = []
+        for label in running:
+            pid = service_pid(label)
+            if pid:
+                old += child_pids(pid)
+        for label in labels:
+            stop_agent(p, label)
+            launchctl("disable", "%s/%s" % (domain(), label))
+        table = ps_table() if old else {}
+        killed = kill_pids([pid for pid in old if pid in table])
+        prev = load_json(stopped_file(p)).get("running", []) if is_stopped(p) else []
+        write_json(stopped_file(p), {"at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                     "running": running or prev}, 0o600)
+        names = ", ".join(label.split(".")[-1] for label in labels) or "nothing installed"
+        say("stopped: %s%s" % (names, "; %d leftover agent process%s ended" % (killed, "" if killed == 1 else "es")
+                                if killed else ""))
+        say("They stay off after login. REAPER keeps running; its bridge just has nobody to talk to.")
+    say("Turn them back on with `hibiki start`.")
+    return 0
+
+
+def cmd_start(a) -> int:
+    p = Paths()
+    marker = load_json(stopped_file(p)) if is_stopped(p) else {}
+    if WINDOWS:
+        ok = win_services_start(p)
+        stopped_file(p).unlink(missing_ok=True)
+        return 0 if ok else 1
+    labels = stop_labels(p)
+    want = [label for label in marker.get("running", []) if label in labels] or \
+        [label for label in labels if label != TUNNEL_LABEL or not marker]
+    for label in (MCP_LABEL, GW_LABEL):
+        if label not in labels:
+            say("%s is not installed - run `hibiki setup`" % label)
+    for label in labels:
+        launchctl("enable", "%s/%s" % (domain(), label))
+    for label in want:
+        if not loaded(label):
+            bootstrap(p, label, str(p.logs / (label.split(".")[-1] + ".log")))
+    stopped_file(p).unlink(missing_ok=True)
+    if no_launchd():
+        return 0
+    mcp = wait_http("http://127.0.0.1:%d/healthz" % port())
+    gw = wait_http("http://127.0.0.1:%d/health" % GW_PORT)
+    say("MCP on 127.0.0.1:%d: %s" % (port(), "up" if mcp else "NOT answering, see %s" % (p.logs / "reaper-mcp.log")))
+    say("agent gateway on 127.0.0.1:%d: %s" % (GW_PORT, "up" if gw else "NOT answering, see %s"
+                                              % (p.logs / "agent-gateway.log")))
+    if WD_LABEL in want:
+        say("watchdog: on")
+    if TUNNEL_LABEL in want:
+        say("tunnel: on")
+    return 0 if mcp else 1
+
+
 def cmd_recover(a) -> int:
     """The panel's Recover button: restart the services, drop stuck streams, report what answers. Never kills REAPER."""
     import contextlib
@@ -1209,6 +1304,13 @@ def cmd_recover(a) -> int:
         return False, ("bridge stale (heartbeat %.0fs old): REAPER busy or hung; the watchdog restarts a hung REAPER"
                        % age)
 
+    if is_stopped(p):
+        detail = "stopped with `hibiki stop` - run `hibiki start` to turn them back on"
+        if a.json:
+            print(json.dumps({"ok": False, "steps": [{"name": "services", "ok": False, "detail": detail}]}))
+        else:
+            print("FAIL %-17s %s" % ("services", detail))
+        return 1
     sink = sys.stderr if (a.json and sys.stderr) else (io.StringIO() if a.json else sys.stdout)
     with contextlib.redirect_stdout(sink):
         step("files", lambda: repair_files(p))
@@ -1260,6 +1362,10 @@ def parser() -> argparse.ArgumentParser:
     rc.add_argument("--resource-path")
     rc.add_argument("--json", action="store_true")
     rc.set_defaults(fn=cmd_recover)
+    st = sub.add_parser("stop", help="turn the background services off (MCP, gateway, watchdog, tunnel); they stay off after login")
+    st.set_defaults(fn=cmd_stop)
+    sa = sub.add_parser("start", help="turn the background services back on after `hibiki stop`")
+    sa.set_defaults(fn=cmd_start)
     u = sub.add_parser("uninstall", help="remove this user's install")
     u.add_argument("--resource-path")
     u.add_argument("--purge", action="store_true", help="also delete tokens, gateway config and ACP transcripts")

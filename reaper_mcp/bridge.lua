@@ -408,6 +408,120 @@ local function set_solo(t, on)
   reaper.SetMediaTrackInfo_Value(t, "I_SOLO", on and 2 or 0) -- 2 = solo in place
 end
 
+----------------------------------------------------------------------
+-- Real patch: plugins a project may hold only once. Every DLSMusicDevice shares one CoreAudio GS synth state and
+-- REAPER processes tracks on parallel worker threads, so two instances running at once crash REAPER
+-- (CAVerboseAbort in MusicDeviceMIDIEvent / SIGSEGV in AudioUnitRender). One instance is safe.
+----------------------------------------------------------------------
+local SINGLE_INSTANCE = {
+  { key = "DLSMusicDevice",
+    why = "every instance shares one CoreAudio GS synth and REAPER processes tracks on parallel threads, "
+      .. "so two running at once crash REAPER",
+    route = "Route instead: one source track holds it and gets MIDI sends from every part (own channel + program "
+      .. "change); it feeds processing tracks by audio sends, and parts that need different FX chains are split by "
+      .. "time with square send-volume envelopes." },
+}
+local DLS = SINGLE_INSTANCE[1]
+
+local function fx_is(spec, tr, k, name)
+  if (name or ""):find(spec.key, 1, true) then return true end
+  if reaper.TrackFX_GetNamedConfigParm then -- a renamed instance still reports its plugin name here
+    local ok, orig = reaper.TrackFX_GetNamedConfigParm(tr, k, "fx_name")
+    if ok and type(orig) == "string" and orig:find(spec.key, 1, true) then return true end
+  end
+  return false
+end
+
+local function single_instances(spec)
+  local out = {}
+  for i = -1, reaper.CountTracks(0) - 1 do
+    local tr = i == -1 and reaper.GetMasterTrack(0) or reaper.GetTrack(0, i)
+    for k = 0, reaper.TrackFX_GetCount(tr) - 1 do
+      local _, name = reaper.TrackFX_GetFXName(tr, k, "")
+      if fx_is(spec, tr, k, name) then
+        local _, tn = reaper.GetTrackName(tr)
+        out[#out + 1] = { track = i, track_name = tn, fx = k, name = name, tr = tr,
+          guid = reaper.TrackFX_GetFXGUID(tr, k) or (i .. ":" .. k),
+          offline = reaper.TrackFX_GetOffline(tr, k) and true or false }
+      end
+    end
+  end
+  return out
+end
+
+local function online_of(list)
+  local out = {}
+  for _, x in ipairs(list) do if not x.offline then out[#out + 1] = x end end
+  return out
+end
+
+local function project_label()
+  local _, p = reaper.EnumProjects(-1, "")
+  if not p or p == "" then return "this project" end
+  return p:match("([^/\\]+)$") or p
+end
+
+local function where(x) return ("track %d (%s)"):format(x.track, x.track_name) end
+
+local function refuse_second(name, same_track)
+  for _, spec in ipairs(SINGLE_INSTANCE) do
+    if tostring(name or ""):find(spec.key, 1, true) then
+      local have = single_instances(spec)[1]
+      if have and not (same_track and have.tr == same_track) then
+        error(("real patch: %s already has a %s on %s. Only one per project: %s. Send MIDI to that track "
+          .. "(own channel + program change) instead."):format(project_label(), spec.key, where(have), spec.why), 0)
+      end
+    end
+  end
+end
+
+local function single_snapshot()
+  local snap = {}
+  for _, spec in ipairs(SINGLE_INSTANCE) do snap[spec] = single_instances(spec) end
+  return snap
+end
+
+-- after a request: new or re-enabled extra instances go offline at once; a project that was loaded with several
+-- online is left alone but warned about
+local function enforce_single(before)
+  local report
+  for _, spec in ipairs(SINGLE_INSTANCE) do
+    local was, was_online = {}, 0
+    for _, x in ipairs(before[spec] or {}) do
+      was[x.guid] = not x.offline
+      if not x.offline then was_online = was_online + 1 end
+    end
+    local online = online_of(single_instances(spec))
+    if #online > 1 then
+      report = report or {}
+      local fresh, kept = {}, {}
+      for _, x in ipairs(online) do
+        if was[x.guid] then kept[#kept + 1] = x else fresh[#fresh + 1] = x end
+      end
+      if #kept == 0 then kept[1] = table.remove(fresh, 1) end
+      if #fresh > 0 then
+        report.offlined = report.offlined or {}
+        local names = {}
+        for _, x in ipairs(fresh) do
+          reaper.TrackFX_SetOffline(x.tr, x.fx, true)
+          report.offlined[#report.offlined + 1] = { track = x.track, track_name = x.track_name, fx = x.fx }
+          names[#names + 1] = where(x)
+        end
+        report.message = ("real patch: set the new %s on %s offline. Only one per project: %s. Kept the one on %s. %s")
+          :format(spec.key, table.concat(names, ", "), spec.why, where(kept[1]), spec.route)
+      end
+      if was_online > 1 then
+        local names = {}
+        for _, x in ipairs(kept) do names[#names + 1] = where(x) end
+        report.warning = ("real patch: %s already had %d online %s instances (%s); left as they are. %s. Pick one "
+          .. "and set the others offline or delete them. %s")
+          :format(project_label(), #kept, spec.key, table.concat(names, ", "), spec.why:gsub("^%l", string.upper), spec.route)
+      end
+    end
+  end
+  return report
+end
+
 function DSL.ping()
   return { ret = { pong = true, version = VERSION, reaper = reaper.GetAppVersion() } }
 end
@@ -458,6 +572,14 @@ function DSL.get_project_summary(detail)
     master_mute = reaper.GetMediaTrackInfo_Value(reaper.GetMasterTrack(0), "B_MUTE") == 1,
   }
   if reaper.IsProjectDirty then ret.dirty = reaper.IsProjectDirty(0) ~= 0 end
+  local dls = online_of(single_instances(DLS))
+  ret.dls_instances = #dls
+  if #dls > 1 then
+    local names = {}
+    for _, x in ipairs(dls) do names[#names + 1] = where(x) end
+    ret.warnings = { ("real patch: %d online %s instances (%s). Only one per project: %s. %s")
+      :format(#dls, DLS.key, table.concat(names, ", "), DLS.why, DLS.route) }
+  end
   if detail then
     local num, denom = 4, 4
     if reaper.TimeMap_GetTimeSigAtTime then
@@ -777,6 +899,7 @@ end
 
 function DSL.add_track_fx(ti, fx_name)
   local t = track_at(ti)
+  refuse_second(fx_name)
   local fx = reaper.TrackFX_AddByName(t, fx_name, false, -1)
   if fx < 0 then error("could not add FX: " .. tostring(fx_name)) end
   local _, got = reaper.TrackFX_GetFXName(t, fx, "")
@@ -1782,6 +1905,19 @@ dispatch = function(req)
 
   local fn = reaper[func]
   if type(fn) == "function" then
+    local rok, rerr = pcall(function()
+      if func == "TrackFX_AddByName" and args[4] ~= 0 then
+        refuse_second(args[2], args[4] == -1 and args[1] or nil)
+      elseif func == "TrackFX_CopyToTrack" and not args[5] then
+        local gok, _, name = pcall(reaper.TrackFX_GetFXName, args[1], args[2], "")
+        if gok and name then
+          for _, spec in ipairs(SINGLE_INSTANCE) do
+            if fx_is(spec, args[1], args[2], name) then refuse_second(spec.key) end
+          end
+        end
+      end
+    end)
+    if not rok then return { ok = false, error = tostring(rerr) } end
     local packed = table.pack(pcall(fn, table.unpack(args, 1, nargs)))
     if receipt_wanted(func) then note_change(describe(func, args), packed[1]) end
     if not packed[1] then
@@ -1813,11 +1949,17 @@ local function run_request(req)
   -- never lets a receipt detail cost the call: a failing snapshot just means the generic line
   local before = opaque and select(2, pcall(snapshot)) or nil
   if type(before) ~= "table" then before = nil end
+  local sok, singles = pcall(single_snapshot)
   reaper.Undo_BeginBlock2(0)
   undo_depth = undo_depth + 1
   local ok, resp = pcall(dispatch, req)
   undo_depth = undo_depth - 1
   local fine = ok and not (type(resp) == "table" and resp.ok == false)
+  local patch
+  if sok then
+    local pok, r = pcall(enforce_single, singles)
+    if pok then patch = r end
+  end
   if opaque then
     local after = before and select(2, pcall(snapshot))
     local okd, lines = false, nil
@@ -1832,6 +1974,9 @@ local function run_request(req)
       note_change("script: " .. first_line(req.code), fine)
     end
   end
+  for _, x in ipairs(patch and patch.offlined or {}) do
+    note_change(("real patch: %s offline on %s"):format(fxname(x.track, x.fx), tname(x.track)))
+  end
   local first = staged[1] and staged[1].what or func
   local label = "Hibiki " .. turn .. ": " .. short(first, 70) .. (#staged > 1 and (" +" .. (#staged - 1)) or "")
   -- EndBlock ticks the state-change counter even when it makes no undo point, so a new point is told apart by
@@ -1844,6 +1989,11 @@ local function run_request(req)
     commit_receipt(turn)
   end
   staged = {}
+  if patch then
+    if not ok then return { ok = false, error = tidy_err(resp), real_patch = patch } end
+    if type(resp) ~= "table" then resp = { ok = true, ret = resp } end
+    resp.real_patch = patch
+  end
   if not ok then error(resp, 0) end
   return resp
 end

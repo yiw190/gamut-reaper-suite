@@ -274,6 +274,23 @@ reaper.Main_OnCommand = function(id)
   if id == 40297 then
     for _, t in ipairs(tracks) do t.selected = false end
   end
+  if id == 40062 then
+    fake_changed = true
+    for i = #tracks, 1, -1 do
+      local t = tracks[i]
+      if t.selected then
+        local d = new_track(t.name)
+        d.fxlist = {}
+        for _, f in ipairs(fxlist(t)) do
+          local c = new_fx(f.name, f.orig)
+          c.enabled, c.offline = f.enabled, f.offline
+          d.fxlist[#d.fxlist + 1] = c
+        end
+        t.selected, d.selected = false, true
+        table.insert(tracks, i + 1, d)
+      end
+    end
+  end
   if id == 42230 then
     local state = {}
     for i, t in ipairs(tracks) do state[i] = { solo = t.solo or false, mute = t.mute or false } end
@@ -383,8 +400,9 @@ reaper.CreateTrackSend = function(src, dest)
   src.sends[#src.sends + 1] = { dest = dest }
   return #src.sends - 1
 end
--- FX: one fake compressor per track that has t.fx = true. Param 0 Threshold (-60..0 dB), 1 Ratio (1:1..inf, like
--- ReaComp's), 2 Mode (enum labels).
+-- FX: t.fxlist = { {name, orig, guid, enabled, offline}, ... }. A track with t.fx = true and no list gets one
+-- ReaComp. Params belong to the track (t.fxp): 0 Threshold (-60..0 dB), 1 Ratio (1:1..inf, like ReaComp's),
+-- 2 Mode (enum labels).
 local MODES = { "Off", "Blown Capacitor 4", "4" }
 local function fx_display(p, v)
   if p == 0 then return string.format("%.1f", -60 + 60 * v) end
@@ -394,8 +412,77 @@ local function fx_display(p, v)
   end
   return MODES[math.min(3, math.floor(v * 3) + 1)]
 end
-reaper.TrackFX_GetCount = function(t) return t.fx and 1 or 0 end
-reaper.TrackFX_GetNumParams = function(t) return t.fx and 3 or 0 end
+local fx_guid_n = 0
+function new_fx(name, orig)
+  fx_guid_n = fx_guid_n + 1
+  return { name = name, orig = orig or name, guid = ("{FX%04d}"):format(fx_guid_n), enabled = true, offline = false }
+end
+function fxlist(t)
+  if t.fxlist then return t.fxlist end
+  if t.fx then
+    t.fxlist = { { name = "ReaComp", orig = "ReaComp", guid = "{FX-" .. reaper.GetTrackGUID(t) .. "}",
+                   enabled = not t.fx_bypassed, offline = false } }
+    return t.fxlist
+  end
+  return {}
+end
+local function fx_at(t, i) return fxlist(t)[i + 1] end
+local function own_list(t)
+  t.fxlist = fxlist(t)
+  return t.fxlist
+end
+local function full_name(q)
+  if q:find("DLSMusicDevice", 1, true) then return "AU: DLSMusicDevice (Apple)" end
+  return q
+end
+reaper.TrackFX_GetCount = function(t) return #fxlist(t) end
+reaper.TrackFX_AddByName = function(t, name, _, inst)
+  hit("TrackFX_AddByName")
+  local list = own_list(t)
+  local full = full_name(name)
+  if inst == 0 or inst == -1 then
+    for i, f in ipairs(list) do if f.orig == full then return i - 1 end end
+    if inst == 0 then return -1 end
+  end
+  fake_changed = true
+  list[#list + 1] = new_fx(full)
+  return #list - 1
+end
+reaper.TrackFX_Delete = function(t, i)
+  local list = own_list(t)
+  if not list[i + 1] then return false end
+  fake_changed = true
+  table.remove(list, i + 1)
+  return true
+end
+reaper.TrackFX_CopyToTrack = function(src, si, dst, di, move)
+  local from = own_list(src)
+  local f = from[si + 1]
+  if not f then return end
+  fake_changed = true
+  local copy = f
+  if move then table.remove(from, si + 1)
+  else
+    copy = new_fx(f.name, f.orig)
+    copy.enabled, copy.offline = f.enabled, f.offline
+  end
+  local to = own_list(dst)
+  table.insert(to, math.min(di + 1, #to + 1), copy)
+end
+reaper.TrackFX_SetOffline = function(t, i, v)
+  hit("TrackFX_SetOffline")
+  fake_changed = true
+  fx_at(t, i).offline = v and true or false
+end
+reaper.TrackFX_GetOffline = function(t, i) local f = fx_at(t, i) return f and f.offline or false end
+reaper.TrackFX_SetEnabled = function(t, i, v) fake_changed = true fx_at(t, i).enabled = v and true or false end
+reaper.TrackFX_GetEnabled = function(t, i) local f = fx_at(t, i) return f == nil or f.enabled end
+reaper.TrackFX_GetNamedConfigParm = function(t, i, key)
+  local f = fx_at(t, i)
+  if f and key == "fx_name" then return true, f.orig end
+  return false, ""
+end
+reaper.TrackFX_GetNumParams = function(t) return #fxlist(t) > 0 and 3 or 0 end
 reaper.TrackFX_GetParamName = function(_, _, p) return true, ({ "Threshold", "Ratio", "Mode" })[p + 1] end
 reaper.TrackFX_FormatParamValueNormalized = function(_, _, p, v) hit("FormatParamValueNormalized") return true, fx_display(p, v) end
 reaper.TrackFX_SetParamNormalized = function(t, _, p, v)
@@ -420,7 +507,9 @@ reaper.GetTrackGUID = function(t)
   if not t.guid then guid_n = guid_n + 1; t.guid = ("{T%04d}"):format(guid_n) end
   return t.guid
 end
-reaper.TrackFX_GetFXGUID = function(t, i) return t.fx and ("{FX-" .. reaper.GetTrackGUID(t) .. "}") or nil end
-reaper.TrackFX_GetFXName = function(t, i) return true, "ReaComp" end
-reaper.TrackFX_GetEnabled = function(t) return not t.fx_bypassed end
-reaper.TrackFX_GetOffline = function() return false end
+reaper.TrackFX_GetFXGUID = function(t, i) local f = fx_at(t, i) return f and f.guid or nil end
+reaper.TrackFX_GetFXName = function(t, i)
+  local f = fx_at(t, i)
+  if not f then return false, "" end
+  return true, f.name
+end

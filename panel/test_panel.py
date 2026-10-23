@@ -143,9 +143,9 @@ class Request:
         m = re.search(r"-o " + QA, cmd)
         self.base = m.group(1)[:-4] if m else None
         m = re.search(r"--data-binary @" + QA, cmd)
-        self.body = json.loads(Path(m.group(1)).read_text()) if m else None
+        self.body = json.loads(Path(m.group(1)).read_text(encoding="utf-8")) if m else None
         m = re.search(r"-H @" + QA, cmd)
-        self.auth = Path(m.group(1)).read_text() if m else None
+        self.auth = Path(m.group(1)).read_text(encoding="utf-8") if m else None
 
     def __repr__(self):
         return "%s %s" % (self.method, self.url)
@@ -173,6 +173,7 @@ class Panel:
         self.lua.globals().OS_NAME = OS_NAME
         self.lua.execute(FAKES)
         self.lua.globals().HIBIKI_TEST.dir = str(PANEL.parent) + os.sep  # loads panel/studio.lua next to it
+        self.lua.globals().MKDIR = lambda d: os.makedirs(d, exist_ok=True)  # mkdir -p doesn't exist on a Windows host
         state = self.lua.globals().EXT_STATE
         for k, v in {"ctx_level": "0", **(ext or {})}.items():
             state["Hibiki/" + k] = v
@@ -1292,7 +1293,7 @@ def test_saved_versions():
       reaper.IsProjectDirty = function() return 1 end
       reaper.Main_SaveProjectEx = function(_, path) SAVED[#SAVED + 1] = path; local f = io.open(path, 'wb'); f:write('<REAPER_PROJECT\n>'); f:close() end
       reaper.Main_openProject = function(path) OPENED[#OPENED + 1] = path end
-      reaper.RecursiveCreateDirectory = function(d) os.execute('mkdir -p "' .. d .. '"') end
+      reaper.RecursiveCreateDirectory = function(d) MKDIR(d) end
     """)
     p.type_and_send("thin the pad")
     turn = st["Hibiki/turn"]
@@ -1307,8 +1308,8 @@ def test_saved_versions():
     saved = p.lua_list(p.lua.globals().SAVED)
     hist = proj_dir / ".hibiki/history/Song"
     check("saved versions: one copy of the project in .hibiki/history after the reply",
-          len(saved) == 1 and saved[0].startswith(str(hist)) and saved[0].endswith(".RPP"), saved)
-    e = json.loads((hist / "index.jsonl").read_text().splitlines()[0])
+          len(saved) == 1 and os.path.normpath(saved[0]).startswith(os.path.normpath(str(hist))) and saved[0].endswith(".RPP"), saved)
+    e = json.loads((hist / "index.jsonl").read_text(encoding="utf-8").splitlines()[0])
     check("saved versions: titled with the reply's first sentence, the change list kept for the tooltip",
           e["what"] == "Pad 降了 3 dB，加了 ReaEQ 切低频" and e["lines"] == ["#3 Pad: volume -3.0 dB", "#3 Pad: add ReaEQ"], e)
     cmds = [c for c in p.lua_list(p.lua.globals().CMDS) if "gzip -9" in c]
@@ -1325,7 +1326,7 @@ def test_saved_versions():
     saved = p.lua_list(p.lua.globals().SAVED)
     opened = p.lua_list(p.lua.globals().OPENED)
     check("Go to: Current is saved as a version first, then the version is written over the project and reopened",
-          len(saved) == 3 and saved[1].startswith(str(hist)) and saved[2] == proj
+          len(saved) == 3 and os.path.normpath(saved[1]).startswith(os.path.normpath(str(hist))) and saved[2] == proj
           and len(opened) == 2 and opened[1] == "noprompt:" + proj, (saved, opened))
     rows = p.lua_list(p.m.studio._rows())
     check("Go to: the saved Current is the newest row", rows[0].what.startswith("Before going to"), [r.what for r in rows])

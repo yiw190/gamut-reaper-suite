@@ -33,22 +33,34 @@ local note = nil -- { text, till }: a short line in the composer's hint spot
 function M.note(text) note = { text = text, till = now() + 6 } end
 function M.hint() return note and now() < note.till and note.text or nil end
 
----------------------------------------------------------------- receipts
-local R = { seq = nil, list = {}, n = 0, current = nil, ended = nil, gone = {}, state = {} }
+---------------------------------------------------------------- receipts: "N changes · Undo" under each reply
+-- The bridge labels every undo point an agent makes "Hibiki <reply id>: …" and lists the reply's changes in ExtState
+-- Hibiki/receipts. Changes are kept by default; the line under the reply undoes exactly that reply.
+local R = { seq = nil, list = {}, by_id = {}, by_msg = {}, n = 0, current = nil, ended = nil, state = {} }
 local RUN_ID = ('%x'):format(math.floor(now() * 1000) % 0xFFFFF)
 reaper.SetExtState(EXT, 'turn', '', false) -- a panel that died mid-reply must not tag later changes as its own
 
--- queued: a message sent while a reply runs; it keeps that reply's id until the reply ends
-function M.turn_start(queued)
-  if queued and R.current then return end
-  R.n = R.n + 1
-  R.current = RUN_ID .. '.' .. R.n
-  reaper.SetExtState(EXT, 'turn', R.current, false)
+-- payload: the sent message, the key that finds the reply's line again in the chat log. queued: sent while a reply
+-- runs; it keeps that reply's id until the reply ends
+function M.turn_start(queued, payload)
+  if not (queued and R.current) then
+    R.n = R.n + 1
+    R.current = RUN_ID .. '.' .. R.n
+    reaper.SetExtState(EXT, 'turn', R.current, false)
+  end
+  if payload then R.by_msg[payload] = R.current end
 end
 function M.turn_end()
   if R.current then R.ended = R.current end
   R.current = nil
   reaper.SetExtState(EXT, 'turn', '', false)
+end
+
+-- the bridge logs a run_lua call as "script: <first line of code>"; lists say what kind of change it was
+local function readable(line)
+  line = tostring(line or '')
+  if line:match('^script: ') then return 'Ran a script' .. (line:match(' %(failed%)$') and ' (failed)' or '') end
+  return line
 end
 
 local function read_receipts()
@@ -57,31 +69,10 @@ local function read_receipts()
   R.seq = seq
   local list = P.decode(reaper.GetExtState(EXT, 'receipts'))
   R.list = type(list) == 'table' and list or {}
-end
-
--- "Always accept": no card after a reply; every change is still a labelled undo point (Edit > Undo history)
-R.auto = reaper.GetExtState(EXT, 'receipt_auto') == '1'
-local function set_auto(on)
-  -- replies that ended before the switch count as accepted: turning review back on must not pop up an old card
-  for _, x in ipairs(R.list) do
-    if type(x) == 'table' and type(x.id) == 'string' and not R.gone[x.id] then R.gone[x.id] = tonumber(x.points) or true end
+  R.by_id = {}
+  for _, r in ipairs(R.list) do
+    if type(r) == 'table' and type(r.id) == 'string' then R.by_id[r.id] = r end
   end
-  R.auto = on
-  reaper.SetExtState(EXT, 'receipt_auto', on and '1' or '0', true)
-end
-
-local function receipt_shown()
-  if S.active or R.auto then return nil end
-  local r = R.list[#R.list]
-  if type(r) ~= 'table' or type(r.id) ~= 'string' then return nil end
-  -- closed at N undo steps: an outside agent that keeps working under the same id brings the card back
-  local g = R.gone[r.id]
-  if g == true or (g and g >= (tonumber(r.points) or 0)) then return nil end
-  -- undo is per project tab: a receipt from another tab can't be reverted here
-  if r.proj ~= select(2, reaper.EnumProjects(-1, '')) then return nil end
-  if r.id == R.ended then return r end
-  -- changes an agent made outside this panel (the Gamut app, a CLI) show once they have settled
-  if r.id:match('^mcp%-') and os.time() - (tonumber(r.at) or 0) >= 3 then return r end
 end
 
 local function prefix(id) return 'Hibiki ' .. id .. ': ' end
@@ -97,14 +88,8 @@ local function revert(r)
   end
   reaper.PreventUIRefresh(-1)
   reaper.UpdateArrange()
-  local st = { undone = n }
-  if n == 0 then st.blocked = reaper.Undo_CanUndo2(0) or ''
-  else
-    st.reverted = true
-    local points = tonumber(r.points) or n
-    if n < points then st.partial = points - n end
-  end
-  R.state[r.id] = st
+  if n == 0 then R.state[r.id] = { blocked = reaper.Undo_CanUndo2(0) or '' }
+  else R.state[r.id] = { reverted = true, undone = n, partial = n < (tonumber(r.points) or n) } end
 end
 local function redo(r)
   local st = R.state[r.id] or {}
@@ -118,57 +103,38 @@ local function redo(r)
   end
   reaper.PreventUIRefresh(-1)
   reaper.UpdateArrange()
-  if n > 0 and n >= (st.undone or 0) then R.state[r.id] = {}
-  else -- nothing (or only part) came back: still reverted, so the card keeps Close / Redo
-    R.state[r.id] = { reverted = true, undone = (st.undone or 0) - n, partial = st.partial, redone = (st.redone or 0) + n }
-  end
+  if n >= (st.undone or 0) then R.state[r.id] = nil else st.undone = st.undone - n end
 end
 
-local function receipt_card(r)
-  local st = R.state[r.id] or {}
+-- the line under a reply: m = the user message that started it (Hibiki.lua calls this where that reply ends)
+function M.turn_line(m)
+  local id = m and R.by_msg[m.text]
+  if not id or id == R.current then return end
+  local r = R.by_id[id]
+  if not r or r.proj ~= select(2, reaper.EnumProjects(-1, '')) or (tonumber(r.n) or 0) == 0 then return end
+  local st = R.state[id] or {}
   local n = tonumber(r.n) or 0
-  local lines = type(r.lines) == 'table' and r.lines or {}
-  local w = ImGui.GetContentRegionAvail(ctx)
+  ImGui.AlignTextToFramePadding(ctx)
   if st.reverted then
-    if (st.undone or 0) < (tonumber(r.points) or n) then -- partial revert or partial redo: count what is really undone
-      P.wrapped('Reverted: ' .. plural(st.undone or 0, 'undo step') .. ' undone'
-        .. ((st.redone or 0) > 0 and (' · ' .. st.redone .. ' redone') or ''))
-    else
-      P.wrapped(('Reverted: %s undone'):format(plural(n, 'change')))
-    end
-    if st.partial then
-      P.wrapped(('%s kept: your own edits are on top of them'):format(plural(st.partial, 'undo step')), C.warn)
-    end
-    if P.primary('Close##rcpt') then R.gone[r.id] = true end
-    ImGui.SameLine(ctx)
+    ImGui.TextColored(ctx, C.muted, (st.partial and 'Partly undone · ' or 'Undone · ') .. plural(n, 'change'))
+    ImGui.SameLine(ctx, 0, 8)
     local top = reaper.Undo_CanRedo2(0)
-    local can = top ~= nil and top:sub(1, #prefix(r.id)) == prefix(r.id) -- the user's own edit clears the redo list
-    if not can then ImGui.BeginDisabled(ctx) end
-    if ImGui.Button(ctx, 'Redo##rcpt') and can then redo(r) end
-    if not can then ImGui.EndDisabled(ctx) end
-    if not can then P.wrapped('Nothing to redo: the project changed after the revert', C.muted) end
+    local can = top ~= nil and top:sub(1, #prefix(id)) == prefix(id) -- an edit since then clears the redo list
+    if P.chip('redo' .. id, 'Redo', C.muted, false, not can) then redo(r) end
   else
-    local who = r.id:match('^mcp%-') and 'An agent' or 'This reply'
-    ImGui.Text(ctx, P.truncate(('%s made %s'):format(who, plural(n, 'change')), w))
-    for i = 1, math.min(3, #lines) do ImGui.TextColored(ctx, C.muted, P.truncate(lines[i], w)) end
-    if #lines > 3 or n > #lines then
-      ImGui.TextColored(ctx, C.muted, ('+%d more'):format(n - math.min(3, #lines)))
-      if ImGui.IsItemHovered(ctx) then P.show_tip(table.concat(lines, '\n')) end
+    ImGui.TextColored(ctx, C.muted, plural(n, 'change'))
+    if ImGui.IsItemHovered(ctx) then
+      local L = {}
+      for _, l in ipairs(type(r.lines) == 'table' and r.lines or {}) do L[#L + 1] = readable(l) end
+      P.show_tip(table.concat(L, '\n'))
     end
-    if P.primary('Accept##rcpt') then R.gone[r.id] = tonumber(r.points) or true end
-    ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Revert##rcpt') then revert(r) end
-    if ImGui.IsItemHovered(ctx) then P.show_tip(plural(tonumber(r.points) or n, 'undo step') .. ' · ' .. prefix(r.id) .. '…') end
-    ImGui.SameLine(ctx)
-    if ImGui.Button(ctx, 'Always accept##rcpt') then
-      R.gone[r.id] = tonumber(r.points) or true
-      set_auto(true)
-      M.note('Always accept on · Agent settings > Studio')
-    end
-    if ImGui.IsItemHovered(ctx) then P.show_tip('Agent settings > Studio > Review changes after each reply') end
-    if st.blocked and (reaper.Undo_CanUndo2(0) or '') ~= st.blocked then st.blocked = nil end -- top undo step changed since
+    ImGui.SameLine(ctx, 0, 8)
+    if P.chip('undo' .. id, 'Undo', C.muted, false, S.active) then revert(r) end
+    if st.blocked and (reaper.Undo_CanUndo2(0) or '') ~= st.blocked then R.state[id] = nil; st = {} end
     if st.blocked then
-      P.wrapped('Your own edit "' .. P.truncate(st.blocked, 200) .. '" is on top of the undo history: undo it first, then Revert', C.danger)
+      ImGui.SameLine(ctx, 0, 8)
+      ImGui.TextColored(ctx, C.danger, 'A newer edit is on top')
+      if ImGui.IsItemHovered(ctx) then P.show_tip(st.blocked) end
     end
   end
 end
@@ -357,7 +323,10 @@ function RK.scan()
     local ok, v = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:hibiki_var', '', false)
     if ok and v ~= '' then
       local g, n = v:match('^(.-)/(%d+)$')
-      if g and g ~= '' then add(g, { n = tonumber(n), tr = tr, label = track_label(i, tr) }) end
+      if g and g ~= '' then
+        local _, tn = reaper.GetTrackName(tr)
+        add(g, { n = tonumber(n), tr = tr, label = track_label(i, tr), short = tn })
+      end
     end
     local ok2, fv = reaper.GetSetMediaTrackInfo_String(tr, 'P_EXT:hibiki_fxvar', '', false)
     if ok2 and fv ~= '' then
@@ -366,7 +335,10 @@ function RK.scan()
         local fx = g and fx_by_guid(tr, guid)
         if fx then
           local _, fxn = reaper.TrackFX_GetFXName(tr, fx, '')
-          add(g, { n = tonumber(n), tr = tr, fx = fx, label = track_label(i, tr) .. ': ' .. fxn })
+          -- "Pizz level -6 dB" in group "Pizz level" reads "-6 dB" next to the buttons
+          local short = fxn:gsub('^%a+: ', ''):gsub(' %(.-%)$', '')
+          if short:sub(1, #g + 1):lower() == (g .. ' '):lower() then short = short:sub(#g + 2) end
+          add(g, { n = tonumber(n), tr = tr, fx = fx, guid = guid, label = track_label(i, tr) .. ': ' .. fxn, short = short })
         end
       end
     end
@@ -391,7 +363,12 @@ function RK.switch(g, n)
   reaper.PreventUIRefresh(1)
   for _, v in ipairs(g.vars) do
     local on = v.n == n
-    if v.fx then reaper.TrackFX_SetEnabled(v.tr, v.fx, on)
+    if v.fx then
+      -- TrackFX_SetEnabled leaves an "FX bypass toggle" undo point (on top of the reply's, blocking Revert); the
+      -- :bypass parameter switches the same thing without one (checked on REAPER 7.79), like B_MUTE
+      local pb = reaper.TrackFX_GetParamFromIdent and reaper.TrackFX_GetParamFromIdent(v.tr, v.fx, ':bypass') or -1
+      if pb >= 0 then reaper.TrackFX_SetParamNormalized(v.tr, v.fx, pb, on and 0 or 1)
+      else reaper.TrackFX_SetEnabled(v.tr, v.fx, on) end
     else reaper.SetMediaTrackInfo_Value(v.tr, 'B_MUTE', on and 0 or 1) end
   end
   reaper.PreventUIRefresh(-1)
@@ -400,6 +377,47 @@ function RK.switch(g, n)
   g.active = n
   RK.focus = g.name
 end
+-- Keep n: the other variants go (tracks deleted / FX removed), the tags are cleared; one undo step
+function RK.keep(g, n)
+  for _, v in ipairs(g.vars) do
+    if reaper.ValidatePtr2(0, v.tr, 'MediaTrack*') == false then RK.at = -math.huge; return end
+  end
+  local kept
+  reaper.Undo_BeginBlock2(0)
+  reaper.PreventUIRefresh(1)
+  local fx_drop, tr_drop = {}, {}
+  for _, v in ipairs(g.vars) do
+    if v.n == n then kept = v
+    elseif v.fx then fx_drop[#fx_drop + 1] = v
+    else tr_drop[#tr_drop + 1] = v end
+  end
+  table.sort(fx_drop, function(a, b) return a.fx > b.fx end) -- highest index first: the others keep their place
+  for _, v in ipairs(fx_drop) do reaper.TrackFX_Delete(v.tr, v.fx) end
+  for _, v in ipairs(tr_drop) do reaper.DeleteTrack(v.tr) end
+  if kept then
+    if kept.fx then
+      local _, lines = reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_fxvar', '', false)
+      local rest = {}
+      for line in (lines or ''):gmatch('[^\n]+') do
+        if line:match('^(.-)/%d+\t') ~= g.name then rest[#rest + 1] = line end
+      end
+      reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_fxvar', table.concat(rest, '\n'), true)
+      for k = 0, reaper.TrackFX_GetCount(kept.tr) - 1 do -- the kept FX by GUID: deleting others moved its index
+        if reaper.TrackFX_GetFXGUID(kept.tr, k) == kept.guid then reaper.TrackFX_SetEnabled(kept.tr, k, true) end
+      end
+    else
+      reaper.GetSetMediaTrackInfo_String(kept.tr, 'P_EXT:hibiki_var', '', true)
+      reaper.SetMediaTrackInfo_Value(kept.tr, 'B_MUTE', 0)
+    end
+  end
+  reaper.PreventUIRefresh(-1)
+  reaper.Undo_EndBlock2(0, ('Hibiki: keep %s %d'):format(g.name, n), -1)
+  reaper.TrackList_AdjustWindows(false)
+  reaper.UpdateArrange()
+  M.note(('Kept %s %d · Cmd+Z undoes'):format(g.name, n))
+  RK.at = -math.huge
+end
+
 -- what each variant measured on the master while it was the one playing
 function RK.on_frame(fr)
   if fr.m <= -60 then return end
@@ -474,16 +492,19 @@ function M.rack_row()
         end
       end
     end
-    ImGui.SameLine(ctx, 0, 8)
     local keep
     for _, x in ipairs(g.vars) do if x.n == g.active then keep = x; break end end
-    if P.chip('rkkeep' .. gi, keep and ('Keep ' .. keep.n) or 'Keep', C.muted, false, not keep) then
-      local req = ('Keep variant %d (%s) of audition group "%s": remove the other variants and their hibiki tags, '
-        .. 'then save.'):format(keep.n, keep.label, g.name)
-      S.input = S.input:match('^%s*$') and req or (S.input:gsub('%s+$', '') .. '\n' .. req) -- a draft in the composer stays
-      S.focus = true
+    if keep and keep.short and keep.short ~= '' then -- what is playing, so a click shows on screen, not only in the sound
+      ImGui.SameLine(ctx, 0, 8)
+      ImGui.AlignTextToFramePadding(ctx)
+      ImGui.TextColored(ctx, C.value, P.truncate(keep.short, 140))
     end
-    if ImGui.IsItemHovered(ctx) then P.show_tip(keep and keep.label or 'No variant playing') end
+    ImGui.SameLine(ctx, 0, 8)
+    if P.chip('rkkeep' .. gi, keep and ('Keep ' .. keep.n) or 'Keep', C.muted, false, not keep) then RK.keep(g, keep.n) end
+    if ImGui.IsItemHovered(ctx) then
+      P.show_tip(keep and (keep.label .. '\nremoves ' .. plural(#g.vars - 1, 'other variant') .. ' · one undo step')
+        or 'No variant playing')
+    end
   end
 end
 
@@ -652,7 +673,7 @@ end
 -- After a reply that changed the project, a copy of the project as it is (saved or not) goes to
 -- <project folder>/.hibiki/history/<name>/<stamp>.RPP(.gz) with a line in index.jsonl. Main_SaveProjectEx to another
 -- path keeps the open project's path and dirty state (checked on REAPER 7.79). No media is copied: ~40 KB a version.
-local SV = { done = {}, cache = nil, cache_key = nil, on = reaper.GetExtState(EXT, 'snapshots') ~= '0' }
+local SV = { done = {}, cache = nil, cache_key = nil }
 local SEP = P.WIN and '\\' or '/'
 local MAX_SNAPS = 200
 local function project_where()
@@ -678,7 +699,7 @@ function SV.snap(r)
   local f = io.open(hd .. SEP .. 'index.jsonl', 'ab')
   if f then
     f:write('{"file":', P.jstr(stamp .. '.RPP' .. (P.WIN and '' or '.gz')), ',"at":', tostring(os.time()),
-      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(lines[1] or ''), '}\n')
+      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(readable(lines[1])), '}\n')
     f:close()
   end
   if not P.WIN then -- compress, and keep the newest MAX_SNAPS, in the background
@@ -741,7 +762,7 @@ function SV.open(e)
 end
 
 local function snap_tick()
-  if not SV.on or S.active then return end
+  if S.active then return end
   local r = R.list[#R.list]
   if type(r) ~= 'table' or type(r.id) ~= 'string' or SV.done[r.id] then return end
   if r.proj ~= select(2, reaper.EnumProjects(-1, '')) or (tonumber(r.n) or 0) == 0 then return end
@@ -787,7 +808,6 @@ local function revert_to_before(r, list)
   end
   reaper.PreventUIRefresh(-1)
   reaper.UpdateArrange()
-  for _, x in ipairs(list) do R.gone[x.id] = true end -- their cards would offer reverts that no longer apply
   H.last = { undone = n, proj = (reaper.EnumProjects(-1, '')), at = os.date('%H:%M', tonumber(r.at) or os.time()) }
 end
 local function redo_all()
@@ -803,7 +823,7 @@ local function redo_all()
   H.last = nil
 end
 
--- one list for Agent settings > Studio: the newest 10 replies that changed this project, from the saved versions
+-- one list for Agent settings > Version history: the newest 10 replies that changed this project, from the saved versions
 -- (kept after a restart) plus this session's receipts. Revert while the reply is in the undo history, else Open the copy
 local function version_rows()
   local list = project_receipts()
@@ -818,7 +838,7 @@ local function version_rows()
   for _, r in ipairs(list) do
     if not seen[r.id] then
       local lines = type(r.lines) == 'table' and r.lines or {}
-      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = tostring(lines[1] or ''), n = tonumber(r.n) or 0, r = r }
+      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = readable(lines[1]), n = tonumber(r.n) or 0, r = r }
     end
   end
   table.sort(rows, function(x, y) return x.at > y.at end)
@@ -850,11 +870,6 @@ function M.tick(t)
     RK.scan(); RK.stats, RK.focus = {}, nil
     H.confirm = nil
   elseif t - RK.at > 1 then RK.scan() end
-end
-
-function M.cards(L)
-  local r = receipt_shown()
-  if r then L[#L + 1] = { kind = 'studio', key = 'receipt_' .. r.id, draw = function() receipt_card(r) end } end
 end
 
 -- the Ears summaries waiting for the next message (Hibiki.lua sends them alone when Context is off): only those whose
@@ -922,26 +937,13 @@ end
 
 -- Agent settings, left column: what agents changed, and the way back
 function M.settings_changes(A)
-  A.section('Changes', A.COL)
+  A.section('Version history', A.COL)
   if now() - (H.drawn or 0) > 0.5 then H.confirm = nil end -- the window was closed: an armed Revert doesn't wait for next time
   H.drawn = now()
   A.box('changes', A.COL, function(w, x0)
     local row, right_btn, right_note = settings_rows(A, w, x0)
-    if A.checkbox('review', 'Review changes after each reply', not R.auto, w) then set_auto(not R.auto) end
-    row()
-    if A.checkbox('snapshots', 'Save a version after each reply', SV.on, w) then
-      SV.on = not SV.on
-      reaper.SetExtState(EXT, 'snapshots', SV.on and '1' or '0', true)
-    end
     local _, _, hist = project_where()
-    if ImGui.IsItemHovered(ctx) then
-      P.show_tip(hist and (hist .. '\n~40 KB each, no audio · newest ' .. MAX_SNAPS .. ' kept') or 'project not saved')
-    end
-    if SV.on and not hist then right_note('not saved') end
-    ImGui.Dummy(ctx, 0, 4)
-    row()
-    ImGui.AlignTextToFramePadding(ctx)
-    ImGui.Text(ctx, 'Version history')
+
     local rows, list = version_rows()
     local here = (reaper.EnumProjects(-1, ''))
     if H.last and H.last.proj == here and not reaper.Undo_CanRedo2(0) then H.last = nil end -- edited since: nothing to redo
@@ -959,9 +961,8 @@ function M.settings_changes(A)
       ImGui.PopTextWrapPos(ctx)
     end
     if #rows == 0 then
-      row()
       ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
-      ImGui.TextColored(ctx, A.dim, 'No agent changes to this project yet')
+      ImGui.TextColored(ctx, A.dim, hist and 'No agent changes to this project yet' or 'Save the project to keep versions')
       ImGui.PopTextWrapPos(ctx)
     end
     local today = os.date('%Y%m%d')

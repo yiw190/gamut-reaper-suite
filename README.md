@@ -214,20 +214,19 @@ while a composition is open and shows the pending pinyin under the input.
 
 ### Around the chat (`panel/studio.lua`)
 
-- **Revert a reply.** The bridge runs every request that can change the project in one undo block labelled
+- **Undo a reply.** The bridge runs every request that can change the project in one undo block labelled
   `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
-  the changes in ExtState `Hibiki/receipts`. When a reply that changed something ends, a card lists the changes with
-  **Accept** (keep them, close the card) and **Revert**, which undoes from the top while the undo point is that reply's, so your own later edits are never
-  undone (it says so and stops instead). **Redo** puts them back. **Always accept** (or Agent settings → Changes → Review changes off) stops the cards;
-  every change is still a labelled undo step. **Version history** (Agent settings → Changes) lists the last 10
-  replies that changed this project (time + what changed): **Revert** goes back to before one (undo is linear, so later
-  replies and your own edits since go too; it asks first), **Redo all** replays them; after a restart a reply's saved
-  copy shows **Open** instead.
+  the changes in ExtState `Hibiki/receipts`. Changes are kept; under each reply that changed the project the chat shows
+  `N changes · Undo` (hover = the list). Undo undoes from the top while the undo point is that reply's, so your own
+  later edits are never undone (it says so and stops instead); Redo puts them back. **Version history** (Agent
+  settings, left column) lists the last 10 replies that changed this project: **Revert** goes back to before one
+  (undo is linear, so later replies and your own edits since go too; it asks first), **Redo all** replays them; after
+  a restart a reply's saved copy shows **Open** instead.
 - **Saved versions.** After a reply that changed the project, a copy of it (saved or not; `Main_SaveProjectEx` to
   another path leaves the open project's path and dirty state alone) goes to `<project folder>/.hibiki/history/<name>/`
   as `<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media, the newest 200 kept. Version history lists
   them after a restart too; **Open** opens one in a new tab as `<name>_restore_<stamp>.RPP` next to the
-  project. Agent settings → Changes → Save a version after each reply turns it off. Changes made outside the panel (the Gamut app, a
+  project. Changes made outside the panel (the Gamut app, a
   CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
   every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,

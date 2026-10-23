@@ -1083,55 +1083,46 @@ def test_receipts_turn_and_revert():
     st = p.lua.globals().EXT_STATE
     p.type_and_send("brighten the pizz")
     turn = st["Hibiki/turn"]
+    asked = p.S.msgs[len(p.lua_list(p.S.msgs))]
     check("receipts: a sent message tags the bridge's changes with this reply's id", bool(turn) and "." in turn, turn)
-    # the bridge's view of that turn: two undo points, three changes; the user edits nothing afterwards
+    # the bridge's view of that reply: two undo points, three changes; the user edits nothing afterwards
     p.lua.execute("UNDO = {'Edit: something old', 'Hibiki %s: #4 Pizz: add ReaEQ', 'Hibiki %s: #4 Pizz: ReaEQ Gain = 3 +1'}"
                   % (turn, turn))
     st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 3, "points": 2, "proj": "",
-                                         "lines": ["#4 Pizz: add ReaEQ", "#4 Pizz: ReaEQ Freq = 3k", "#4 Pizz: ReaEQ Gain = 3"]}])
+                                         "lines": ["#4 Pizz: add ReaEQ", "#4 Pizz: ReaEQ Freq = 3k", "script: local tr = x"]}])
     st["Hibiki/receipts_seq"] = "1"
     p.m.studio.tick(2000)
-    check("receipts: no card while the reply is still running", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+
+    def line():
+        p.lua.execute("UI = {}")
+        p.m.studio.turn_line(asked)
+        return [c.args[3] for c in p.lua_list(p.lua.globals().UI) if c.name == "TextColored"]
+    check("receipts: no line while the reply is still running", line() == [])
     p.sse({"type": "session_idle"})
     p.requests()
     check("receipts: the reply's end clears the turn id", st["Hibiki/turn"] == "")
-    p.m.studio.tick(2001)
-    cards = [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"]
-    check("receipts: one card for the reply that changed things", len(cards) == 1)
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Revert') ~= nil end")
-    cards[0].draw()
+    check("receipts: under the reply, '3 changes' and an Undo button", line() == ["3 changes"])
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_undo%s' end" % turn)
+    line()
     undo = p.lua_list(p.lua.globals().UNDO)
-    check("receipts: Revert undoes exactly this reply's points and stops at the user's", undo == ["Edit: something old"], undo)
-    check("receipts: the card now offers Redo", p.m.studio._R.state[turn].reverted is True)
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Redo') ~= nil end")
-    cards[0].draw()
-    check("receipts: Redo puts both points back", len(p.lua_list(p.lua.globals().UNDO)) == 3)
-    # a user edit on top blocks the revert instead of undoing the user's work
+    check("receipts: Undo undoes exactly this reply's points and stops at the user's", undo == ["Edit: something old"], undo)
+    p.lua.execute("RET.InvisibleButton = nil")
+    check("receipts: the line then says it was undone", line() == ["Undone · 3 changes"])
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_redo%s' end" % turn)
+    line()
+    p.lua.execute("RET.InvisibleButton = nil")
+    check("receipts: Redo puts both points back", len(p.lua_list(p.lua.globals().UNDO)) == 3 and line() == ["3 changes"])
     p.lua.execute("UNDO[#UNDO + 1] = 'Move items'")
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Revert') ~= nil end")
-    cards[0].draw()
-    check("receipts: a user edit on top blocks the revert", len(p.lua_list(p.lua.globals().UNDO)) == 4
-          and p.m.studio._R.state[turn].blocked == "Move items")
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Accept') ~= nil end")
-    cards[0].draw()
-    check("receipts: Accept keeps the changes and hides the card", not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
-    st["Hibiki/receipts"] = json.dumps([{"id": "k9.1", "at": 1, "n": 1, "points": 1, "proj": "", "lines": ["#1 Bass: mute"]}])
-    st["Hibiki/receipts_seq"] = "1b"
-    p.m.studio._R.ended = "k9.1"
-    p.m.studio.tick(2001.5)
-    cards = [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"]
-    p.lua.execute("RET.Button = function(_, label) return label:find('^Always accept') ~= nil end")
-    cards[0].draw()
-    check("receipts: Always accept hides this card and every later one, and is remembered",
-          not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"] and st["Hibiki/receipt_auto"] == "1")
-    st["Hibiki/receipt_auto"] = "0"
-    p.m.studio._R.auto = False
-    st["Hibiki/receipts"] = json.dumps([{"id": "mcp-1", "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
+    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_undo%s' end" % turn)
+    line()
+    p.lua.execute("RET.InvisibleButton = nil")
+    check("receipts: a newer edit of the user's blocks Undo instead of undoing it",
+          len(p.lua_list(p.lua.globals().UNDO)) == 4 and line() == ["3 changes", "A newer edit is on top"])
+    st["Hibiki/receipts"] = json.dumps([{"id": turn, "at": 1, "n": 1, "points": 1, "proj": "/elsewhere/Other.RPP",
                                          "lines": ["#1 Bass: mute"]}])
     st["Hibiki/receipts_seq"] = "2"
     p.m.studio.tick(2002)
-    check("receipts: a receipt from another project tab is not shown here",
-          not [c for c in p.lua_list(p.m.card_list()) if c.kind == "studio"])
+    check("receipts: no line for changes in another project tab", line() == [])
 
 
 def test_meter_context():
@@ -1171,13 +1162,28 @@ def test_rack_switch_and_context():
     p.m.studio.rack_row()
     t = p.lua.globals().TRACKS
     check("rack: clicking 2 plays Bass B and mutes Bass A", t[1].mute == 1 and t[2].mute == 0 and t[3].mute == 0)
-    p.lua.execute("RET.InvisibleButton = function(_, id) return id == '##chip_rkkeep1' end")
-    p.m.studio.rack_row()
-    check("rack: Keep writes the request into the composer", "Keep variant 2 (#2 Bass B)" in p.S.input, p.S.input)
     p.lua.execute("RET.InvisibleButton = nil")
     reqs = p.type_and_send("which bass?")
     body = find(reqs, "POST", "/sessions/s1/messages")[0].body["content"]
     check("rack: the context says which variant is playing", 'audition rack "Bass": 2 variants, playing #2 (#2 Bass B)' in body, body[-400:])
+
+
+def test_rack_keep():
+    p = studio_panel()
+    p.lua.execute("""
+      TRACKS = { { name = 'Bass A', ext = { hibiki_var = 'Bass/1' }, mute = 1 },
+                 { name = 'Bass B', ext = { hibiki_var = 'Bass/2' }, mute = 0 },
+                 { name = 'Keys', ext = {}, mute = 0 } }
+      reaper.DeleteTrack = function(t) for i, x in ipairs(TRACKS) do if x == t then table.remove(TRACKS, i) end end end
+      RET.InvisibleButton = function(_, id) return id == '##chip_rkkeep1' end""")
+    p.m.studio.tick(5000)
+    p.m.studio.rack_row()
+    p.lua.execute("RET.InvisibleButton = nil")
+    t = p.lua_list(p.lua.globals().TRACKS)
+    check("rack: Keep 2 deletes the other variant and clears the tag, in the panel",
+          [x.name for x in t] == ["Bass B", "Keys"] and (t[0].ext.hibiki_var or "") == "" and t[0].mute == 0)
+    p.m.studio.tick(5002)
+    check("rack: the row is gone after Keep", len(p.lua_list(p.m.studio._RK.groups)) == 0)
 
 
 def test_remember_command():

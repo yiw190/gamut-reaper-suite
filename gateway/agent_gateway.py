@@ -92,12 +92,12 @@ BRAIN_END = "<!-- hibiki rules: end -->"
 BRAIN_MAX = 12000  # characters (~3k tokens): every session of every agent pays for it
 # what every agent in the panel should know about the panel itself; written above the user's rules
 BRAIN_CONVENTIONS = """## Hibiki panel conventions
-- Each of your replies is one revertable unit: the panel lists what you changed in REAPER and offers Revert. Prefer the
-  MCP verbs (track / fx / send / item / envelope / midi) over run_lua, so the list says what changed.
+- Each reply of yours is one undo unit: the panel shows "N changes · Undo" under it. Prefer the MCP verbs (track /
+  fx / send / item / envelope / midi) over run_lua, so the change list says what changed.
 - Audition rack: to offer the user alternatives (parts, sounds, FX settings), make each variant a track and tag it
   with track P_EXT:hibiki_var = "<group>/<n>" (n = 1..9; unmute one, mute the rest), or tag FX on one track with
-  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). The panel shows numbered buttons and keys 1-9.
-  Match the variants' loudness before handing them over. "Keep variant n" means: delete the others, remove the tags.
+  P_EXT:hibiki_fxvar lines "<group>/<n><TAB><fx GUID>" (enable one). The panel shows numbered buttons; its Keep
+  button deletes the other variants itself. Match the variants' loudness before handing them over.
 - "meter" lines in the REAPER context are measured on the master during the user's last playback (Hibiki Meter).
 - Files named ears-*.wav/.png/.md are the user's selection rendered from the master and measured for you."""
 BRAIN_TEMPLATE = """# Rules for agents working in REAPER

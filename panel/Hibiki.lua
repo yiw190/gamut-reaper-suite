@@ -1278,7 +1278,7 @@ end
 local function deliver(payload, text, typed, files)
   local bubble = { role = 'user', text = payload }
   local queued = S.active and S.sid ~= ''
-  if studio then studio.turn_start(queued) end
+  if studio then studio.turn_start(queued, payload) end
   if queued then
     S.queued[#S.queued + 1] = bubble -- the reply in progress stays above it
   else
@@ -3408,7 +3408,6 @@ local function card_list()
   if S.agent ~= '' and not is_acp() and via_gateway() and ONB.reaper_enabled(S.agent) == false then
     L[#L + 1] = { kind = 'reaper', key = 'reaper' }
   end
-  if studio then studio.cards(L) end
   return L
 end
 local function cards_height(L)
@@ -3619,8 +3618,6 @@ local function card(c)
       if S.auth.err then wrapped(S.auth.err, C.danger) end
     elseif c.kind == 'greq' then
       greq_card(c.q, who)
-    elseif c.kind == 'studio' then
-      c.draw()
     elseif c.kind == 'reaper' then
       wrapped(who .. " can't use REAPER yet")
       if primary((ONB.busy[S.agent] and 'Enabling…' or 'Enable REAPER for ' .. who) .. '##enreaper') and not ONB.busy[S.agent] then
@@ -3797,10 +3794,16 @@ do
       if grow then cut = nil end
     end
     local y_first, y_cut = ImGui.GetCursorPosY(ctx), nil
+    local asked -- the user message whose reply is being drawn: its "N changes · Undo" line goes where that reply ends
     for i = from, n do
+      if msgs[i].role == 'user' then
+        if asked and studio then flush(); studio.turn_line(asked) end
+        asked = msgs[i]
+      end
       if i == cut then flush(); y_cut = ImGui.GetCursorPosY(ctx) end
       draw_msg(msgs[i], i)
     end
+    if asked and studio and #S.live == 0 then flush(); studio.turn_line(asked) end
     for i, b in ipairs(S.live) do
       if b.kind == 'text' then
         flush()

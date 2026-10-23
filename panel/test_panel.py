@@ -1091,10 +1091,8 @@ def test_receipts_turn_and_title():
           {"type": "session_idle"})
     p.requests()
     check("receipts: the reply's end clears the turn id", st["Hibiki/turn"] == "")
-    p.m.studio.tick(2000)
-    rows = p.lua_list(p.m.studio._rows()[0])
-    check("version history: the row is titled with the reply's first real sentence (no 'OK', no heading)",
-          len(rows) == 1 and rows[0].what == "Pizz 换成 Celesta，做了 3 个版本", [r.what for r in rows])
+    check("version history: the reply is titled with its first real sentence (no 'OK', no heading)",
+          p.m.studio._R.summary[turn] == "Pizz 换成 Celesta，做了 3 个版本", p.m.studio._R.summary[turn])
 
 
 def test_meter_context():
@@ -1280,7 +1278,7 @@ def test_ears_render_and_attach():
 
 def test_saved_versions():
     if OS_NAME.startswith("Win"):
-        return  # the paths use \ there, which this host's filesystem can't take; the logic is the same
+        return  # the paths use \\ there, which this host's filesystem can't take; the logic is the same
     p = studio_panel()
     st = p.lua.globals().EXT_STATE
     proj_dir = p.tmp / "Song"
@@ -1289,10 +1287,11 @@ def test_saved_versions():
     p.lua.globals().PROJ_PATH = proj
     p.lua.execute(r"""
       reaper.EnumProjects = function() return 0, PROJ_PATH end
-      SAVED, OPENED, CMDS2 = {}, {}, {}
+      SAVED, OPENED, CHANGES = {}, {}, 5
+      reaper.GetProjectStateChangeCount = function() return CHANGES end
+      reaper.IsProjectDirty = function() return 1 end
       reaper.Main_SaveProjectEx = function(_, path) SAVED[#SAVED + 1] = path; local f = io.open(path, 'wb'); f:write('<REAPER_PROJECT\n>'); f:close() end
       reaper.Main_openProject = function(path) OPENED[#OPENED + 1] = path end
-      reaper.Main_OnCommand = function(id) CMDS2[#CMDS2 + 1] = id end
       reaper.RecursiveCreateDirectory = function(d) os.execute('mkdir -p "' .. d .. '"') end
     """)
     p.type_and_send("thin the pad")
@@ -1302,39 +1301,34 @@ def test_saved_versions():
     st["Hibiki/receipts_seq"] = "s1"
     p.m.studio.tick(3000)
     check("saved versions: nothing while the reply runs", len(p.lua_list(p.lua.globals().SAVED)) == 0)
-    p.sse({"type": "session_idle"})
+    p.sse({"type": "stream_delta", "text": "Pad 降了 3 dB，加了 ReaEQ 切低频。"}, {"type": "session_idle"})
     p.requests()
     p.m.studio.tick(3001)
     saved = p.lua_list(p.lua.globals().SAVED)
     hist = proj_dir / ".hibiki/history/Song"
     check("saved versions: one copy of the project in .hibiki/history after the reply",
           len(saved) == 1 and saved[0].startswith(str(hist)) and saved[0].endswith(".RPP"), saved)
-    index = (hist / "index.jsonl").read_text().splitlines()
-    e = json.loads(index[0])
-    check("saved versions: index line with the reply and what changed",
-          len(index) == 1 and e["turn"] == turn and e["n"] == 2 and e["what"] == "#3 Pad: volume -3.0 dB", index)
+    e = json.loads((hist / "index.jsonl").read_text().splitlines()[0])
+    check("saved versions: titled with the reply's first sentence, the change list kept for the tooltip",
+          e["what"] == "Pad 降了 3 dB，加了 ReaEQ 切低频" and e["lines"] == ["#3 Pad: volume -3.0 dB", "#3 Pad: add ReaEQ"], e)
     cmds = [c for c in p.lua_list(p.lua.globals().CMDS) if "gzip -9" in c]
     check("saved versions: compressed and pruned to the newest 200 in the background",
           len(cmds) == 1 and "tail -n +201" in cmds[0] and cmds[0].rstrip().endswith("&"), cmds)
     p.m.studio.tick(3002)
     check("saved versions: once per reply", len(p.lua_list(p.lua.globals().SAVED)) == 1)
-    lst = p.lua_list(p.m.studio._SV.list())
-    check("saved versions: listed newest first", len(lst) == 1 and lst[0].turn == turn)
-    rows = p.lua_list(p.m.studio._rows()[0])
-    check("version list: one row per reply, with a Revert while the receipt is live",
-          len(rows) == 1 and rows[0].what == "#3 Pad: volume -3.0 dB" and rows[0].n == 2 and rows[0].r is not None)
-    st["Hibiki/receipts"] = json.dumps([])
-    st["Hibiki/receipts_seq"] = "s2"
-    p.m.studio.tick(3003)
-    rows = p.lua_list(p.m.studio._rows()[0])
-    check("version list: after a restart (no receipt) the saved copy is still listed, to Open",
-          len(rows) == 1 and rows[0].r is None and rows[0].e is not None)
-    p.m.studio._SV.open(lst[0])
+    rows = p.lua_list(p.m.studio._rows())
+    check("version history: one row per saved version", len(rows) == 1 and rows[0].what == "Pad 降了 3 dB，加了 ReaEQ 切低频")
+    import time
+    time.sleep(1.1)  # versions are one a second
+    p.lua.execute("CHANGES = 9")  # the user edited since: going somewhere saves Current first
+    p.m.studio._SV.go(rows[0].e)
+    saved = p.lua_list(p.lua.globals().SAVED)
     opened = p.lua_list(p.lua.globals().OPENED)
-    check("saved versions: opens in a new tab as <name>_restore_<stamp>.RPP next to the project, project untouched",
-          p.lua_list(p.lua.globals().CMDS2) == [40859] and len(opened) == 2 and opened[1].startswith("noprompt:" + str(proj_dir / "Song_restore_"))
-          and proj not in [x.replace("noprompt:", "") for x in opened], opened)
-
+    check("Go to: Current is saved as a version first, then the version is written over the project and reopened",
+          len(saved) == 3 and saved[1].startswith(str(hist)) and saved[2] == proj
+          and len(opened) == 2 and opened[1] == "noprompt:" + proj, (saved, opened))
+    rows = p.lua_list(p.m.studio._rows())
+    check("Go to: the saved Current is the newest row", rows[0].what.startswith("Before going to"), [r.what for r in rows])
 
 
 def test_cli_in_dev_mode():

@@ -214,20 +214,16 @@ while a composition is open and shows the pending pinyin under the input.
 
 ### Around the chat (`panel/studio.lua`)
 
-- **Version history.** The bridge runs every request that can change the project in one undo block labelled
-  `Hibiki <reply>: <what changed>` (the panel sets the reply id in ExtState `Hibiki/turn` while it waits) and lists
-  the changes in ExtState `Hibiki/receipts`; for `run_lua` and raw API calls it diffs the project before and after
-  (tracks, volume, pan, mute, FX added / removed / bypassed / offline, items, lanes, sends, tempo), and a first-line
-  `-- comment` titles the script. Changes are simply kept. Agent settings → Version history lists the last 10 replies
-  that changed this project, each titled with the reply's own first sentence (hover = the change list): **Revert**
-  goes back to before one (undo is linear, so later replies and your own edits since go too; it asks first), **Redo
-  all** replays them; after a restart a reply's saved copy shows **Open** instead.
-- **Saved versions.** After a reply that changed the project, a copy of it (saved or not; `Main_SaveProjectEx` to
-  another path leaves the open project's path and dirty state alone) goes to `<project folder>/.hibiki/history/<name>/`
-  as `<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media, the newest 200 kept. Version history lists
-  them after a restart too; **Open** opens one in a new tab as `<name>_restore_<stamp>.RPP` next to the
-  project. Changes made outside the panel (the Gamut app, a
-  CLI) are grouped by time and get a card too. Read-only `run_lua` / getters leave no undo point.
+- **Version history.** After every agent reply that changed the project, a copy of it (saved or not;
+  `Main_SaveProjectEx` to another path leaves the open project's path and dirty state alone) goes to
+  `<project folder>/.hibiki/history/<name>/<stamp>.RPP.gz` with a line in `index.jsonl`: about 40 KB each, no media,
+  the newest 200 kept. Each version is titled with the reply's own first sentence; hover lists what changed. The
+  bridge knows what changed because it runs every request that can change the project in one undo block labelled
+  `Hibiki <reply>: <what changed>` and lists the changes in ExtState `Hibiki/receipts`; for `run_lua` and raw API
+  calls it diffs the project before and after (tracks, volume, pan, mute, FX added / removed / bypassed / offline,
+  items, lanes, sends, tempo), and a first-line `-- comment` titles the script. Agent settings → Version history:
+  **Current** (with **Save version** when it isn't in the history yet), then the 10 newest versions with the time to
+  the second and **Go to**, which saves Current as a version first, then makes this tab that version.
 - **Measure playback.** `Hibiki_Meter.jsfx` sits on the master's monitoring FX (never rendered) and writes a frame
   every 100 ms of playback to gmem `Hibiki`: LUFS-M/S (BS.1770 K-weighting), 4× oversampled true peak, sample peak,
   correlation, side vs mid and eight mid bands. The next message's context gets the last playback: bars, gated

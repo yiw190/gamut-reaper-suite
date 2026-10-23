@@ -682,21 +682,23 @@ local function project_where()
   return dir, name, dir .. SEP .. '.hibiki' .. SEP .. 'history' .. SEP .. name
 end
 
-function SV.snap(r)
-  SV.done[r.id] = true
+-- one saved version: the project as it is now (saved or not), with a title and the change list for the tooltip
+function SV.save(title, lines, turn)
   local dir, name, hd = project_where()
-  if not dir then return end
+  if not dir then return nil end
   reaper.RecursiveCreateDirectory(hd, 0)
   local stamp = os.date('%Y%m%d-%H%M%S')
   local file = hd .. SEP .. stamp .. '.RPP'
-  if exists(file) then return end
+  if exists(file) or exists(file .. '.gz') then return nil end -- one version a second
   reaper.Main_SaveProjectEx(0, file, 0)
-  if not exists(file) then return end
-  local lines = type(r.lines) == 'table' and r.lines or {}
+  if not exists(file) then return nil end
+  local L = {}
+  for i, l in ipairs(lines or {}) do if i <= 12 then L[#L + 1] = P.jstr(readable(l)) end end
   local f = io.open(hd .. SEP .. 'index.jsonl', 'ab')
   if f then
     f:write('{"file":', P.jstr(stamp .. '.RPP' .. (P.WIN and '' or '.gz')), ',"at":', tostring(os.time()),
-      ',"turn":', P.jstr(r.id), ',"n":', tostring(tonumber(r.n) or 0), ',"what":', P.jstr(R.summary[r.id] or readable(lines[1])), '}\n')
+      ',"turn":', P.jstr(turn or ''), ',"n":', tostring(#(lines or {})), ',"what":', P.jstr(title or ''),
+      ',"lines":[', table.concat(L, ','), ']}\n')
     f:close()
   end
   if not P.WIN then -- compress, and keep the newest MAX_SNAPS, in the background
@@ -704,6 +706,19 @@ function SV.snap(r)
       .. '/usr/bin/tail -n +' .. (MAX_SNAPS + 1) .. ' | while read f; do /bin/rm -f "$f"; done ) >/dev/null 2>&1 &')
   end
   SV.cache_key = nil
+  SV.saved_at = reaper.GetProjectStateChangeCount(0) -- "Current" is in the history until the project changes again
+  return stamp
+end
+
+-- after a reply that changed the project: titled with the reply's first sentence
+function SV.snap(r)
+  SV.done[r.id] = true
+  local lines = type(r.lines) == 'table' and r.lines or {}
+  local title = R.summary[r.id]
+  if not title then
+    for _, l in ipairs(lines) do if not l:match('^script: ') then title = l; break end end
+  end
+  SV.save(title or 'Agent changes', lines, r.id)
 end
 
 -- newest first, only versions whose file is still there
@@ -727,35 +742,34 @@ function SV.list()
   return out
 end
 
--- open a saved version in a new tab as <name>_restore_<stamp>.RPP next to the project; the project itself is untouched
-function SV.open(e)
+-- Go to: this tab becomes that version. The current state is saved as a version first, so nothing is lost and
+-- Go to can come back. The version opens from its own folder (relative media paths resolve) and is saved over the
+-- project file from there, so REAPER rewrites the paths for the project folder.
+function SV.go(e)
   local dir, name, hd = project_where()
+  local _, path = reaper.EnumProjects(-1, '')
   if not dir then return end
   local src = hd .. SEP .. e.file
   local rpp = src:gsub('%.gz$', '')
+  local unpacked = false
   if not exists(rpp) then
     if P.WIN or not exists(src) then M.note('That version is gone'); return end
+    rpp = hd .. SEP .. 'goto-' .. e.file:gsub('%.gz$', '')
     P.sh('/usr/bin/gunzip -c ' .. P.q(src) .. ' > ' .. P.q(rpp))
+    unpacked = true
   end
   if not exists(rpp) then M.note('Could not unpack that version'); return end
-  local stamp = e.file:match('^([%d-]+)') or os.date('%Y%m%d-%H%M%S')
-  local target = dir .. SEP .. name .. '_restore_' .. stamp .. '.RPP'
-  for i = 0, 255 do -- already open: switch to that tab instead of a second copy of the same file
-    local p, path = reaper.EnumProjects(i, '')
-    if not p then break end
-    if path == target then
-      reaper.SelectProjectInstance(p)
-      if src ~= rpp then os.remove(rpp) end
-      M.note('Switched to ' .. name .. '_restore_' .. stamp)
-      return
-    end
+  local when = os.date('%H:%M:%S', tonumber(e.at) or os.time())
+  if reaper.GetProjectStateChangeCount(0) ~= SV.saved_at or reaper.IsProjectDirty(0) ~= 0 then
+    SV.save('Before going to ' .. when, {}, 'goto')
   end
-  reaper.Main_OnCommand(40859, 0) -- new project tab
-  reaper.Main_openProject('noprompt:' .. rpp) -- opened where it was saved, so relative media paths resolve
-  if not exists(target) then reaper.Main_SaveProjectEx(0, target, 0) end -- rewritten for the project folder
-  if exists(target) then reaper.Main_openProject('noprompt:' .. target) end
-  if src ~= rpp then os.remove(rpp) end
-  M.note('Opened ' .. name .. '_restore_' .. stamp .. ' in a new tab')
+  reaper.Main_openProject('noprompt:' .. rpp)
+  reaper.Main_SaveProjectEx(0, path, 0)
+  reaper.Main_openProject('noprompt:' .. path)
+  if unpacked then os.remove(rpp) end
+  SV.saved_at = reaper.GetProjectStateChangeCount(0)
+  SV.cache_key = nil
+  M.note('Went to the ' .. when .. ' version')
 end
 
 local function snap_tick()
@@ -770,76 +784,17 @@ end
 read_receipts()
 for _, r in ipairs(R.list) do if type(r) == 'table' and type(r.id) == 'string' then SV.done[r.id] = true end end
 
----------------------------------------------------------------- change history (go back to before any reply)
--- Undo is linear: going back to before reply X undoes X and everything above it (later replies, the user's own
--- edits); Redo all replays the same number of steps. Lives as long as REAPER's undo history (until a restart).
-local H = { confirm = nil, last = nil }
-local function project_receipts()
-  local proj = select(2, reaper.EnumProjects(-1, ''))
-  local out = {}
-  for i = #R.list, 1, -1 do
-    local r = R.list[i]
-    if type(r) == 'table' and type(r.id) == 'string' and r.proj == proj then out[#out + 1] = r end
-  end
-  return out
-end
-local function revert_to_before(r, list)
-  H.err = nil
-  local pre, need = prefix(r.id), tonumber(r.points) or 1
-  local seen, n = 0, 0
-  reaper.PreventUIRefresh(1)
-  while n < 2000 and seen < need do
-    local top = reaper.Undo_CanUndo2(0)
-    if not top then break end
-    if top:sub(1, #pre) == pre then seen = seen + 1 end
-    reaper.Undo_DoUndo2(0)
-    n = n + 1
-  end
-  if seen < need then -- the reply's undo steps are not on the stack (undone by hand): put every step back
-    for _ = 1, n do if reaper.Undo_DoRedo2(0) == 0 then break end end
-    reaper.PreventUIRefresh(-1)
-    reaper.UpdateArrange()
-    H.err = 'Not reverted: that reply is no longer in the undo history'
-    return
-  end
-  reaper.PreventUIRefresh(-1)
-  reaper.UpdateArrange()
-  H.last = { undone = n, proj = (reaper.EnumProjects(-1, '')), at = os.date('%H:%M', tonumber(r.at) or os.time()) }
-end
-local function redo_all()
-  if not H.last or H.last.proj ~= (reaper.EnumProjects(-1, '')) then return end -- undo is per project tab
-  local n = 0
-  reaper.PreventUIRefresh(1)
-  while n < (H.last and H.last.undone or 0) and reaper.Undo_CanRedo2(0) do
-    reaper.Undo_DoRedo2(0)
-    n = n + 1
-  end
-  reaper.PreventUIRefresh(-1)
-  reaper.UpdateArrange()
-  H.last = nil
-end
-
--- one list for Agent settings > Version history: the newest 10 replies that changed this project, from the saved versions
--- (kept after a restart) plus this session's receipts. Revert while the reply is in the undo history, else Open the copy
+---------------------------------------------------------------- version history rows
+-- the newest 10 saved versions of this project
 local function version_rows()
-  local list = project_receipts()
-  local rec, seen, rows = {}, {}, {}
-  for _, r in ipairs(list) do rec[r.id] = r end
-  for _, e in ipairs(SV.list()) do
-    local turn = type(e.turn) == 'string' and e.turn or nil
-    if turn then seen[turn] = true end
-    rows[#rows + 1] = { key = 'v' .. tostring(e.file), at = tonumber(e.at) or 0, what = tostring(e.what or ''),
-      n = tonumber(e.n) or 0, r = turn and rec[turn], e = e }
+  local rows = {}
+  for i, e in ipairs(SV.list()) do
+    if i > 10 then break end
+    local what = tostring(e.what or '')
+    if what == '' or what:match('^script: ') or what == 'Ran a script' then what = 'Agent changes' end
+    rows[#rows + 1] = { at = tonumber(e.at) or 0, what = what, lines = type(e.lines) == 'table' and e.lines or {}, e = e }
   end
-  for _, r in ipairs(list) do
-    if not seen[r.id] then
-      local lines = type(r.lines) == 'table' and r.lines or {}
-      rows[#rows + 1] = { key = 'r' .. r.id, at = tonumber(r.at) or 0, what = R.summary[r.id] or readable(lines[1]), n = tonumber(r.n) or 0, r = r }
-    end
-  end
-  table.sort(rows, function(x, y) return x.at > y.at end)
-  for i = #rows, 11, -1 do rows[i] = nil end
-  return rows, list
+  return rows
 end
 
 ---------------------------------------------------------------- panel hooks
@@ -864,7 +819,6 @@ function M.tick(t)
   if proj ~= RK.proj then -- another project tab: nothing from the last one may stay clickable
     RK.proj = proj
     RK.scan(); RK.stats, RK.focus = {}, nil
-    H.confirm = nil
   elseif t - RK.at > 1 then RK.scan() end
 end
 
@@ -934,66 +888,41 @@ end
 -- Agent settings, left column: what agents changed, and the way back
 function M.settings_changes(A)
   A.section('Version history', A.COL)
-  if now() - (H.drawn or 0) > 0.5 then H.confirm = nil end -- the window was closed: an armed Revert doesn't wait for next time
-  H.drawn = now()
   A.box('changes', A.COL, function(w, x0)
-    local row, right_btn, right_note = settings_rows(A, w, x0)
+    local row, right_btn = settings_rows(A, w, x0)
     local _, _, hist = project_where()
-
-    local rows, list = version_rows()
-    local here = (reaper.EnumProjects(-1, ''))
-    if H.last and H.last.proj == here and not reaper.Undo_CanRedo2(0) then H.last = nil end -- edited since: nothing to redo
-    local went = H.last ~= nil and H.last.proj == here
-    if went then
-      row()
-      ImGui.AlignTextToFramePadding(ctx)
-      ImGui.TextColored(ctx, A.dim, P.truncate('Went back to before ' .. H.last.at, w - ImGui.CalcTextSize(ctx, 'Redo all') - 24))
-      if right_btn('redoall', 'Redo all', false) then redo_all() end
-    end
-    if H.err then
-      row()
-      ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
-      ImGui.TextColored(ctx, C.razor, H.err)
-      ImGui.PopTextWrapPos(ctx)
-    end
-    if #rows == 0 then
-      ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
-      ImGui.TextColored(ctx, A.dim, hist and 'No agent changes to this project yet' or 'Save the project to keep versions')
-      ImGui.PopTextWrapPos(ctx)
-    end
     local today = os.date('%Y%m%d')
-    local tcol = math.max((ImGui.CalcTextSize(ctx, '00:00')), (ImGui.CalcTextSize(ctx, '00-00'))) + 8 -- time column
-    for i, x in ipairs(rows) do
+    local tcol = (ImGui.CalcTextSize(ctx, '00-00 00:00')) + 10 -- time column: 00:00:00 today, MM-DD HH:MM before
+    -- Current: the project as it is now; saved into the history unless it already is
+    local changed = SV.saved_at == nil or reaper.GetProjectStateChangeCount(0) ~= SV.saved_at
+    ImGui.AlignTextToFramePadding(ctx)
+    ImGui.Text(ctx, 'Current')
+    ImGui.SameLine(ctx, 0, 0)
+    ImGui.SetCursorScreenPos(ctx, x0 + tcol, select(2, ImGui.GetCursorScreenPos(ctx)))
+    ImGui.TextColored(ctx, A.dim, not hist and 'project not saved' or (changed and 'not in the history' or 'in the history'))
+    if right_btn('savever', 'Save version', not hist or not changed or S.active) then
+      if SV.save('Saved by you', {}, 'you') then M.note('Saved this version') end
+    end
+    for i, x in ipairs(version_rows()) do
       row()
       ImGui.AlignTextToFramePadding(ctx)
-      ImGui.TextColored(ctx, A.dim, os.date(os.date('%Y%m%d', x.at) == today and '%H:%M' or '%m-%d', x.at))
+      ImGui.TextColored(ctx, A.dim, os.date(os.date('%Y%m%d', x.at) == today and '%H:%M:%S' or '%m-%d %H:%M', x.at))
       ImGui.SameLine(ctx, 0, 0)
       ImGui.SetCursorScreenPos(ctx, x0 + tcol, select(2, ImGui.GetCursorScreenPos(ctx)))
-      local later = 0
-      for j = 1, i - 1 do if rows[j].r then later = later + 1 end end
-      local armed = H.confirm == x.key
-      local label = x.r and (armed and ('Revert ' .. plural(later + 1, 'reply')) or 'Revert') or 'Open'
-      local bw = ImGui.CalcTextSize(ctx, label) + 16
+      local bw = ImGui.CalcTextSize(ctx, 'Go to') + 16
       local cx = ImGui.GetCursorScreenPos(ctx)
-      local summary = x.what
-      ImGui.Text(ctx, P.truncate(summary ~= '' and summary or plural(x.n, 'change'), x0 + w - bw - 8 - cx))
+      ImGui.Text(ctx, P.truncate(x.what, x0 + w - bw - 8 - cx))
       if ImGui.IsItemHovered(ctx) then
-        local L = {}
-        for _, l in ipairs(x.r and type(x.r.lines) == 'table' and x.r.lines or {}) do L[#L + 1] = readable(l) end
-        local lines = #L > 0 and table.concat(L, '\n') or x.what
-        P.show_tip(os.date('%Y-%m-%d %H:%M', x.at) .. ' · ' .. plural(x.n, 'change') .. '\n' .. lines)
+        local L = { os.date('%Y-%m-%d %H:%M:%S', x.at) .. ' · ' .. x.what }
+        for _, l in ipairs(x.lines) do L[#L + 1] = readable(l) end
+        P.show_tip(table.concat(L, '\n'))
       end
-      if right_btn('ver' .. i, label, (went or S.active) and x.r ~= nil, armed) then
-        if not x.r then SV.open(x.e)
-        elseif not armed then H.confirm, H.err = x.key, nil
-        else revert_to_before(x.r, list); H.confirm = nil end
-      end
-      if armed then
-        row()
-        ImGui.PushTextWrapPos(ctx, x0 + w - ImGui.GetWindowPos(ctx))
-        ImGui.TextColored(ctx, C.razor, 'Your own edits since ' .. os.date('%H:%M', x.at) .. ' go too · Redo all restores everything')
-        ImGui.PopTextWrapPos(ctx)
-      end
+      if right_btn('ver' .. i, 'Go to', S.active) then SV.go(x.e) end
+      if ImGui.IsItemHovered(ctx) then P.show_tip('Current is saved as a version first') end
+    end
+    if hist and #version_rows() == 0 then
+      row()
+      ImGui.TextColored(ctx, A.dim, 'No versions yet')
     end
   end)
 end

@@ -913,6 +913,12 @@ function M.settings_changes(A)
     local tcol = (ImGui.CalcTextSize(ctx, '00-00 00:00')) + 10 -- time column: 00:00:00 today, MM-DD HH:MM before
     -- Current: the project as it is now; saved into the history unless it already is
     local changed = SV.saved_at == nil or reaper.GetProjectStateChangeCount(0) ~= SV.saved_at
+    -- the history is per project and this window stays open across tab switches: say whose it is
+    local _, path = reaper.EnumProjects(-1, '')
+    local _, pname = project_where()
+    ImGui.TextColored(ctx, A.dim, P.truncate(pname or 'Untitled project', w))
+    if ImGui.IsItemHovered(ctx) and path ~= '' then P.show_tip(path) end
+    row()
     ImGui.AlignTextToFramePadding(ctx)
     ImGui.Text(ctx, 'Current')
     ImGui.SameLine(ctx, 0, 0)
